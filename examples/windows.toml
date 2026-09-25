@@ -1,0 +1,17 @@
+version = 1
+
+[[workloads]]
+name = "example-job"
+description = "A harmless Windows scheduled command"
+executable = 'C:\Windows\System32\cmd.exe'
+args = ["/d", "/c", "echo Scheduled job completed"]
+working_directory = 'C:\Windows\Temp'
+kind = "job"
+restart = "never"
+
+[workloads.schedule]
+cron = "0 0 2 * * *"
+timezone = "Africa/Dar_es_Salaam"
+action = "start"
+missed = "skip"
+

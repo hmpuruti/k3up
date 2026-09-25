@@ -1,0 +1,31 @@
+version = 1
+
+# macOS/Linux example. Replace paths with your own executable and directory.
+[[workloads]]
+name = "example-worker"
+description = "A minimal long-running process"
+executable = "/bin/sleep"
+args = ["3600"]
+working_directory = "/tmp"
+kind = "service"
+start_at_boot = false
+restart = "always"
+max_restarts = 5
+restart_delay_secs = 2
+stop_timeout_secs = 5
+
+[[workloads]]
+name = "example-job"
+description = "A scheduled command that exits"
+executable = "/bin/echo"
+args = ["Scheduled job completed"]
+working_directory = "/tmp"
+kind = "job"
+restart = "never"
+
+[workloads.schedule]
+every_secs = 3600
+timezone = "UTC"
+action = "start"
+missed = "skip"
+

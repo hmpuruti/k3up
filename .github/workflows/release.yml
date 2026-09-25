@@ -1,0 +1,63 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            asset: k3up-macos-arm64.zip
+          - os: ubuntu-latest
+            asset: k3up-linux-x86_64.tar.gz
+          - os: windows-latest
+            asset: k3up-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        run: |
+          packaging/macos/bundle.sh
+          ditto -c -k --keepParent "target/K3 Up.app" ${{ matrix.asset }}
+      - name: Package Linux binaries
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked --release --features desktop
+          tar -czf ${{ matrix.asset }} -C target/release k3up k3up-agent k3up-desktop
+      - name: Package Windows binaries and installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --locked --release --features desktop
+          Compress-Archive -Path target/release/k3up.exe, target/release/k3up-agent.exe, target/release/k3up-desktop.exe -DestinationPath ${{ matrix.asset }}
+          choco install nsis --no-progress -y
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" "-DVERSION=$version" "-DBINARIES=$pwd\target\release" "-DOUTFILE=$pwd\k3up-setup-x86_64.exe" packaging\windows\installer.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            k3up-setup-x86_64.exe
+          if-no-files-found: warn
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --title "K3 Up $GITHUB_REF_NAME" --generate-notes

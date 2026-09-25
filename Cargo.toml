@@ -1,0 +1,80 @@
+[package]
+name = "k3up"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Keep any application running as a background service on macOS, Linux and Windows, with auto-restart, scheduling and a desktop app"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/hmpuruti/k3up"
+homepage = "https://github.com/hmpuruti/k3up"
+keywords = ["service-manager", "process-manager", "supervisor", "windows-service", "daemon"]
+categories = ["command-line-utilities", "os", "gui"]
+# Only what building needs; installers, CI and README-only images stay in the repository.
+include = [
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/examples/**/*",
+    "/assets/branding/k3-up-app-icon.png",
+    "/assets/branding/k3-up-mark-on-dark.png",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+]
+
+[lib]
+name = "k3up"
+
+[[bin]]
+name = "k3up"
+path = "src/bin/k3up.rs"
+
+[[bin]]
+name = "k3up-agent"
+path = "src/bin/agent.rs"
+
+[[bin]]
+name = "k3up-desktop"
+path = "src/bin/desktop/main.rs"
+required-features = ["desktop"]
+
+[features]
+default = []
+desktop = ["dep:iced", "dep:iced_graphics", "dep:iced_tiny_skia"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+cron = "0.15"
+fs2 = "0.4"
+iced = { version = "0.13", optional = true, default-features = false, features = ["tiny-skia", "tokio", "advanced", "canvas", "image"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pinned exactly: src/bin/desktop/charts.rs works around canvas transform and clip bugs in these
+# releases. Remove the pins together with that workaround when upgrading Iced.
+iced_graphics = { version = "=0.13.0", optional = true }
+iced_tiny_skia = { version = "=0.13.0", optional = true }
+sysinfo = { version = "0.38", default-features = false, features = ["system", "disk"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Registry"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+# Whole-program optimisation: 12–19% smaller binaries, so less for the always-running agent
+# to keep in memory. Release builds take longer; development builds are unaffected.
+lto = "fat"
+codegen-units = 1
+strip = true
