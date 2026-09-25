@@ -105,10 +105,15 @@ impl LoginAgent {
         if self.is_registered() && self.start_supervised().is_ok() {
             return Ok(());
         }
-        self.spawn()
+        self.launch()
     }
 
-    fn spawn(&self) -> Result<()> {
+    /// Starts the agent directly, bypassing the login item's supervisor. For data directories
+    /// the login item does not manage. Does nothing if an agent is already running.
+    pub fn launch(&self) -> Result<()> {
+        if self.is_running() {
+            return Ok(());
+        }
         let data = platform::prepare_dir(&self.data)?;
         let log = OpenOptions::new()
             .create(true)

@@ -1,6 +1,7 @@
 pub mod autostart;
 pub mod client;
 pub mod engine;
+pub mod health;
 pub mod metrics;
 pub mod model;
 pub mod platform;

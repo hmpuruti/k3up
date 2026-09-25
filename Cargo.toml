@@ -28,7 +28,7 @@ name = "k3up"
 
 [[bin]]
 name = "k3up"
-path = "src/bin/k3up.rs"
+path = "src/bin/k3up/main.rs"
 
 [[bin]]
 name = "k3up-agent"
@@ -48,6 +48,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4.6"
 cron = "0.15"
 fs2 = "0.4"
 iced = { version = "0.13", optional = true, default-features = false, features = ["tiny-skia", "tokio", "advanced", "canvas", "image"] }

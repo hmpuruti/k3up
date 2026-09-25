@@ -151,44 +151,210 @@ k3up-desktop --data-dir ~/k3up-test
 
 On macOS and Linux the socket path must fit the operating system's limit of about 100 bytes, so keep custom data directories short. The agent reports a clear error when a path is too long.
 
-## Command line
+### Headless install
+
+On a server, or anywhere without the desktop app, the command line installs the agent. `cargo install k3up` puts `k3up` and `k3up-agent` side by side, which is what `agent install` needs.
 
 ```sh
+k3up agent install
+k3up agent status
+```
+
+- **Linux:** the login item is a systemd user service, which normally runs only while you are logged in. To keep the agent running without a login session, an administrator enables lingering once: `sudo loginctl enable-linger $USER`.
+- **macOS:** the login item is a launchd agent in `~/Library/LaunchAgents`, which runs while you are logged in. The first `agent install` shows a "Background Items Added" notice.
+- **Windows:** `agent install` writes a Run entry for your account and starts the agent. For a service that runs for every user without a login, use `agent install-service` from an elevated terminal instead, see [Windows](#windows).
+
+`agent uninstall` reverses the install and keeps your data.
+
+## Command line
+
+`k3up` manages the same agent as the desktop app, and covers everything the app does: installing the agent, defining workloads, starting and stopping them, and reading health. Every command has `--help` with an explanation and examples, and `k3up --help` covers the concepts.
+
+```sh
+k3up agent install
 k3up create worker --exe /usr/local/bin/worker --cwd /srv/worker -- --port 8080
 k3up start worker --wait --timeout 30
 k3up list
 k3up status worker --json
 k3up logs worker --follow
-k3up restart worker --wait
+k3up health
 k3up stop worker
 k3up remove worker
 ```
 
-Arguments after `--` are passed to the program exactly as written. K3 Up never runs commands through a shell. To use shell features, register the shell itself, such as `/bin/sh -c "..."` or `cmd.exe /c ...`.
+Arguments after `--` are passed to the program exactly as written. K3 Up never runs commands through a shell. To use shell features, register the shell itself, such as `--exe sh -- -c "cmd1 && cmd2"` or `--exe cmd.exe -- /c ...`.
 
-Manage workloads as a manifest:
+### Command-line reference
 
-```sh
-k3up validate examples/workloads.toml
-k3up apply examples/workloads.toml --dry-run
-k3up apply examples/workloads.toml
-k3up export --output saved-workloads.toml
+Global flags: `--data-dir DIR` selects the agent's data directory and `--json` prints the result as JSON. Boolean workload flags take an optional value, so `--start-at-boot=false` turns a setting off in `edit`.
+
+**Workloads**
+
+| Command | What it does |
+|---|---|
+| `create NAME --exe PROGRAM [flags] [-- ARGS...]` | Register a program. `--exe` is a path or a bare name found on PATH (and PATHEXT on Windows); the absolute path is stored. `--start` starts it, `--wait` waits like `start --wait`. |
+| `edit NAME [flags] [-- ARGS...]` | Change only the flags given. `--env` adds or replaces a variable, `--unset-env KEY` removes one, `--depends-on` and `-- ARGS` replace their lists. `--clear-env`, `--clear-depends-on`, `--clear-schedule`, `--clear-readiness`, `--clear-run-timeout` and `--clear-args` remove settings. A running workload needs `--restart-running`, which stops it, applies the change and starts it again. |
+| `show NAME` | The definition as a one-workload TOML manifest. With `--json`, the status object. |
+| `list` | Every workload with its state, process and reason. |
+| `status NAME` | One workload's state, process, restarts, next run, last exit and reason. |
+| `start NAME [--wait] [--timeout SECS]` | Start a workload and its dependencies. `--wait` returns once a service is running or a job has exited with 0. |
+| `stop NAME` | Stop a workload and remember the stop across agent restarts. |
+| `restart NAME [--wait] [--timeout SECS]` | Stop and start. |
+| `remove NAME [--stop]` | Delete the definition; the log file is kept. |
+| `logs NAME [--lines N] [--follow]` | The last lines of the log, or a live tail. |
+| `events [NAME] [--limit N]` | The activity history, newest first, up to 200. |
+| `schedule NAME --every SECS or --cron EXPR [--timezone TZ] [--schedule-action start or restart] [--catch-up]` | Replace the schedule. `--clear` removes it. |
+
+Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`, `--job`, `--start-at-boot`, `--env KEY=VALUE`, `--depends-on NAME`, `--readiness-tcp HOST:PORT`, `--restart never|on-failure|always`, `--max-restarts N`, `--restart-delay SECS`, `--stop-timeout SECS`, `--run-timeout SECS`, `--startup-timeout SECS`, `--every SECS`, `--cron EXPR`, `--timezone TZ`, `--schedule-action start|restart`, `--catch-up`. `k3up create --help` lists the ranges and defaults.
+
+**Manifests**
+
+| Command | What it does |
+|---|---|
+| `validate FILE` | Check a manifest without contacting the agent, and print the startup order. |
+| `apply FILE [--dry-run]` | Create or update the workloads in the file as one transaction. Never deletes. Running workloads must be stopped before their definition changes. |
+| `export [--output FILE]` | Every definition as a manifest. |
+| `template` | A complete, commented manifest showing every field, valid as printed. |
+
+**Health**
+
+| Command | What it does |
+|---|---|
+| `stats [NAME] [--watch SECS]` | Machine vitals and the resources of each running workload. With a name, one workload in detail with min, average and max CPU and memory. `--watch` redraws every N seconds. |
+| `health [--strict]` | The overall verdict: vitals, warnings and workloads needing attention. `--strict` exits with 1 unless the status is ok. |
+
+**Agent**
+
+| Command | What it does |
+|---|---|
+| `agent install` | Register the agent found beside `k3up` as a login item, start it and wait until it answers. Safe to repeat. Clears an opt-out made in the app. |
+| `agent uninstall` | Remove the login item, stop the agent and wait for it to exit. Data is kept. |
+| `agent start` | Start the agent now without registering it. |
+| `agent stop` | Stop the agent and every workload, and wait for it to exit. |
+| `agent status` | Reachability, version, process, uptime, data directory, executable, login item and workload counts. Exits with 1 when unreachable. |
+| `agent install-service`, `agent uninstall-service` | The Windows machine service, see [Windows](#windows). |
+
+**Other**
+
+| Command | What it does |
+|---|---|
+| `completions SHELL` | A completion script for bash, zsh, fish, PowerShell or elvish. |
+| `systemd-export FILE --output DIR`, `systemd-install FILE` | Native systemd units, see [Linux with systemd](#linux-with-systemd). |
+
+## Automation and AI agents
+
+`k3up` is built to be driven by scripts and by AI agents: every command is documented in `--help`, every result is available as JSON, and repeating a command never makes things worse.
+
+### The JSON contract
+
+With `--json`, most commands print the agent's response object, on success and on failure:
+
+| Field | Meaning |
+|---|---|
+| `ok` | `true` on success. The exit code is 1 when it is `false`. |
+| `message` | What happened, or the error. |
+| `workloads` | Status objects, for `list`, `status`, `start`, `restart`, `stats NAME` and `create --start`. Each has `workload` (the definition), `state`, `desired_running`, `pid`, `restart_count`, `started_at`, `next_run`, `last_exit` and `reason`. |
+| `events` | For `events`: `id`, `at`, `name` and `message`, newest first. |
+| `text` | Log output, or the text view of `stats` and `template`. |
+| `offset` | For `logs`: the byte offset to continue from. |
+| `manifest` | For `export`: `version` and `workloads`. |
+| `metrics` | For `stats`: `at`, `machine`, `agent`, `managed`, `workloads` and `data_bytes`. |
+| `agent` | For `agent install` and `agent start`: `version`, `pid`, `started_at`, `data_dir` and `executable`. |
+
+States are `stopped`, `pending`, `blocked`, `starting`, `running`, `backoff`, `completed` and `failed`. `failed`, `backoff` and `blocked` need attention.
+
+Three commands print their own shape. `show --json` prints the status object itself. `health --json` prints:
+
+```json
+{
+  "status": "ok",
+  "warnings": [{ "kind": "memory", "message": "Memory 90% used, above 85%" }],
+  "attention": [{ "name": "api", "state": "failed", "reason": "Process exited with code 1; restart limit reached", "last_exit": 1 }],
+  "machine": { "host": "...", "os": "...", "cores": 8, "cpu": 12.5, "memory_total": 0, "memory_used": 0, "swap_total": 0, "swap_used": 0, "disk_total": 0, "disk_available": 0, "load": [1.0, 1.0, 1.0], "uptime_secs": 0 },
+  "k3up": { "agent": { "cpu": 0.0, "memory": 0, "read_rate": 0, "write_rate": 0, "processes": 1 }, "workloads": { "cpu": 0.0, "memory": 0, "read_rate": 0, "write_rate": 0, "processes": 0 }, "data_bytes": 0, "workload_count": 0, "running": 0 }
+}
 ```
 
-`apply` creates or updates only the workloads in the file and never deletes the others. Stop a workload before changing its definition.
+`status` is `warning` when there is any warning or any workload needing attention. Warning kinds are `cpu`, `memory`, `swap` and `disk`.
 
-Manage schedules and history:
+`agent status --json` prints:
 
-```sh
-k3up schedule backup --cron '0 0 2 * * *' --timezone Europe/Berlin
-k3up schedule backup --every 3600
-k3up schedule backup --clear
-k3up events backup
+```json
+{
+  "reachable": true,
+  "version": "0.1.0",
+  "pid": 4242,
+  "started_at": "2026-09-25T12:00:00Z",
+  "uptime_secs": 3600,
+  "data_dir": "/home/me/.local/share/k3up",
+  "executable": "/usr/local/bin/k3up-agent",
+  "login_item": true,
+  "workloads": { "total": 3, "running": 2, "attention": 0 }
+}
 ```
 
-Every command accepts `--json` for structured output, including errors. Exit code 0 means success, 1 means the request failed, and 2 means the command line was invalid.
+When the agent is not reachable it prints `{ "reachable": false, "error": "...", "data_dir": "...", "login_item": false }` and exits with 1.
 
-`start --wait` and `restart --wait` return once a service is running (and has passed its TCP check, if it has one), or once a job has exited with code 0. They exit with 1 if the workload fails or stops.
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success. For `health --strict`, the status is ok. |
+| 1 | The request failed, the workload failed or stopped while waiting, the agent is unreachable, or `health --strict` found a problem. |
+| 2 | The command line was invalid. |
+
+### What is safe to repeat
+
+- `agent install`, `agent start`: leave a running agent alone and refresh the login item.
+- `agent stop`, `agent uninstall`: report "not running" when there is nothing to stop.
+- `apply`: skips unchanged workloads and reports "No changes".
+- `start`: does nothing to a running workload. `stop`: does nothing to a stopped one.
+- `edit` with values already in place: reports "No changes" without stopping anything.
+- `create`: fails when the name exists. Use `apply` or `edit` to update.
+
+### Recipes
+
+A web service with environment variables and a TCP check, started now and at every login:
+
+```sh
+k3up create web --exe node --cwd /srv/web --env NODE_ENV=production --env PORT=8080 \
+    --readiness-tcp 127.0.0.1:8080 --start-at-boot --start --wait -- server.js
+```
+
+A nightly job at 02:00 Berlin time, catching up one run if the machine was off:
+
+```sh
+k3up create backup --exe /usr/local/bin/backup.sh --cwd /srv --job \
+    --cron '0 0 2 * * *' --timezone Europe/Berlin --catch-up --run-timeout 3600
+```
+
+Change a running workload:
+
+```sh
+k3up edit web --env PORT=9090 --readiness-tcp 127.0.0.1:9090 --restart-running
+```
+
+Find out why a workload failed:
+
+```sh
+k3up status web --json | jq '{state: .workloads[0].state, reason: .workloads[0].reason, exit: .workloads[0].last_exit}'
+k3up events web --limit 20
+k3up logs web --lines 200
+```
+
+A machine health check for monitoring:
+
+```sh
+k3up health --strict --json > /var/log/k3up-health.json || alert "K3 Up needs attention"
+```
+
+Only the agent and the command line on a server, without the desktop app:
+
+```sh
+cargo install k3up
+k3up agent install
+k3up agent status
+```
 
 ## Configuration
 
@@ -252,7 +418,7 @@ A scheduled start overrides an earlier manual stop, so clear the schedule if you
 
 ## Health and resource use
 
-The desktop app's **Health** page and `k3up stats` show:
+The desktop app's **Health** page, `k3up stats` and `k3up health` show:
 - machine CPU, memory, swap, free space on the data volume, load average and uptime
 - the share of the machine used by K3 Up: its workloads, the agent and the desktop app
 - for each workload: process count, CPU, memory, disk read and write rates, log size and command, with CPU and memory sparklines in the app
@@ -313,12 +479,12 @@ systemctl --user status k3up-example-worker.service
 The installer and the desktop app run the agent under your own account. To run it instead as a machine-wide service, place `k3up.exe` and `k3up-agent.exe` in the same folder and run this from an elevated terminal:
 
 ```powershell
-.\k3up.exe install-agent
+.\k3up.exe agent install-service
 sc.exe start K3Up
 .\k3up.exe --data-dir "$env:ProgramData\K3 Up" list
 ```
 
-Installation copies the agent to `%ProgramFiles%\K3 Up` and keeps data in `%ProgramData%\K3 Up`. Both folders are created with access limited to SYSTEM and Administrators. If any step fails, the installer removes what it created. `.\k3up.exe uninstall-agent` stops and removes the service; the folders are left in place for you to review.
+Installation copies the agent to `%ProgramFiles%\K3 Up` and keeps data in `%ProgramData%\K3 Up`. Both folders are created with access limited to SYSTEM and Administrators. If any step fails, the installer removes what it created. `.\k3up.exe agent uninstall-service` stops and removes the service; the folders are left in place for you to review.
 
 The machine service runs as LocalSystem, and so do its workloads. Clients need an elevated terminal to reach it.
 
@@ -354,7 +520,9 @@ Workload definitions, including environment variables, are stored in plain text 
 | `src/autostart.rs` | Starting the agent at login |
 | `src/systemd.rs` | Native systemd unit generation |
 | `src/windows_host.rs`, `src/win32.rs` | Windows service hosting and security |
-| `src/bin/` | The `k3up` and `k3up-agent` programs |
+| `src/health.rs` | Health thresholds shared by the command line and the app |
+| `src/bin/agent.rs` | The `k3up-agent` program |
+| `src/bin/k3up/` | The `k3up` command line, one module per command group |
 | `src/bin/desktop/` | The desktop app |
 
 ## Development
