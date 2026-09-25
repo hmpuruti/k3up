@@ -324,11 +324,18 @@ fn optional_number<T: std::str::FromStr>(value: &str, label: &str) -> Result<Opt
 mod tests {
     use super::*;
 
+    /// Paths must be absolute on the platform running the tests.
     fn filled() -> Form {
         let mut form = Form::new(Workload::default(), false);
         form.name = "worker".into();
-        form.executable = "/bin/sleep".into();
-        form.directory = "/tmp".into();
+        (form.executable, form.directory) = if cfg!(windows) {
+            (
+                r"C:\Windows\System32\timeout.exe".into(),
+                r"C:\Windows\Temp".into(),
+            )
+        } else {
+            ("/bin/sleep".into(), "/tmp".into())
+        };
         form
     }
 

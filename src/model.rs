@@ -343,11 +343,17 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Paths must be absolute on the platform running the tests.
     fn service(name: &str) -> Workload {
+        let (executable, working_directory) = if cfg!(windows) {
+            (r"C:\Windows\System32\timeout.exe", r"C:\Windows\Temp")
+        } else {
+            ("/bin/sleep", "/tmp")
+        };
         Workload {
             name: name.into(),
-            executable: "/bin/sleep".into(),
-            working_directory: "/tmp".into(),
+            executable: executable.into(),
+            working_directory: working_directory.into(),
             ..Default::default()
         }
     }
