@@ -289,11 +289,14 @@ Three commands print their own shape. `show --json` prints the status object its
   "data_dir": "/home/me/.local/share/k3up",
   "executable": "/usr/local/bin/k3up-agent",
   "login_item": true,
+  "login_item_elsewhere": false,
   "workloads": { "total": 3, "running": 2, "attention": 0 }
 }
 ```
 
-When the agent is not reachable it prints `{ "reachable": false, "error": "...", "data_dir": "...", "login_item": false }` and exits with 1.
+When the agent is not reachable it prints `{ "reachable": false, "error": "...", "data_dir": "...", "login_item": false, "login_item_elsewhere": false }` and exits with 1.
+
+`login_item` is true only when the login item starts the agent for this data directory. There is one login item per user account; `login_item_elsewhere` is true when it belongs to a different data directory.
 
 ### Exit codes
 

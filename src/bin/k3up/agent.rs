@@ -1,7 +1,7 @@
 use crate::output::{Outcome, checked, duration};
 use anyhow::{Context, Result, bail};
 use k3up::{
-    autostart::{LoginAgent, bundled_agent},
+    autostart::{LoginAgent, Registration, bundled_agent},
     client::Client,
     platform,
     protocol::{Command, Response},
@@ -151,18 +151,18 @@ fn shutdown(client: &Client, login: &LoginAgent, timeout: u64) -> Result<String>
 
 pub fn status(client: &Client) -> Result<Outcome> {
     let login = login_for_data(client);
-    let registered = managed(client) && login.is_registered();
+    let registration = login.registration();
     let data_dir = client.data_dir.display().to_string();
     let info = match client.send(Command::Info) {
         Ok(response) if response.ok => response.agent,
-        Ok(response) => return Ok(unreachable(&response.message, &data_dir, registered)),
-        Err(error) => return Ok(unreachable(&format!("{error:#}"), &data_dir, registered)),
+        Ok(response) => return Ok(unreachable(&response.message, &data_dir, registration)),
+        Err(error) => return Ok(unreachable(&format!("{error:#}"), &data_dir, registration)),
     };
     let Some(info) = info else {
         return Ok(unreachable(
             "Agent gave no information",
             &data_dir,
-            registered,
+            registration,
         ));
     };
     let statuses = checked(client.send(Command::List)?)?.workloads;
@@ -182,11 +182,7 @@ pub fn status(client: &Client) -> Result<Outcome> {
         duration(uptime),
         info.data_dir,
         info.executable,
-        if registered {
-            "registered"
-        } else {
-            "not registered"
-        },
+        login_label(registration),
         statuses.len(),
         running,
         attention
@@ -201,28 +197,34 @@ pub fn status(client: &Client) -> Result<Outcome> {
             "uptime_secs": uptime,
             "data_dir": info.data_dir,
             "executable": info.executable,
-            "login_item": registered,
+            "login_item": registration == Registration::ThisDirectory,
+            "login_item_elsewhere": registration == Registration::OtherDirectory,
             "workloads": { "total": statuses.len(), "running": running, "attention": attention },
         }),
         ok: true,
     })
 }
 
-fn unreachable(error: &str, data_dir: &str, registered: bool) -> Outcome {
+fn login_label(registration: Registration) -> &'static str {
+    match registration {
+        Registration::ThisDirectory => "registered",
+        Registration::OtherDirectory => "registered for another data directory",
+        Registration::None => "not registered",
+    }
+}
+
+fn unreachable(error: &str, data_dir: &str, registration: Registration) -> Outcome {
     Outcome::Custom {
         text: format!(
             "Agent       not reachable  ·  {error}\nData        {data_dir}\nLogin item  {}",
-            if registered {
-                "registered"
-            } else {
-                "not registered"
-            }
+            login_label(registration)
         ),
         json: serde_json::json!({
             "reachable": false,
             "error": error,
             "data_dir": data_dir,
-            "login_item": registered,
+            "login_item": registration == Registration::ThisDirectory,
+            "login_item_elsewhere": registration == Registration::OtherDirectory,
         }),
         ok: false,
     }
