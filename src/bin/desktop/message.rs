@@ -82,7 +82,7 @@ pub enum Message {
     },
     ActionDone {
         session: u64,
-        result: Result<Response, String>,
+        result: Result<Box<Response>, String>,
     },
     MetricsLoaded {
         session: u64,

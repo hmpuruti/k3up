@@ -61,12 +61,25 @@ pub enum Command {
         after: Option<i64>,
     },
     Export,
+    /// The agent's version, process, start time and data directory.
+    Info,
+    /// Stops every workload in reverse dependency order, then exits the agent.
+    Shutdown,
     /// Waits until the agent's state generation exceeds `since`, or `timeout_ms` passes, and
     /// returns the current generation. Lets clients refresh on change instead of polling.
     Watch {
         since: u64,
         timeout_ms: u64,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub version: String,
+    pub pid: u32,
+    pub started_at: DateTime<Utc>,
+    pub data_dir: String,
+    pub executable: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -87,6 +100,8 @@ pub struct Response {
     pub metrics: Option<Box<crate::metrics::Metrics>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub agent: Option<AgentInfo>,
 }
 impl Response {
     pub fn success(message: impl Into<String>) -> Self {

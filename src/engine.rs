@@ -39,6 +39,7 @@ pub struct Engine {
     tracked: Vec<(String, u32)>,
     /// Bumped on every observable change; clients wait on it instead of polling.
     generation: tokio::sync::watch::Sender<u64>,
+    started_at: DateTime<Utc>,
 }
 
 impl Engine {
@@ -123,6 +124,7 @@ impl Engine {
             monitor: crate::metrics::Monitor::start(data.into()),
             tracked: vec![],
             generation: tokio::sync::watch::Sender::new(0),
+            started_at: now,
         };
         for (name, note) in notes {
             engine.event(&name, note)?;
@@ -403,6 +405,20 @@ impl Engine {
                 metrics: self.monitor.snapshot(since).map(Box::new),
                 ..Response::success("Metrics")
             }),
+            Command::Info => Ok(Response {
+                agent: Some(crate::protocol::AgentInfo {
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    pid: std::process::id(),
+                    started_at: self.started_at,
+                    data_dir: self.data.to_string_lossy().into_owned(),
+                    executable: std::env::current_exe()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                }),
+                ..Response::success("Agent")
+            }),
+            // The server intercepts this to stop its loop; reaching the engine means nothing to do.
+            Command::Shutdown => Ok(Response::success("Shutting down")),
             Command::Watch { .. } => Ok(Response {
                 generation: Some(*self.generation.borrow()),
                 ..Response::success("Generation")

@@ -461,7 +461,10 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    client.send(command).map_err(|error| format!("{error:#}"))
+                    client
+                        .send(command)
+                        .map(Box::new)
+                        .map_err(|error| format!("{error:#}"))
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))

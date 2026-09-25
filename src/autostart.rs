@@ -36,8 +36,8 @@ pub fn bundled_agent() -> Option<PathBuf> {
 /// Starts the agent for the current user at login and on demand.
 ///
 /// macOS uses a launchd LaunchAgent and Linux a systemd user service; both restart the agent
-/// after a crash. Windows has no per-user supervisor, so its Run entry launches the calling
-/// program with `--start-agent`, which must start the agent and exit.
+/// after a crash. On Windows a Run entry launches the agent at login; it has no supervisor to
+/// restart the agent after a crash.
 #[derive(Clone, Debug)]
 pub struct LoginAgent {
     agent: PathBuf,
@@ -239,12 +239,11 @@ impl LoginAgent {
 #[cfg(windows)]
 impl LoginAgent {
     fn run_entry(&self) -> Result<String> {
-        let launcher = std::env::current_exe()?;
         // A trailing backslash would escape the closing quote.
         let data = self.data.to_string_lossy();
         Ok(format!(
-            "\"{}\" --start-agent --data-dir \"{}\"",
-            launcher.display(),
+            "\"{}\" --data-dir \"{}\"",
+            self.agent.display(),
             data.trim_end_matches('\\')
         ))
     }

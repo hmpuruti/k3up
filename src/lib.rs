@@ -8,6 +8,7 @@ pub mod protocol;
 pub mod server;
 pub mod store;
 pub mod systemd;
+pub mod user_path;
 #[cfg(windows)]
 pub mod win32;
 #[cfg(windows)]

@@ -1,3 +1,6 @@
+// A console-subsystem agent started by a login entry would keep a console window open.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use clap::Parser;
 use k3up::{platform, server};
 use std::path::PathBuf;
