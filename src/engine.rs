@@ -51,29 +51,29 @@ impl Engine {
         for record in store.load()? {
             let desired = record.desired && record.workload.kind == Kind::Service;
             let mut next = record.next_run;
-            if let Some(schedule) = &record.workload.schedule {
-                if next.is_none() || (next < Some(now) && schedule.missed == Missed::Skip) {
-                    // An expired or unreadable schedule must never keep the agent from starting.
-                    next = match schedule.next_after(now) {
-                        Ok(Some(next)) => Some(next),
-                        Ok(None) => {
-                            if record.next_run.is_some() {
-                                notes.push((
-                                    record.workload.name.clone(),
-                                    "Schedule has no further executions".to_string(),
-                                ));
-                            }
-                            None
-                        }
-                        Err(error) => {
+            if let Some(schedule) = &record.workload.schedule
+                && (next.is_none() || (next < Some(now) && schedule.missed == Missed::Skip))
+            {
+                // An expired or unreadable schedule must never keep the agent from starting.
+                next = match schedule.next_after(now) {
+                    Ok(Some(next)) => Some(next),
+                    Ok(None) => {
+                        if record.next_run.is_some() {
                             notes.push((
                                 record.workload.name.clone(),
-                                format!("Schedule disabled: {error:#}"),
+                                "Schedule has no further executions".to_string(),
                             ));
-                            None
                         }
-                    };
-                }
+                        None
+                    }
+                    Err(error) => {
+                        notes.push((
+                            record.workload.name.clone(),
+                            format!("Schedule disabled: {error:#}"),
+                        ));
+                        None
+                    }
+                };
             }
             store.runtime(&record.workload.name, desired, next)?;
             let status = Status {
@@ -474,10 +474,10 @@ impl Engine {
             }
             let existing = merged.get(&spec.name);
             if existing != Some(spec) {
-                if let Some(entry) = self.entries.get(&spec.name) {
-                    if entry.process.is_some() || entry.status.desired_running {
-                        bail!("Stop '{}' before changing its definition", spec.name);
-                    }
+                if let Some(entry) = self.entries.get(&spec.name)
+                    && (entry.process.is_some() || entry.status.desired_running)
+                {
+                    bail!("Stop '{}' before changing its definition", spec.name);
                 }
                 changes.push(format!(
                     "{} {}",
@@ -689,8 +689,8 @@ impl Engine {
             && spec.kind == Kind::Service
             && (spec.restart == Restart::Always
                 || (spec.restart == Restart::OnFailure && code != 0));
-        let message;
-        if retry && entry.status.restart_count < spec.max_restarts {
+
+        let message = if retry && entry.status.restart_count < spec.max_restarts {
             let delay = spec
                 .restart_delay_secs
                 .saturating_mul(2u64.saturating_pow(entry.status.restart_count.min(16)))
@@ -698,10 +698,10 @@ impl Engine {
             entry.status.restart_count += 1;
             entry.retry_at = Some(Utc::now() + Duration::seconds(delay as i64));
             entry.status.state = State::Backoff;
-            message = format!(
+            format!(
                 "{reason}; retry {}/{} in {delay}s",
                 entry.status.restart_count, spec.max_restarts
-            );
+            )
         } else {
             entry.status.state = if code == 0 {
                 State::Completed
@@ -709,12 +709,12 @@ impl Engine {
                 State::Failed
             };
             entry.status.desired_running = false;
-            message = if retry {
+            if retry {
                 format!("{reason}; restart limit reached")
             } else {
                 reason
-            };
-        }
+            }
+        };
         self.persist(name)?;
         self.event(name, message)
     }

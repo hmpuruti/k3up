@@ -757,10 +757,10 @@ impl App {
             }
             Message::ClearOutput => self.logs.clear_view(),
             Message::Dismiss => {
-                if let Some(notice) = self.notice.take() {
-                    if notice.tone == Tone::Warning {
-                        self.dismissed_warning = Some(notice.text);
-                    }
+                if let Some(notice) = self.notice.take()
+                    && notice.tone == Tone::Warning
+                {
+                    self.dismissed_warning = Some(notice.text);
                 }
             }
         }

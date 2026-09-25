@@ -69,7 +69,9 @@ fn service_main(_: Vec<OsString>) {
                     // Stopping workloads can take each one's full stop timeout. Advancing the
                     // checkpoint tells the Service Control Manager the agent is still progressing.
                     tokio::spawn(async move {
-                        for checkpoint in 1.. {
+                        let mut checkpoint = 0u32;
+                        loop {
+                            checkpoint = checkpoint.wrapping_add(1);
                             report(handle, ServiceState::StopPending, checkpoint, 0);
                             tokio::time::sleep(Duration::from_secs(5)).await;
                         }
