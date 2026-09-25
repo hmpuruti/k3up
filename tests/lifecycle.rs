@@ -631,7 +631,12 @@ async fn idle_agent_sleeps_until_something_is_due() {
         .await
         .unwrap();
     let running = engine.next_wake();
-    assert!(running > Duration::from_secs(5), "{running:?}");
+    // Unix wakes on SIGCHLD, so it can sleep; Windows polls running processes every second.
+    if cfg!(unix) {
+        assert!(running > Duration::from_secs(5), "{running:?}");
+    } else {
+        assert!(running <= Duration::from_millis(1005), "{running:?}");
+    }
     engine.shutdown().await.unwrap();
 }
 
