@@ -40,6 +40,7 @@ K3 Up is written in Rust. It has no browser runtime, no .NET, no listening netwo
 - Per-workload logs with rotation, and an activity history of every lifecycle decision and its reason.
 - A health view of machine CPU, memory, swap and disk, and of the CPU, memory, disk I/O and log size of every workload and of K3 Up itself.
 - Define workloads in the app, with CLI flags, or in a versioned TOML manifest you can validate, preview and apply as one transaction.
+- Organise a large fleet into folders such as `watchtower/entra`, and list, start, stop, restart or export a folder at a time.
 - Export workloads as native systemd services and timers on Linux.
 - Run the agent as a Windows service, with each workload's processes contained in a Job Object.
 
@@ -175,6 +176,7 @@ k3up agent install
 k3up create worker --exe /usr/local/bin/worker --cwd /srv/worker -- --port 8080
 k3up start worker --wait --timeout 30
 k3up list
+k3up groups
 k3up status worker --json
 k3up logs worker --follow
 k3up health
@@ -193,27 +195,28 @@ Global flags: `--data-dir DIR` selects the agent's data directory and `--json` p
 | Command | What it does |
 |---|---|
 | `create NAME --exe PROGRAM [flags] [-- ARGS...]` | Register a program. `--exe` is a path or a bare name found on PATH (and PATHEXT on Windows); the absolute path is stored. `--start` starts it, `--wait` waits like `start --wait`. |
-| `edit NAME [flags] [-- ARGS...]` | Change only the flags given. `--env` adds or replaces a variable, `--unset-env KEY` removes one, `--depends-on`, `--success-exit-code` and `-- ARGS` replace their lists. `--clear-env`, `--clear-depends-on`, `--clear-schedule`, `--clear-readiness`, `--clear-run-timeout`, `--clear-args` and `--clear-success-exit-codes` remove settings. A running workload needs `--restart-running`, which stops it, applies the change and starts it again. |
+| `edit NAME [flags] [-- ARGS...]` | Change only the flags given. `--env` adds or replaces a variable, `--unset-env KEY` removes one, `--depends-on`, `--success-exit-code` and `-- ARGS` replace their lists. `--clear-env`, `--clear-depends-on`, `--clear-schedule`, `--clear-readiness`, `--clear-run-timeout`, `--clear-args`, `--clear-success-exit-codes` and `--clear-group` remove settings. `--group`, `--clear-group` and `--description` apply to a running workload at once; any other change needs `--restart-running`, which stops it, applies the change and starts it again. |
 | `show NAME` | The definition as a one-workload TOML manifest, without restart settings for a job. With `--json`, the status object. |
-| `list` | Every workload with its state, process and reason. |
+| `list [--group PATH]` | Every workload with its state, process and reason, under its folder. `--group` limits it to one folder and its subfolders. |
+| `groups` | The folder tree: each folder with the number of workloads inside it, including subfolders, and their states. |
 | `status NAME` | One workload's state, process, restarts, next run, last exit and reason. |
-| `start NAME [--wait] [--timeout SECS]` | Start a workload and its dependencies. `--wait` returns once a service is running or a job has exited with 0 or one of its success exit codes. |
-| `stop NAME` | Stop a workload and remember the stop across agent restarts. |
-| `restart NAME [--wait] [--timeout SECS]` | Stop and start. |
+| `start NAME or --group PATH [--wait] [--timeout SECS]` | Start a workload and its dependencies, or every workload in a folder in dependency order. `--wait` returns once a service is running or a job has exited with 0 or one of its success exit codes; for a folder it applies to all of them. |
+| `stop NAME or --group PATH` | Stop a workload and remember the stop across agent restarts. A folder is stopped in reverse dependency order. |
+| `restart NAME or --group PATH [--wait] [--timeout SECS]` | Stop and start, one workload or a folder. |
 | `remove NAME [--stop]` | Delete the definition; the log file is kept. |
 | `logs NAME [--lines N] [--follow]` | The last lines of the log, or a live tail. |
 | `events [NAME] [--limit N]` | The activity history, newest first, up to 200. |
 | `schedule NAME --every SECS or --cron EXPR [--timezone TZ] [--schedule-action start or restart] [--catch-up]` | Replace the schedule. `--clear` removes it. |
 
-Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`, `--job`, `--start-at-boot`, `--env KEY=VALUE`, `--depends-on NAME`, `--readiness-tcp HOST:PORT`, `--restart never|on-failure|always`, `--max-restarts N|unlimited`, `--restart-delay SECS`, `--restart-backoff exponential|fixed`, `--success-exit-code CODE`, `--stop-timeout SECS`, `--run-timeout SECS`, `--startup-timeout SECS`, `--every SECS`, `--cron EXPR`, `--timezone TZ`, `--schedule-action start|restart`, `--catch-up`. `k3up create --help` lists the ranges and defaults. The four restart flags apply to services only and are refused for a job.
+Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`, `--group PATH`, `--job`, `--start-at-boot`, `--env KEY=VALUE`, `--depends-on NAME`, `--readiness-tcp HOST:PORT`, `--restart never|on-failure|always`, `--max-restarts N|unlimited`, `--restart-delay SECS`, `--restart-backoff exponential|fixed`, `--success-exit-code CODE`, `--stop-timeout SECS`, `--run-timeout SECS`, `--startup-timeout SECS`, `--every SECS`, `--cron EXPR`, `--timezone TZ`, `--schedule-action start|restart`, `--catch-up`. `k3up create --help` lists the ranges and defaults. The four restart flags apply to services only and are refused for a job.
 
 **Manifests**
 
 | Command | What it does |
 |---|---|
 | `validate FILE` | Check a manifest without contacting the agent, and print the startup order. |
-| `apply FILE [--dry-run]` | Create or update the workloads in the file as one transaction. Never deletes. Running workloads must be stopped before their definition changes. |
-| `export [--output FILE]` | Every definition as a manifest. |
+| `apply FILE [--dry-run]` | Create or update the workloads in the file as one transaction. Never deletes. Running workloads must be stopped before their definition changes, except for `group` and `description`. |
+| `export [--output FILE] [--group PATH]` | Every definition as a manifest, or only one folder and its subfolders. |
 | `template` | A complete, commented manifest showing every field, valid as printed. |
 
 **Health**
@@ -266,7 +269,7 @@ With `--json`, most commands print the agent's response object, on success and o
 |---|---|
 | `ok` | `true` on success. The exit code is 1 when it is `false`. |
 | `message` | What happened, or the error. |
-| `workloads` | Status objects, for `list`, `status`, `start`, `restart`, `stats NAME` and `create --start`. Each has `workload` (the definition), `state`, `desired_running`, `pid`, `restart_count`, `started_at`, `next_run`, `last_exit` and `reason`. In the definition, `max_restarts` is a number or the string `"unlimited"`, and `success_exit_codes` lists the exit codes besides 0 that count as success. `last_exit` is always the real code. |
+| `workloads` | Status objects, for `list`, `status`, `start`, `restart`, `stats NAME`, `create --start` and the `--group` forms of `start`, `stop` and `restart`. Each has `workload` (the definition), `state`, `desired_running`, `pid`, `restart_count`, `started_at`, `next_run`, `last_exit` and `reason`. In the definition, `group` is the folder path or `""`, `max_restarts` is a number or the string `"unlimited"`, and `success_exit_codes` lists the exit codes besides 0 that count as success. `last_exit` is always the real code. |
 | `events` | For `events`: `id`, `at`, `name` and `message`, newest first. |
 | `text` | Log output, or the text view of `stats` and `template`. |
 | `offset` | For `logs`: the byte offset to continue from. |
@@ -276,7 +279,16 @@ With `--json`, most commands print the agent's response object, on success and o
 
 States are `stopped`, `pending`, `blocked`, `starting`, `running`, `backoff`, `completed` and `failed`. `failed`, `backoff` and `blocked` need attention.
 
-Three commands print their own shape. `show --json` prints the status object itself. `health --json` prints:
+Four commands print their own shape. `show --json` prints the status object itself. `groups --json` prints one object per folder, parents before children, where `attention` counts the failed, backoff and blocked workloads:
+
+```json
+[
+  { "path": "watchtower", "workloads": 12, "running": 10, "attention": 1 },
+  { "path": "watchtower/entra", "workloads": 4, "running": 4, "attention": 0 }
+]
+```
+
+`health --json` prints:
 
 ```json
 {
@@ -325,7 +337,8 @@ When the agent is not reachable it prints `{ "reachable": false, "error": "...",
 - `agent stop`, `agent uninstall`: report "not running" when there is nothing to stop.
 - `apply`: skips unchanged workloads and reports "No changes".
 - `start`: does nothing to a running workload. `stop`: does nothing to a stopped one.
-- `edit` with values already in place: reports "No changes" without stopping anything.
+- `edit` with values already in place: reports "No changes" without stopping anything. `edit --group` and `edit --description` never stop anything.
+- `start --group`, `stop --group`, `restart --group`: attempt every workload in the folder and exit with 1 if any failed, so a second run picks up the ones that did not make it.
 - `create`: fails when the name exists. Use `apply` or `edit` to update.
 
 ### Recipes
@@ -358,6 +371,18 @@ k3up events web --limit 20
 k3up logs web --lines 200
 ```
 
+Organise a fleet into folders, then restart one folder:
+
+```sh
+k3up edit entra-users --group watchtower/entra
+k3up edit entra-devices --group watchtower/entra
+k3up edit intune-policies --group watchtower/intune
+k3up groups
+k3up restart --group watchtower/entra --wait
+```
+
+The `edit` calls apply while the workloads run. `apply` does the same for a manifest with `group` set on each workload.
+
 A machine health check for monitoring:
 
 ```sh
@@ -380,6 +405,7 @@ version = 1
 [[workloads]]
 name = "worker"
 description = "Background application worker"
+group = "myapp/workers"
 executable = "/opt/myapp/worker"
 args = ["--port", "8080"]
 working_directory = "/opt/myapp"
@@ -412,6 +438,14 @@ Restart settings:
 `success_exit_codes` lists exit codes besides 0 that count as success, for jobs and services: up to 32 codes, without duplicates or 0. A job that exits with one of them is completed, and a service with `restart = "on_failure"` is not restarted. The activity history shows the real code, for example `Process exited with code 3, counted as success`.
 
 `start_at_boot = true` starts a service when it is first registered. After that, the agent remembers whether you last started or stopped it, and restores that state whenever the agent starts.
+
+### Groups
+
+`group` is a folder path such as `watchtower/entra`: up to 5 segments separated by `/`, each 1 to 64 characters of letters, digits, spaces, `-`, `_` or `.`, without leading or trailing spaces, and at most 128 characters in all. Leave it out for no folder.
+
+Folders are matched without regard to case, so `Watchtower/Entra` and `watchtower/entra` are the same folder; it is shown with the spelling of its first workload in sorted order. A folder includes its subfolders: `--group watchtower` covers `watchtower/entra`, but not `watchtower-old`. Groups are organisation only. They never affect dependencies or start order, and `apply` and `edit` can change them on a running workload.
+
+In the desktop app the workload list shows folders as a collapsible tree, each with its count and a colour for the state of everything inside it, with start and stop for the whole folder.
 
 ### Dependencies
 
@@ -499,7 +533,7 @@ k3up systemd-install examples/workloads.toml
 systemctl --user status k3up-example-worker.service
 ```
 
-`systemd-install` installs user units and refuses to overwrite existing files. If `systemctl` fails partway, it removes the units it wrote. Export supports interval schedules with `action = "start"` and `missed = "skip"`, and rejects cron schedules, scheduled restarts, catch-up and TCP checks rather than silently dropping them. `success_exit_codes` becomes `SuccessExitStatus=`, `max_restarts = "unlimited"` disables systemd's start rate limit, and `restart_delay_secs` becomes `RestartSec=`; systemd does not double the delay, so an exponential backoff is exported as its first delay. Generated services require systemd with `Type=exec` support, such as RHEL 9 or newer. To run user units without an active login session, an administrator must enable lingering for the account.
+`systemd-install` installs user units and refuses to overwrite existing files. `group` is metadata and is not carried into the units. If `systemctl` fails partway, it removes the units it wrote. Export supports interval schedules with `action = "start"` and `missed = "skip"`, and rejects cron schedules, scheduled restarts, catch-up and TCP checks rather than silently dropping them. `success_exit_codes` becomes `SuccessExitStatus=`, `max_restarts = "unlimited"` disables systemd's start rate limit, and `restart_delay_secs` becomes `RestartSec=`; systemd does not double the delay, so an exponential backoff is exported as its first delay. Generated services require systemd with `Type=exec` support, such as RHEL 9 or newer. To run user units without an active login session, an administrator must enable lingering for the account.
 
 ### Windows
 
@@ -539,6 +573,7 @@ Workload definitions, including environment variables, are stored in plain text 
 | Path | Contents |
 |---|---|
 | `src/model.rs` | Workload definitions, schedules and dependency validation |
+| `src/group.rs` | Folder paths and the folder tree shared by the command line and the app |
 | `src/engine.rs` | Lifecycle state, recovery, scheduling and supervision |
 | `src/server.rs`, `src/client.rs`, `src/protocol.rs` | The local request protocol |
 | `src/store.rs` | SQLite storage for definitions and activity |

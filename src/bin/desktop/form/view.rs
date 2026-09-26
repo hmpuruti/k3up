@@ -8,7 +8,9 @@ use crate::{
 use iced::{
     Alignment, Element, Font,
     Length::Fill,
-    widget::{Space, column, container, pick_list, row, scrollable, text, text_editor, toggler},
+    widget::{
+        Space, column, combo_box, container, pick_list, row, scrollable, text, text_editor, toggler,
+    },
 };
 use k3up::model::{Kind, Missed, Restart, RestartBackoff, ScheduleAction};
 
@@ -183,6 +185,7 @@ fn program(form: &Form) -> Element<'_, Message> {
         column![
             widgets::field("NAME", name),
             text_field("DESCRIPTION", "", &form.description, Field::Description),
+            widgets::field("GROUP", widgets::clip(folder_picker(form))),
             mono_field("EXECUTABLE", exe_hint, &form.executable, Field::Executable),
             mono_field(
                 "WORKING DIRECTORY",
@@ -194,6 +197,18 @@ fn program(form: &Form) -> Element<'_, Message> {
         ]
         .spacing(theme::SPACE_LG),
     )
+}
+
+/// Existing folders are offered as you type; any valid path is accepted.
+fn folder_picker(form: &Form) -> Element<'_, Message> {
+    let set = |value| Message::Form(FormMessage::Text(Field::Group, value));
+    combo_box(&form.folders, "folder/subfolder", Some(&form.group), set)
+        .on_input(set)
+        .padding([9, 11])
+        .size(f32::from(theme::TEXT_INPUT))
+        .input_style(theme::input)
+        .menu_style(theme::menu)
+        .into()
 }
 
 fn arguments(form: &Form) -> Element<'_, Message> {
