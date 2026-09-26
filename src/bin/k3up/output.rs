@@ -74,8 +74,8 @@ fn print_response(response: Response, json: bool) -> Result<bool> {
 /// Folders come first as header lines above their workloads; ungrouped workloads follow.
 fn print_workloads(workloads: &[k3up::model::Status]) {
     println!(
-        "{:<24} {:<12} {:<8} {:<8} REASON",
-        "NAME", "STATE", "PID", "RETRIES"
+        "{:<24} {:<12} {:<8} {:<8} {:<6} {:<12} REASON",
+        "NAME", "STATE", "PID", "RETRIES", "EXIT", "NEXT RUN"
     );
     let tree = k3up::group::tree(workloads);
     for folder in &tree.folders {
@@ -93,18 +93,31 @@ fn print_workloads(workloads: &[k3up::model::Status]) {
 }
 
 fn print_status(status: &k3up::model::Status, indent: &str) {
+    let dash = || "-".to_string();
     println!(
-        "{indent}{:<width$} {:<12} {:<8} {:<8} {}",
+        "{indent}{:<width$} {:<12} {:<8} {:<8} {:<6} {:<12} {}",
         status.workload.name,
         status.state,
-        status
-            .pid
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "-".into()),
+        status.pid.map(|id| id.to_string()).unwrap_or_else(dash),
         status.restart_count,
+        status
+            .last_exit
+            .map(|code| code.to_string())
+            .unwrap_or_else(dash),
+        status
+            .next_run
+            .map(|at| next_run(at, chrono::Utc::now()))
+            .unwrap_or_else(dash),
         status.reason,
         width = 24 - indent.len()
     );
+}
+
+fn next_run(at: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    match (at - now).num_seconds() {
+        ..=0 => "now".into(),
+        seconds => format!("in {}", duration(seconds as u64)),
+    }
 }
 
 pub fn bytes(value: u64) -> String {
@@ -155,5 +168,15 @@ mod tests {
         assert_eq!(duration(125), "2m 5s");
         assert_eq!(duration(3_660), "1h 1m");
         assert_eq!(duration(90_000), "1d 1h");
+    }
+
+    #[test]
+    fn next_run_is_relative_to_now() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            next_run(now + chrono::TimeDelta::seconds(300), now),
+            "in 5m 0s"
+        );
+        assert_eq!(next_run(now - chrono::TimeDelta::seconds(1), now), "now");
     }
 }

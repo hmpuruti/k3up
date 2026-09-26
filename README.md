@@ -246,7 +246,20 @@ Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`
 
 ## Automation and AI agents
 
-`k3up` is built to be driven by scripts and by AI agents: every command is documented in `--help`, every result is available as JSON, and repeating a command never makes things worse.
+`k3up` is built to be driven by scripts and by AI agents: every command is documented in `--help`, every result is available as JSON, and repeating a command never makes things worse. [AGENTS.md](AGENTS.md) is a one-page summary for AI coding agents.
+
+### Changes outside the data directory
+
+Four commands change the system: `agent install` and `agent uninstall` add or remove a login item, and `agent install-service` and `agent uninstall-service` add or remove the Windows service. The login item only serves the default data directory, so `agent install` and `agent uninstall` refuse any other. Every other command only reads and writes the data directory.
+
+To try K3 Up without changing the system, use a scratch directory and start the agent directly:
+
+```sh
+export K3UP_DATA_DIR=/tmp/k3try
+k3up agent start
+k3up create clock --exe sh --start -- -c 'while :; do date; sleep 2; done'
+k3up agent stop && rm -rf /tmp/k3try
+```
 
 ### The JSON contract
 
@@ -459,6 +472,8 @@ Use either `every_secs` or `cron`. Cron expressions have 6 or 7 fields, starting
 - `action = "restart"` stops and starts a service.
 - `missed = "skip"` ignores runs missed while the agent was down.
 - `missed = "run_once"` runs once to catch up after downtime.
+
+A schedule is active as soon as it is set; the workload does not need to be started. Between runs it shows as `stopped`, and the NEXT RUN column of `k3up list` shows when it runs next.
 
 A scheduled start overrides an earlier manual stop, so clear the schedule if you want a workload to stay stopped. The agent records the next run before starting the current one. A crash at the wrong moment can therefore skip a run, but never repeats one.
 
