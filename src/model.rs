@@ -18,6 +18,8 @@ const MAX_RETRY_DELAY_SECS: u64 = 300;
 pub struct Workload {
     pub name: String,
     pub description: String,
+    /// Folder path such as `watchtower/entra`; empty means no folder.
+    pub group: String,
     pub executable: String,
     pub args: Vec<String>,
     pub working_directory: String,
@@ -42,6 +44,7 @@ impl Default for Workload {
         Self {
             name: String::new(),
             description: String::new(),
+            group: String::new(),
             executable: String::new(),
             args: vec![],
             working_directory: String::new(),
@@ -185,9 +188,12 @@ struct Printable<'a>(&'a Workload);
 impl Serialize for Printable<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let workload = self.0;
-        let mut state = serializer.serialize_struct("Workload", 20)?;
+        let mut state = serializer.serialize_struct("Workload", 21)?;
         state.serialize_field("name", &workload.name)?;
         state.serialize_field("description", &workload.description)?;
+        if !workload.group.is_empty() {
+            state.serialize_field("group", &workload.group)?;
+        }
         state.serialize_field("executable", &workload.executable)?;
         state.serialize_field("args", &workload.args)?;
         state.serialize_field("working_directory", &workload.working_directory)?;
@@ -289,6 +295,16 @@ impl Workload {
         toml::to_string_pretty(&Printable(self))
     }
 
+    /// Group and description are labels: changing them never affects a running process.
+    pub fn only_labels_differ(&self, other: &Workload) -> bool {
+        let relabelled = Workload {
+            group: other.group.clone(),
+            description: other.description.clone(),
+            ..self.clone()
+        };
+        self != other && relabelled == *other
+    }
+
     /// First execution for a new or changed definition. Registering an exhausted schedule is refused.
     pub fn first_run(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
         let Some(schedule) = &self.schedule else {
@@ -314,6 +330,7 @@ impl Workload {
         {
             bail!("Name must be 1–64 ASCII letters, digits, underscores, or hyphens");
         }
+        crate::group::validate(&self.group)?;
         if !paths.is_absolute(&self.executable) || self.executable.contains(['\0', '\n', '\r']) {
             bail!("Executable must be an absolute path without control characters");
         }
@@ -410,11 +427,18 @@ impl Manifest {
         if self.version != 1 {
             bail!("Unsupported manifest version {}; expected 1", self.version);
         }
-        let mut by_name = BTreeMap::new();
         for workload in &self.workloads {
             workload
                 .validate_for(paths)
                 .with_context(|| format!("Invalid workload '{}'", workload.name))?;
+        }
+        self.order()
+    }
+
+    /// Startup order: dependencies before dependents, otherwise by name. Groups play no part.
+    pub fn order(&self) -> Result<Vec<String>> {
+        let mut by_name = BTreeMap::new();
+        for workload in &self.workloads {
             if by_name.insert(workload.name.clone(), workload).is_some() {
                 bail!("Duplicate name '{}'", workload.name);
             }
@@ -453,7 +477,9 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     #[default]
@@ -665,6 +691,64 @@ mod tests {
         assert_eq!(workload.max_restarts, RestartLimit::Count(5));
         assert_eq!(workload.restart_backoff, RestartBackoff::Exponential);
         assert!(workload.success_exit_codes.is_empty());
+        assert_eq!(workload.group, "");
+        let manifest: Manifest = toml::from_str(
+            "version = 1\n[[workloads]]\nname = \"old\"\nexecutable = \"/bin/sleep\"\nworking_directory = \"/tmp\"\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.workloads[0].group, "");
+    }
+    #[test]
+    fn group_is_validated_and_printed_only_when_set() {
+        let mut grouped = service("users");
+        grouped.group = "Watchtower/Entra".into();
+        grouped.validate().unwrap();
+        let text = grouped.to_toml().unwrap();
+        assert!(text.contains("group = \"Watchtower/Entra\"\n"), "{text}");
+        assert_eq!(toml::from_str::<Workload>(&text).unwrap(), grouped);
+        let json = serde_json::to_value(&grouped).unwrap();
+        assert_eq!(json["group"], "Watchtower/Entra");
+        let plain = service("plain");
+        assert!(!plain.to_toml().unwrap().contains("group"));
+        assert_eq!(serde_json::to_value(&plain).unwrap()["group"], "");
+        let mut invalid = service("invalid");
+        invalid.group = "a//b".into();
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("empty segments")
+        );
+        invalid.group = "a/b/c/d/e/f".into();
+        assert!(invalid.validate().is_err());
+    }
+    #[test]
+    fn label_changes_are_told_apart_from_real_changes() {
+        let base = service("web");
+        let mut relabelled = base.clone();
+        relabelled.group = "watchtower".into();
+        relabelled.description = "Users".into();
+        assert!(base.only_labels_differ(&relabelled));
+        assert!(relabelled.only_labels_differ(&base));
+        assert!(!base.only_labels_differ(&base));
+        let mut changed = relabelled.clone();
+        changed.args.push("--x".into());
+        assert!(!base.only_labels_differ(&changed));
+    }
+    #[test]
+    fn order_ignores_groups() {
+        let mut api = service("api");
+        api.group = "a".into();
+        api.depends_on.push("db".into());
+        let mut db = service("db");
+        db.group = "z".into();
+        let manifest = Manifest {
+            version: 1,
+            workloads: vec![api, db],
+        };
+        assert_eq!(manifest.order().unwrap(), vec!["db", "api"]);
+        assert_eq!(manifest.validate().unwrap(), vec!["db", "api"]);
     }
     #[test]
     fn retry_delay_doubles_with_a_cap_or_stays_fixed() {

@@ -1,7 +1,8 @@
-use crate::output::checked;
-use anyhow::{Context, Result};
+use crate::{groups, output::checked};
+use anyhow::{Context, Result, bail};
 use k3up::{
     client::Client,
+    group,
     model::Manifest,
     protocol::{Command, Response},
 };
@@ -34,8 +35,18 @@ pub fn apply(client: &Client, file: &Path, dry_run: bool) -> Result<Response> {
     })
 }
 
-pub fn export(client: &Client, output: Option<PathBuf>) -> Result<Response> {
-    let response = checked(client.send(Command::Export)?)?;
+pub fn export(client: &Client, output: Option<PathBuf>, folder: Option<&str>) -> Result<Response> {
+    let mut response = checked(client.send(Command::Export)?)?;
+    if let Some(folder) = folder {
+        groups::check_folder(folder)?;
+        let manifest = response.manifest.as_mut().unwrap();
+        manifest
+            .workloads
+            .retain(|workload| group::contains(folder, &workload.group));
+        if manifest.workloads.is_empty() {
+            bail!("No workloads in folder '{folder}'");
+        }
+    }
     let Some(output) = output else {
         return Ok(response);
     };

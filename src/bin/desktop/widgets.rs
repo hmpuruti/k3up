@@ -20,6 +20,8 @@ pub mod glyph {
     pub const PLUS: &str = "+";
     pub const CLOSE: &str = "×";
     pub const CHEVRON: &str = "›";
+    pub const FOLDED: &str = "▸";
+    pub const UNFOLDED: &str = "▾";
     pub const BACK: &str = "‹";
     pub const ASC: &str = "↑";
     pub const DESC: &str = "↓";

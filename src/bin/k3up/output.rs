@@ -71,24 +71,40 @@ fn print_response(response: Response, json: bool) -> Result<bool> {
     Ok(success)
 }
 
+/// Folders come first as header lines above their workloads; ungrouped workloads follow.
 fn print_workloads(workloads: &[k3up::model::Status]) {
     println!(
         "{:<24} {:<12} {:<8} {:<8} REASON",
         "NAME", "STATE", "PID", "RETRIES"
     );
-    for status in workloads {
-        println!(
-            "{:<24} {:<12} {:<8} {:<8} {}",
-            status.workload.name,
-            status.state,
-            status
-                .pid
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "-".into()),
-            status.restart_count,
-            status.reason
-        );
+    let tree = k3up::group::tree(workloads);
+    for folder in &tree.folders {
+        if folder.members.is_empty() {
+            continue;
+        }
+        println!("{}", folder.path);
+        for &index in &folder.members {
+            print_status(&workloads[index], "  ");
+        }
     }
+    for &index in &tree.ungrouped {
+        print_status(&workloads[index], "");
+    }
+}
+
+fn print_status(status: &k3up::model::Status, indent: &str) {
+    println!(
+        "{indent}{:<width$} {:<12} {:<8} {:<8} {}",
+        status.workload.name,
+        status.state,
+        status
+            .pid
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".into()),
+        status.restart_count,
+        status.reason,
+        width = 24 - indent.len()
+    );
 }
 
 pub fn bytes(value: u64) -> String {

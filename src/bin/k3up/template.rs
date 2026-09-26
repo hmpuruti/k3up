@@ -8,6 +8,7 @@ version = 1
 [[workloads]]
 name = "web"                               # 1 to 64 letters, digits, hyphens or underscores
 description = "Web server"                 # default ""
+group = "watchtower/entra"                 # folder path, up to 5 levels of letters, digits, spaces, - _ .; default ""
 executable = "/usr/local/bin/node"         # absolute path
 args = ["server.js", "--port", "8080"]     # default []
 working_directory = "/srv/web"             # absolute path
@@ -77,6 +78,8 @@ mod tests {
         assert_eq!(web.max_restarts, RestartLimit::Count(5));
         assert_eq!(web.restart_backoff, RestartBackoff::Exponential);
         assert!(web.success_exit_codes.is_empty());
+        assert_eq!(web.group, "watchtower/entra");
+        assert_eq!(manifest.workloads[1].group, "");
         assert_eq!(manifest.workloads[1].run_timeout_secs, Some(600));
         assert_eq!(manifest.workloads[1].success_exit_codes, [3]);
         let job = &toml::from_str::<toml::Value>(TEMPLATE).unwrap()["workloads"][1];
@@ -91,6 +94,7 @@ mod tests {
         for field in [
             "name",
             "description",
+            "group",
             "executable",
             "args",
             "working_directory",
