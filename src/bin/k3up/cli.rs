@@ -39,11 +39,17 @@ Command groups
 Output and exit codes
   --json prints the result as one JSON document, including errors, for scripts and AI
   agents. The exit code is 0 on success, 1 when the request failed and 2 when the command
-  line was invalid. `k3up <command> --help` explains each command and shows examples.";
+  line was invalid. `k3up <command> --help` explains each command and shows examples.
+
+Changes outside the data directory
+  agent install, agent uninstall, install-service and uninstall-service change the system:
+  a login item, a Windows service. Every other command only touches the data directory.
+  To try K3 Up without changing the system, use a scratch directory and `agent start`:
+    K3UP_DATA_DIR=/tmp/k3try k3up agent start";
 
 const START_HERE: &str = "\
 Start here:
-  k3up agent install
+  k3up agent install      (registers a login item, see Changes outside the data directory)
   k3up create web --exe node --cwd /srv/web --env PORT=8080 \\
       --readiness-tcp 127.0.0.1:8080 --start-at-boot -- server.js
   k3up start web --wait
@@ -80,6 +86,9 @@ pub enum Action {
         long_about = "\
 Register a program as a service or job. The definition is stored by the agent; nothing runs
 until you start it, pass --start, give it a schedule, or set --start-at-boot.
+
+A schedule works without --start. Between runs the workload shows as `stopped`, and
+`k3up list` shows when it runs next.
 
 --exe takes an absolute or relative path, or a bare program name looked up on PATH (and
 PATHEXT on Windows). The absolute path is stored. Arguments after -- are passed to the
@@ -349,8 +358,9 @@ Replace a workload's schedule, or remove it with --clear. Use --every for an int
 --cron for a cron expression. Cron expressions have 6 or 7 fields starting with seconds:
 `0 0 2 * * *` is 02:00 every day, and an optional seventh field is the year.
 
-A scheduled start is skipped while the workload is running; a scheduled restart stops it
-first. Jobs support --schedule-action start only. Stop the workload before changing its
+The schedule is active as soon as it is set; the workload does not need to be started.
+Between runs it shows as `stopped`, and `k3up list` shows when it runs next. A scheduled
+start is skipped while the workload is running; a scheduled restart stops it first. Jobs support --schedule-action start only. Stop the workload before changing its
 schedule, or use `k3up edit --restart-running`.",
         after_long_help = "\
 Examples:
@@ -553,7 +563,10 @@ Register the agent found beside k3up as a login item, start it, and wait until i
 The login item is a launchd agent on macOS, a systemd user service on Linux and a Run entry
 on Windows. Running it again is safe: it refreshes the login item and leaves a running agent
 alone. An earlier opt-out made in the desktop app is cleared, since you are asking for the
-login item explicitly. The login item always manages the default data directory.",
+login item explicitly. The login item always manages the default data directory.
+
+This changes the system outside the data directory. To try K3 Up in a scratch directory
+instead, use `k3up agent start`.",
         after_long_help = "\
 Examples:
   k3up agent install
