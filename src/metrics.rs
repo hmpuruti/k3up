@@ -185,6 +185,34 @@ struct Sampler {
     os: String,
 }
 
+fn on_volume(path: &Path, mount: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        volume_key(&path.to_string_lossy()).starts_with(&volume_key(&mount.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(mount)
+    }
+}
+
+/// The data directory is canonical, so on Windows it starts with `\\?\`, while volumes are
+/// listed as plain `C:\`. Drive letters and paths also compare case-insensitively.
+#[cfg(any(windows, test))]
+fn volume_key(path: &str) -> String {
+    let mut path = path.replace('/', "\\");
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        path = format!(r"\\{rest}");
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        path = rest.to_string();
+    }
+    let mut path = path.to_lowercase();
+    if !path.ends_with('\\') {
+        path.push('\\');
+    }
+    path
+}
+
 impl Sampler {
     fn new(data: PathBuf) -> Self {
         Self {
@@ -351,7 +379,7 @@ impl Sampler {
             .disks
             .list()
             .iter()
-            .filter(|disk| self.data.starts_with(disk.mount_point()))
+            .filter(|disk| on_volume(&self.data, disk.mount_point()))
             .max_by_key(|disk| disk.mount_point().as_os_str().len());
         let load = System::load_average();
         Machine {
@@ -573,6 +601,17 @@ mod tests {
             .map(|pid| pid.as_u32())
             .collect();
         assert_eq!(pids, vec![1, 2, 4, 3]);
+    }
+
+    #[test]
+    fn windows_volumes_match_canonical_paths() {
+        let data = volume_key(r"\\?\C:\Users\me\AppData\Local\K3 Up");
+        assert!(data.starts_with(&volume_key(r"C:\")));
+        assert!(data.starts_with(&volume_key("c:/users")));
+        assert!(!data.starts_with(&volume_key(r"D:\")));
+        assert!(!data.starts_with(&volume_key(r"C:\Use")));
+        let share = volume_key(r"\\?\UNC\server\share\k3up");
+        assert!(share.starts_with(&volume_key(r"\\server\share\")));
     }
 
     #[test]
