@@ -99,11 +99,17 @@ Section "K3 Up"
   SectionGetSize 0 $0
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "EstimatedSize" $0
 
+  ; k3up.exe is a console program; nsExec runs it without a console window flashing.
+  nsExec::ExecToLog '"$INSTDIR\k3up.exe" path add "$INSTDIR"'
+  Pop $0
   ; Start the agent now and at every login, so workloads run even before the app is opened.
-  ExecWait '"$INSTDIR\${APP}" --register-agent'
+  nsExec::ExecToLog '"$INSTDIR\k3up.exe" agent install'
+  Pop $0
 SectionEnd
 
 Section "Uninstall"
+  nsExec::ExecToLog '"$INSTDIR\k3up.exe" path remove "$INSTDIR"'
+  Pop $0
   !insertmacro StopK3Up
   DeleteRegValue HKCU "${RUN_KEY}" "K3 Up"
   Delete "$SMPROGRAMS\K3 Up.lnk"

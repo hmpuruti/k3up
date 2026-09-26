@@ -33,6 +33,14 @@ pub fn bundled_agent() -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// Whose data directory the login item manages. There is one login item per user account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    None,
+    ThisDirectory,
+    OtherDirectory,
+}
+
 /// Starts the agent for the current user at login and on demand.
 ///
 /// macOS uses a launchd LaunchAgent and Linux a systemd user service; both restart the agent
@@ -96,8 +104,28 @@ impl LoginAgent {
         held
     }
 
-    /// Starts the agent now, through the login item's supervisor when one is registered.
-    /// Does nothing if an agent is already running.
+    pub fn registration(&self) -> Registration {
+        match self.registered_entry() {
+            None => Registration::None,
+            Some(entry) if entry.contains(&self.entry_marker()) => Registration::ThisDirectory,
+            Some(_) => Registration::OtherDirectory,
+        }
+    }
+
+    /// True only when the login item manages this agent's data directory.
+    pub fn is_registered(&self) -> bool {
+        self.registration() == Registration::ThisDirectory
+    }
+
+    /// The data directory as the macOS and Linux login items record it, as written by `install`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn recorded_data(&self) -> PathBuf {
+        std::fs::canonicalize(&self.data).unwrap_or_else(|_| self.data.clone())
+    }
+
+    /// Starts the agent now, through the login item's supervisor when that manages this data
+    /// directory. Another directory's supervised agent is never touched. Does nothing if an
+    /// agent is already running.
     pub fn start(&self) -> Result<()> {
         if self.is_running() {
             return Ok(());
@@ -105,10 +133,15 @@ impl LoginAgent {
         if self.is_registered() && self.start_supervised().is_ok() {
             return Ok(());
         }
-        self.spawn()
+        self.launch()
     }
 
-    fn spawn(&self) -> Result<()> {
+    /// Starts the agent directly, bypassing the login item's supervisor. For data directories
+    /// the login item does not manage. Does nothing if an agent is already running.
+    pub fn launch(&self) -> Result<()> {
+        if self.is_running() {
+            return Ok(());
+        }
         let data = platform::prepare_dir(&self.data)?;
         let log = OpenOptions::new()
             .create(true)
@@ -160,8 +193,12 @@ impl LoginAgent {
             .join(format!("{LABEL}.plist")))
     }
 
-    pub fn is_registered(&self) -> bool {
-        Self::plist_path().is_ok_and(|path| path.exists())
+    fn registered_entry(&self) -> Option<String> {
+        std::fs::read_to_string(Self::plist_path().ok()?).ok()
+    }
+
+    fn entry_marker(&self) -> String {
+        format!("<string>{}</string>", xml_escape(&self.recorded_data()))
     }
 
     fn install(&self) -> Result<()> {
@@ -208,8 +245,15 @@ impl LoginAgent {
         Ok(config.join("systemd/user").join(UNIT))
     }
 
-    pub fn is_registered(&self) -> bool {
-        Self::unit_path().is_ok_and(|path| path.exists())
+    fn registered_entry(&self) -> Option<String> {
+        std::fs::read_to_string(Self::unit_path().ok()?).ok()
+    }
+
+    fn entry_marker(&self) -> String {
+        format!(
+            "--data-dir {}",
+            crate::systemd::quoted(&self.recorded_data().to_string_lossy())
+        )
     }
 
     fn install(&self) -> Result<()> {
@@ -248,15 +292,16 @@ impl LoginAgent {
         ))
     }
 
-    pub fn is_registered(&self) -> bool {
+    fn registered_entry(&self) -> Option<String> {
         use windows_sys::Win32::{
             Foundation::ERROR_SUCCESS,
             System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW},
         };
         let key = crate::win32::wide(RUN_KEY.as_ref());
         let value = crate::win32::wide(RUN_VALUE.as_ref());
-        // SAFETY: NUL-terminated names; a null data pointer only queries existence.
-        unsafe {
+        let mut bytes = 0u32;
+        // SAFETY: NUL-terminated names; a null buffer asks only for the size.
+        let status = unsafe {
             RegGetValueW(
                 HKEY_CURRENT_USER,
                 key.as_ptr(),
@@ -264,9 +309,39 @@ impl LoginAgent {
                 RRF_RT_REG_SZ,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            ) == ERROR_SUCCESS
+                &mut bytes,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
         }
+        let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+        // SAFETY: the buffer is at least `bytes` long, as reported by the first call.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        let length = buffer
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(buffer.len());
+        Some(String::from_utf16_lossy(&buffer[..length]))
+    }
+
+    /// Matches `run_entry`, which records the data directory as given.
+    fn entry_marker(&self) -> String {
+        let data = self.data.to_string_lossy();
+        format!("--data-dir \"{}\"", data.trim_end_matches('\\'))
     }
 
     fn install(&self) -> Result<()> {
@@ -318,8 +393,12 @@ impl LoginAgent {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 impl LoginAgent {
-    pub fn is_registered(&self) -> bool {
-        false
+    fn registered_entry(&self) -> Option<String> {
+        None
+    }
+
+    fn entry_marker(&self) -> String {
+        String::new()
     }
 
     fn install(&self) -> Result<()> {
@@ -369,13 +448,16 @@ fn run(program: &str, arguments: &[&str]) -> Result<()> {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn xml_escape(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn launchd_plist(agent: &std::path::Path, data: &std::path::Path, log: &std::path::Path) -> String {
-    let escape = |path: &std::path::Path| {
-        path.to_string_lossy()
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    };
+    let escape = xml_escape;
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -428,6 +510,23 @@ fn systemd_unit(agent: &std::path::Path, data: &std::path::Path) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// One login item per user: an item for one data directory must not claim another, even
+    /// when one directory's path is a prefix of the other's.
+    #[test]
+    fn login_items_name_exactly_one_data_directory() {
+        let agent = Path::new("/Applications/K3 Up.app/Contents/MacOS/K3 Up Agent");
+        let plist = launchd_plist(agent, Path::new("/tmp/k3up"), Path::new("/tmp/k3up/log"));
+        let marker = |data: &str| format!("<string>{}</string>", xml_escape(Path::new(data)));
+        assert!(plist.contains(&marker("/tmp/k3up")));
+        assert!(!plist.contains(&marker("/tmp/k3")));
+        assert!(!plist.contains(&marker("/tmp/k3up-test")));
+
+        let unit = systemd_unit(Path::new("/usr/bin/k3up-agent"), Path::new("/srv/k3up"));
+        let marker = |data: &str| format!("--data-dir {}", crate::systemd::quoted(data));
+        assert!(unit.contains(&marker("/srv/k3up")));
+        assert!(!unit.contains(&marker("/srv/k3")));
+    }
 
     #[test]
     fn launchd_plist_escapes_paths() {

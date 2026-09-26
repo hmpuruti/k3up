@@ -53,6 +53,9 @@ pub async fn run(data_dir: PathBuf, shutdown: impl std::future::Future<Output = 
             Some((request, reply)) = rx.recv() => {
                 if request.version == VERSION && matches!(request.command, Command::Shutdown) {
                     let _ = reply.send(Response::success("Agent stopping; workloads will be stopped first"));
+                    // The serving task writes the reply; give it a turn before the loop ends,
+                    // because with nothing to stop the runtime is gone within microseconds.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     break;
                 }
                 let response = if request.version != VERSION { Response::error("Unsupported API version") }
