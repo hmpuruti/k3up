@@ -54,6 +54,7 @@ fn run(args: Args) -> Result<Outcome> {
             clear_readiness,
             clear_run_timeout,
             clear_args,
+            clear_success_exit_codes,
             restart_running,
             args,
         } => workloads::edit(
@@ -69,6 +70,7 @@ fn run(args: Args) -> Result<Outcome> {
                 clear_readiness,
                 clear_run_timeout,
                 clear_args,
+                clear_success_exit_codes,
                 restart_running,
                 args,
             },

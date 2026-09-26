@@ -2,7 +2,7 @@
 #![cfg(unix)]
 
 use k3up::{
-    model::{Kind, Manifest, Missed, Restart, State, Status},
+    model::{Kind, Manifest, Missed, RestartBackoff, RestartLimit, State, Status},
     protocol::Response,
 };
 use std::time::{Duration, Instant};
@@ -86,8 +86,8 @@ fn create_round_trips_through_show() {
         "A=1",
         "--env",
         "B=two",
-        "--restart",
-        "never",
+        "--success-exit-code",
+        "3",
         "--cron",
         "0 0 2 * * *",
         "--timezone",
@@ -109,7 +109,7 @@ fn create_round_trips_through_show() {
     assert_eq!(workload.args, ["300"]);
     assert_eq!(workload.environment["A"], "1");
     assert_eq!(workload.environment["B"], "two");
-    assert_eq!(workload.restart, Restart::Never);
+    assert_eq!(workload.success_exit_codes, [3]);
     let schedule = workload.schedule.as_ref().unwrap();
     assert_eq!(schedule.cron.as_deref(), Some("0 0 2 * * *"));
     assert_eq!(schedule.timezone, "Europe/Berlin");
@@ -120,6 +120,114 @@ fn create_round_trips_through_show() {
     assert!(success);
     let manifest: Manifest = toml::from_str(&text).unwrap();
     assert_eq!(manifest.workloads, vec![workload.clone()]);
+    let printed: toml::Value = toml::from_str(&text).unwrap();
+    for field in [
+        "restart",
+        "max_restarts",
+        "restart_delay_secs",
+        "restart_backoff",
+    ] {
+        assert!(printed["workloads"][0].get(field).is_none(), "{field}");
+    }
+    assert!(text.contains("success_exit_codes = [3]"), "{text}");
+}
+
+#[test]
+fn restart_settings_are_refused_for_jobs() {
+    let agent = Agent::start();
+    for flags in [
+        vec!["--restart", "always"],
+        vec!["--max-restarts", "unlimited"],
+        vec!["--restart-delay", "5"],
+        vec!["--restart-backoff", "fixed"],
+    ] {
+        let arguments = [&["create", "loader", "--exe", "sleep", "--job"], &flags[..]].concat();
+        let (success, response) = agent.call(&arguments);
+        assert!(!success, "{flags:?}");
+        assert_eq!(response.message, "Restart settings apply to services only");
+    }
+    let (success, _) = agent.call(&["create", "loader", "--exe", "sleep", "--job"]);
+    assert!(success);
+    let (success, response) = agent.call(&["edit", "loader", "--max-restarts", "3"]);
+    assert!(!success);
+    assert_eq!(response.message, "Restart settings apply to services only");
+    let (success, response) = agent.call(&["create", "web", "--exe", "sleep", "--", "300"]);
+    assert!(success, "{}", response.message);
+    let (success, response) = agent.call(&["edit", "web", "--job=true", "--restart", "always"]);
+    assert!(!success);
+    assert_eq!(response.message, "Restart settings apply to services only");
+    let (success, response) = agent.call(&["edit", "web", "--job=false", "--restart", "always"]);
+    assert!(success, "{}", response.message);
+}
+
+#[test]
+fn unlimited_restarts_and_success_codes_round_trip() {
+    let agent = Agent::start();
+    let (success, response) = agent.call(&[
+        "create",
+        "sentinel",
+        "--exe",
+        "sleep",
+        "--restart",
+        "always",
+        "--max-restarts",
+        "unlimited",
+        "--restart-backoff",
+        "fixed",
+        "--restart-delay",
+        "5",
+        "--success-exit-code",
+        "3",
+        "--success-exit-code",
+        "75",
+        "--",
+        "300",
+    ]);
+    assert!(success, "{}", response.message);
+    let workload = agent.show("sentinel").workload;
+    assert_eq!(workload.max_restarts, RestartLimit::Unlimited);
+    assert_eq!(workload.restart_backoff, RestartBackoff::Fixed);
+    assert_eq!(workload.restart_delay_secs, 5);
+    assert_eq!(workload.success_exit_codes, [3, 75]);
+    let (success, text) = agent.run(&["show", "sentinel"]);
+    assert!(success);
+    assert!(text.contains("max_restarts = \"unlimited\""), "{text}");
+    assert!(text.contains("restart_backoff = \"fixed\""), "{text}");
+    assert_eq!(
+        toml::from_str::<Manifest>(&text).unwrap().workloads,
+        vec![workload]
+    );
+
+    let (success, response) = agent.call(&["edit", "sentinel", "--max-restarts", "10"]);
+    assert!(success, "{}", response.message);
+    assert_eq!(
+        agent.show("sentinel").workload.max_restarts,
+        RestartLimit::Count(10)
+    );
+    let (success, response) = agent.call(&["edit", "sentinel", "--clear-success-exit-codes"]);
+    assert!(success, "{}", response.message);
+    assert!(
+        agent
+            .show("sentinel")
+            .workload
+            .success_exit_codes
+            .is_empty()
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_k3up"))
+        .arg("--data-dir")
+        .arg(agent.dir.path())
+        .args(["edit", "sentinel", "--max-restarts", "many"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unlimited"));
+    let (success, response) = agent.call(&["edit", "sentinel", "--success-exit-code", "0"]);
+    assert!(!success);
+    assert!(
+        response.message.contains("Exit code 0"),
+        "{}",
+        response.message
+    );
 }
 
 #[test]
@@ -160,7 +268,7 @@ fn edit_changes_only_what_was_given() {
     let workload = agent.show("backup").workload;
     assert_eq!(workload.kind, Kind::Service);
     assert_eq!(workload.args, ["200"]);
-    assert_eq!(workload.max_restarts, 3);
+    assert_eq!(workload.max_restarts, RestartLimit::Count(3));
     assert_eq!(workload.stop_timeout_secs, 7);
     assert_eq!(workload.environment.keys().collect::<Vec<_>>(), ["B", "C"]);
     assert_eq!(

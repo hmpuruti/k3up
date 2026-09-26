@@ -107,3 +107,34 @@ impl Store {
         .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{RestartBackoff, RestartLimit};
+
+    #[test]
+    fn definitions_saved_before_the_newer_fields_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("k3up.db")).unwrap();
+        let spec = r#"{"name":"old","description":"","executable":"/bin/sleep","args":["5"],
+            "working_directory":"/tmp","environment":{},"kind":"service","start_at_boot":true,
+            "depends_on":[],"restart":"always","max_restarts":3,"restart_delay_secs":4,
+            "stop_timeout_secs":5,"run_timeout_secs":null,"readiness_tcp":null,
+            "startup_timeout_secs":30,"schedule":null}"#;
+        store
+            .db
+            .execute(
+                "INSERT INTO workloads(name,spec,desired,next_run) VALUES ('old',?1,1,NULL)",
+                [spec],
+            )
+            .unwrap();
+        let records = store.load().unwrap();
+        let workload = &records[0].workload;
+        assert!(records[0].desired);
+        assert_eq!(workload.max_restarts, RestartLimit::Count(3));
+        assert_eq!(workload.restart_delay_secs, 4);
+        assert_eq!(workload.restart_backoff, RestartBackoff::Exponential);
+        assert!(workload.success_exit_codes.is_empty());
+    }
+}

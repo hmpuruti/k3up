@@ -149,7 +149,7 @@ fn facts<'a>(
         format!(
             "{} / {} · {}",
             status.restart_count,
-            status.workload.max_restarts,
+            format::restart_limit(status.workload.max_restarts),
             format::restart_label(status.workload.restart)
         )
     };

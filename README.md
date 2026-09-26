@@ -33,7 +33,7 @@ K3 Up is written in Rust. It has no browser runtime, no .NET, no listening netwo
 ## Features
 
 - Run long-lived **services** and one-off or scheduled **jobs**, with literal arguments, a working directory and environment variables.
-- Restart on failure or always, with exponential backoff, a restart budget, run timeouts and stop timeouts.
+- Restart on failure or always, with exponential or fixed delays, a restart budget or unlimited retries, extra success exit codes, run timeouts and stop timeouts.
 - Interval and cron schedules in any IANA timezone, with a choice of skipping or catching up missed runs.
 - Start workloads in dependency order, optionally waiting until a TCP port accepts connections.
 - Remember whether you stopped a workload on purpose, so recovery never undoes a stop.
@@ -193,11 +193,11 @@ Global flags: `--data-dir DIR` selects the agent's data directory and `--json` p
 | Command | What it does |
 |---|---|
 | `create NAME --exe PROGRAM [flags] [-- ARGS...]` | Register a program. `--exe` is a path or a bare name found on PATH (and PATHEXT on Windows); the absolute path is stored. `--start` starts it, `--wait` waits like `start --wait`. |
-| `edit NAME [flags] [-- ARGS...]` | Change only the flags given. `--env` adds or replaces a variable, `--unset-env KEY` removes one, `--depends-on` and `-- ARGS` replace their lists. `--clear-env`, `--clear-depends-on`, `--clear-schedule`, `--clear-readiness`, `--clear-run-timeout` and `--clear-args` remove settings. A running workload needs `--restart-running`, which stops it, applies the change and starts it again. |
-| `show NAME` | The definition as a one-workload TOML manifest. With `--json`, the status object. |
+| `edit NAME [flags] [-- ARGS...]` | Change only the flags given. `--env` adds or replaces a variable, `--unset-env KEY` removes one, `--depends-on`, `--success-exit-code` and `-- ARGS` replace their lists. `--clear-env`, `--clear-depends-on`, `--clear-schedule`, `--clear-readiness`, `--clear-run-timeout`, `--clear-args` and `--clear-success-exit-codes` remove settings. A running workload needs `--restart-running`, which stops it, applies the change and starts it again. |
+| `show NAME` | The definition as a one-workload TOML manifest, without restart settings for a job. With `--json`, the status object. |
 | `list` | Every workload with its state, process and reason. |
 | `status NAME` | One workload's state, process, restarts, next run, last exit and reason. |
-| `start NAME [--wait] [--timeout SECS]` | Start a workload and its dependencies. `--wait` returns once a service is running or a job has exited with 0. |
+| `start NAME [--wait] [--timeout SECS]` | Start a workload and its dependencies. `--wait` returns once a service is running or a job has exited with 0 or one of its success exit codes. |
 | `stop NAME` | Stop a workload and remember the stop across agent restarts. |
 | `restart NAME [--wait] [--timeout SECS]` | Stop and start. |
 | `remove NAME [--stop]` | Delete the definition; the log file is kept. |
@@ -205,7 +205,7 @@ Global flags: `--data-dir DIR` selects the agent's data directory and `--json` p
 | `events [NAME] [--limit N]` | The activity history, newest first, up to 200. |
 | `schedule NAME --every SECS or --cron EXPR [--timezone TZ] [--schedule-action start or restart] [--catch-up]` | Replace the schedule. `--clear` removes it. |
 
-Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`, `--job`, `--start-at-boot`, `--env KEY=VALUE`, `--depends-on NAME`, `--readiness-tcp HOST:PORT`, `--restart never|on-failure|always`, `--max-restarts N`, `--restart-delay SECS`, `--stop-timeout SECS`, `--run-timeout SECS`, `--startup-timeout SECS`, `--every SECS`, `--cron EXPR`, `--timezone TZ`, `--schedule-action start|restart`, `--catch-up`. `k3up create --help` lists the ranges and defaults.
+Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`, `--job`, `--start-at-boot`, `--env KEY=VALUE`, `--depends-on NAME`, `--readiness-tcp HOST:PORT`, `--restart never|on-failure|always`, `--max-restarts N|unlimited`, `--restart-delay SECS`, `--restart-backoff exponential|fixed`, `--success-exit-code CODE`, `--stop-timeout SECS`, `--run-timeout SECS`, `--startup-timeout SECS`, `--every SECS`, `--cron EXPR`, `--timezone TZ`, `--schedule-action start|restart`, `--catch-up`. `k3up create --help` lists the ranges and defaults. The four restart flags apply to services only and are refused for a job.
 
 **Manifests**
 
@@ -253,7 +253,7 @@ With `--json`, most commands print the agent's response object, on success and o
 |---|---|
 | `ok` | `true` on success. The exit code is 1 when it is `false`. |
 | `message` | What happened, or the error. |
-| `workloads` | Status objects, for `list`, `status`, `start`, `restart`, `stats NAME` and `create --start`. Each has `workload` (the definition), `state`, `desired_running`, `pid`, `restart_count`, `started_at`, `next_run`, `last_exit` and `reason`. |
+| `workloads` | Status objects, for `list`, `status`, `start`, `restart`, `stats NAME` and `create --start`. Each has `workload` (the definition), `state`, `desired_running`, `pid`, `restart_count`, `started_at`, `next_run`, `last_exit` and `reason`. In the definition, `max_restarts` is a number or the string `"unlimited"`, and `success_exit_codes` lists the exit codes besides 0 that count as success. `last_exit` is always the real code. |
 | `events` | For `events`: `id`, `at`, `name` and `message`, newest first. |
 | `text` | Log output, or the text view of `stats` and `template`. |
 | `offset` | For `logs`: the byte offset to continue from. |
@@ -376,6 +376,8 @@ depends_on = ["database"]
 restart = "on_failure"
 max_restarts = 5
 restart_delay_secs = 2
+restart_backoff = "exponential"
+success_exit_codes = []
 stop_timeout_secs = 5
 readiness_tcp = "127.0.0.1:8080"
 startup_timeout_secs = 30
@@ -385,9 +387,16 @@ APP_MODE = "production"
 ```
 
 `kind` is `service` or `job`:
-- Services keep running. `restart` can be `never`, `on_failure` or `always`, and restarts back off exponentially until `max_restarts` is reached.
-- Jobs run to completion each time they are started or scheduled, and are never restarted.
+- Services keep running. `restart` can be `never`, `on_failure` or `always`.
+- Jobs run to completion each time they are started or scheduled, and are never restarted. The restart settings apply to services only; `show`, `export` and `template` leave them out of jobs, and a manifest that has them on a job is still accepted.
 - `run_timeout_secs` limits how long either kind may run.
+
+Restart settings:
+- `max_restarts` is a number from 0 to 100, or `"unlimited"`. After that many retries in a row the service is marked failed. The count resets once the service has run for 60 seconds.
+- `restart_delay_secs` is the wait before a retry, 1 to 300.
+- `restart_backoff = "exponential"` doubles the wait after each retry, up to 300 seconds. `"fixed"` waits `restart_delay_secs` every time. `max_restarts = "unlimited"` with a fixed delay suits a program that should simply run again whenever it exits.
+
+`success_exit_codes` lists exit codes besides 0 that count as success, for jobs and services: up to 32 codes, without duplicates or 0. A job that exits with one of them is completed, and a service with `restart = "on_failure"` is not restarted. The activity history shows the real code, for example `Process exited with code 3, counted as success`.
 
 `start_at_boot = true` starts a service when it is first registered. After that, the agent remembers whether you last started or stopped it, and restores that state whenever the agent starts.
 
@@ -395,7 +404,7 @@ APP_MODE = "production"
 
 Workloads start in dependency order, and dependency cycles are rejected.
 - A service dependency is ready when its process has started, or when its TCP check passes.
-- A job dependency is ready when it has exited with code 0.
+- A job dependency is ready when it has exited with code 0 or one of its success exit codes.
 - If a dependency fails or is stopped before it is ready, the waiting workload is marked failed, with the reason.
 
 Stopping a dependency does not stop workloads that are already running. The TCP check applies at startup only; it is not an ongoing health check.
@@ -475,7 +484,7 @@ k3up systemd-install examples/workloads.toml
 systemctl --user status k3up-example-worker.service
 ```
 
-`systemd-install` installs user units and refuses to overwrite existing files. If `systemctl` fails partway, it removes the units it wrote. Export supports interval schedules with `action = "start"` and `missed = "skip"`, and rejects cron schedules, scheduled restarts, catch-up and TCP checks rather than silently dropping them. Generated services require systemd with `Type=exec` support, such as RHEL 9 or newer. To run user units without an active login session, an administrator must enable lingering for the account.
+`systemd-install` installs user units and refuses to overwrite existing files. If `systemctl` fails partway, it removes the units it wrote. Export supports interval schedules with `action = "start"` and `missed = "skip"`, and rejects cron schedules, scheduled restarts, catch-up and TCP checks rather than silently dropping them. `success_exit_codes` becomes `SuccessExitStatus=`, `max_restarts = "unlimited"` disables systemd's start rate limit, and `restart_delay_secs` becomes `RestartSec=`; systemd does not double the delay, so an exponential backoff is exported as its first delay. Generated services require systemd with `Type=exec` support, such as RHEL 9 or newer. To run user units without an active login session, an administrator must enable lingering for the account.
 
 ### Windows
 

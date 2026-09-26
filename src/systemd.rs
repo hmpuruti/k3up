@@ -1,5 +1,7 @@
 //! Native Linux execution. Exported units run independently of the K3 Up agent.
-use crate::model::{Kind, Manifest, Missed, PathStyle, Restart, ScheduleAction};
+use crate::model::{
+    Kind, Manifest, Missed, PathStyle, Restart, RestartLimit, ScheduleAction, Workload,
+};
 use anyhow::{Result, bail};
 use std::{collections::BTreeMap, path::Path};
 
@@ -59,10 +61,21 @@ pub fn render(manifest: &Manifest) -> Result<BTreeMap<String, String>> {
                 .join(" ");
             unit.push_str(&format!("Requires={deps}\nAfter={deps}\n"));
         }
-        unit.push_str(&format!("StartLimitIntervalSec={}\nStartLimitBurst={}\n\n[Service]\nType={}\nWorkingDirectory={}\nExecStart={}\n",
-            if workload.kind == Kind::Job { 0 } else { 300 },
-            workload.max_restarts + 1, if workload.kind == Kind::Job { "oneshot" } else { "exec" }, workload.working_directory.replace('%', "%%"),
-            std::iter::once(workload.executable.as_str()).chain(workload.args.iter().map(String::as_str)).map(quoted).collect::<Vec<_>>().join(" ")));
+        unit.push_str(&start_limit(workload));
+        unit.push_str(&format!(
+            "\n[Service]\nType={}\nWorkingDirectory={}\nExecStart={}\n",
+            if workload.kind == Kind::Job {
+                "oneshot"
+            } else {
+                "exec"
+            },
+            workload.working_directory.replace('%', "%%"),
+            std::iter::once(workload.executable.as_str())
+                .chain(workload.args.iter().map(String::as_str))
+                .map(quoted)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
         for (key, value) in &workload.environment {
             unit.push_str(&format!(
                 "Environment={}\n",
@@ -80,6 +93,15 @@ pub fn render(manifest: &Manifest) -> Result<BTreeMap<String, String>> {
         };
         unit.push_str(&format!("Restart={restart}\nRestartSec={}\nTimeoutStopSec={}\nKillMode=control-group\nStandardOutput=journal\nStandardError=journal\n",
             workload.restart_delay_secs, workload.stop_timeout_secs));
+        if !workload.success_exit_codes.is_empty() {
+            let codes = workload
+                .success_exit_codes
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            unit.push_str(&format!("SuccessExitStatus={codes}\n"));
+        }
         if let Some(timeout) = workload.run_timeout_secs {
             unit.push_str(&format!(
                 "{}={timeout}\n",
@@ -112,6 +134,16 @@ pub fn render(manifest: &Manifest) -> Result<BTreeMap<String, String>> {
         }
     }
     Ok(units)
+}
+
+/// Jobs and unlimited services are never rate limited; RestartSec= alone paces their retries.
+fn start_limit(workload: &Workload) -> String {
+    match workload.max_restarts {
+        RestartLimit::Count(limit) if workload.kind == Kind::Service => {
+            format!("StartLimitIntervalSec=300\nStartLimitBurst={}\n", limit + 1)
+        }
+        _ => "StartLimitIntervalSec=0\n".to_string(),
+    }
 }
 
 pub fn export(manifest: &Manifest, directory: &Path) -> Result<usize> {
@@ -162,6 +194,41 @@ mod tests {
         let unit = &units["k3up-job.service"];
         assert!(unit.contains("WorkingDirectory=/tmp/a directory%%\n"));
         assert!(unit.contains("StartLimitIntervalSec=0\n"));
+        assert!(!unit.contains("StartLimitBurst"));
         assert!(unit.contains("TimeoutStartSec=infinity\n"));
+    }
+    #[test]
+    fn maps_restart_limits_backoff_and_success_codes() {
+        let counted = Workload {
+            name: "counted".into(),
+            executable: "/bin/echo".into(),
+            working_directory: "/tmp".into(),
+            max_restarts: RestartLimit::Count(3),
+            ..Default::default()
+        };
+        let unlimited = Workload {
+            name: "sentinel".into(),
+            executable: "/bin/echo".into(),
+            working_directory: "/tmp".into(),
+            restart: Restart::Always,
+            max_restarts: RestartLimit::Unlimited,
+            restart_backoff: crate::model::RestartBackoff::Fixed,
+            restart_delay_secs: 5,
+            success_exit_codes: vec![3, 75],
+            ..Default::default()
+        };
+        let units = render(&Manifest {
+            version: 1,
+            workloads: vec![counted, unlimited],
+        })
+        .unwrap();
+        let counted = &units["k3up-counted.service"];
+        assert!(counted.contains("StartLimitIntervalSec=300\nStartLimitBurst=4\n"));
+        assert!(!counted.contains("SuccessExitStatus"));
+        let sentinel = &units["k3up-sentinel.service"];
+        assert!(sentinel.contains("StartLimitIntervalSec=0\n"));
+        assert!(!sentinel.contains("StartLimitBurst"));
+        assert!(sentinel.contains("Restart=always\nRestartSec=5\n"));
+        assert!(sentinel.contains("SuccessExitStatus=3 75\n"));
     }
 }

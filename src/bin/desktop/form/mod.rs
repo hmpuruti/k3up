@@ -1,7 +1,9 @@
 pub mod view;
 
 use iced::widget::text_editor;
-use k3up::model::{Kind, Missed, Restart, Schedule, ScheduleAction, Workload};
+use k3up::model::{
+    Kind, Missed, Restart, RestartBackoff, RestartLimit, Schedule, ScheduleAction, Workload,
+};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,6 +15,7 @@ pub enum Field {
     Readiness,
     MaxRestarts,
     RestartDelay,
+    SuccessCodes,
     StopTimeout,
     StartupTimeout,
     RunTimeout,
@@ -35,6 +38,8 @@ pub enum FormMessage {
     Kind(Kind),
     Boot(bool),
     Restart(Restart),
+    Unlimited(bool),
+    Backoff(RestartBackoff),
     ArgumentAdd,
     ArgumentChange(usize, String),
     ArgumentRemove(usize),
@@ -67,7 +72,10 @@ pub struct Form {
     pub boot: bool,
     pub restart: Restart,
     pub max_restarts: String,
+    pub unlimited: bool,
     pub restart_delay: String,
+    pub backoff: RestartBackoff,
+    pub success_codes: String,
     pub stop_timeout: String,
     pub startup_timeout: String,
     pub run_timeout: String,
@@ -86,9 +94,7 @@ impl Form {
         Self {
             editing,
             raw: false,
-            editor: text_editor::Content::with_text(
-                &toml::to_string_pretty(&spec).unwrap_or_default(),
-            ),
+            editor: text_editor::Content::with_text(&spec.to_toml().unwrap_or_default()),
             name: spec.name.clone(),
             description: spec.description.clone(),
             executable: spec.executable.clone(),
@@ -103,8 +109,19 @@ impl Form {
             kind: spec.kind,
             boot: spec.start_at_boot,
             restart: spec.restart,
-            max_restarts: spec.max_restarts.to_string(),
+            max_restarts: match spec.max_restarts {
+                RestartLimit::Count(count) => count.to_string(),
+                RestartLimit::Unlimited => RestartLimit::default().to_string(),
+            },
+            unlimited: spec.max_restarts == RestartLimit::Unlimited,
             restart_delay: spec.restart_delay_secs.to_string(),
+            backoff: spec.restart_backoff,
+            success_codes: spec
+                .success_exit_codes
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
             stop_timeout: spec.stop_timeout_secs.to_string(),
             startup_timeout: spec.startup_timeout_secs.to_string(),
             run_timeout: spec
@@ -153,6 +170,8 @@ impl Form {
             }
             FormMessage::Boot(value) => self.boot = value,
             FormMessage::Restart(value) => self.restart = value,
+            FormMessage::Unlimited(value) => self.unlimited = value,
+            FormMessage::Backoff(value) => self.backoff = value,
             FormMessage::ArgumentAdd => self.arguments.push(String::new()),
             FormMessage::ArgumentChange(index, value) => {
                 if let Some(slot) = self.arguments.get_mut(index) {
@@ -228,6 +247,13 @@ impl Form {
         if numeric && !value.chars().all(|c| c.is_ascii_digit()) {
             return;
         }
+        if field == Field::SuccessCodes
+            && !value
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, ',' | ' ' | '-'))
+        {
+            return;
+        }
         let slot = match field {
             Field::Name => &mut self.name,
             Field::Description => &mut self.description,
@@ -236,6 +262,7 @@ impl Form {
             Field::Readiness => &mut self.readiness,
             Field::MaxRestarts => &mut self.max_restarts,
             Field::RestartDelay => &mut self.restart_delay,
+            Field::SuccessCodes => &mut self.success_codes,
             Field::StopTimeout => &mut self.stop_timeout,
             Field::StartupTimeout => &mut self.startup_timeout,
             Field::RunTimeout => &mut self.run_timeout,
@@ -266,8 +293,19 @@ impl Form {
         spec.kind = self.kind;
         spec.start_at_boot = self.boot;
         spec.restart = self.restart;
-        spec.max_restarts = number(&self.max_restarts, "Max restarts")?;
+        spec.max_restarts = if self.unlimited {
+            RestartLimit::Unlimited
+        } else {
+            RestartLimit::Count(number(&self.max_restarts, "Max restarts")?)
+        };
         spec.restart_delay_secs = number(&self.restart_delay, "Restart delay")?;
+        spec.restart_backoff = self.backoff;
+        spec.success_exit_codes = self
+            .success_codes
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|part| !part.is_empty())
+            .map(|part| number(part, "Success exit codes"))
+            .collect::<Result<_, _>>()?;
         spec.stop_timeout_secs = number(&self.stop_timeout, "Stop timeout")?;
         spec.startup_timeout_secs = number(&self.startup_timeout, "Startup timeout")?;
         spec.run_timeout_secs = optional_number(&self.run_timeout, "Run timeout")?;
@@ -360,6 +398,40 @@ mod tests {
         assert_eq!(form.max_restarts, "5");
         form.update(FormMessage::Text(Field::MaxRestarts, "12".into()));
         assert_eq!(form.max_restarts, "12");
+        form.update(FormMessage::Text(Field::SuccessCodes, "3, 75".into()));
+        assert_eq!(form.success_codes, "3, 75");
+        form.update(FormMessage::Text(Field::SuccessCodes, "3; 75".into()));
+        assert_eq!(form.success_codes, "3, 75");
+    }
+
+    #[test]
+    fn recovery_and_success_codes_round_trip() {
+        let mut original = filled().workload().unwrap();
+        original.restart = Restart::Always;
+        original.max_restarts = RestartLimit::Unlimited;
+        original.restart_delay_secs = 5;
+        original.restart_backoff = RestartBackoff::Fixed;
+        original.success_exit_codes = vec![3, 75];
+        let form = Form::new(original.clone(), true);
+        assert!(form.unlimited);
+        assert_eq!(form.success_codes, "3, 75");
+        assert_eq!(form.workload().unwrap(), original);
+
+        let mut form = Form::new(original.clone(), true);
+        form.update(FormMessage::Raw(true));
+        form.update(FormMessage::Raw(false));
+        assert_eq!(form.workload().unwrap(), original);
+
+        form.update(FormMessage::Unlimited(false));
+        form.update(FormMessage::Text(Field::MaxRestarts, "9".into()));
+        form.update(FormMessage::Backoff(RestartBackoff::Exponential));
+        form.update(FormMessage::Text(Field::SuccessCodes, "".into()));
+        let spec = form.workload().unwrap();
+        assert_eq!(spec.max_restarts, RestartLimit::Count(9));
+        assert_eq!(spec.restart_backoff, RestartBackoff::Exponential);
+        assert!(spec.success_exit_codes.is_empty());
+        form.update(FormMessage::Text(Field::SuccessCodes, "3,".into()));
+        assert_eq!(form.workload().unwrap().success_exit_codes, [3]);
     }
 
     #[test]

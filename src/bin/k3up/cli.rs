@@ -1,6 +1,6 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
-use k3up::model::{Restart, ScheduleAction};
+use k3up::model::{Restart, RestartBackoff, RestartLimit, ScheduleAction};
 use std::path::PathBuf;
 
 const ABOUT: &str = "Keep applications running as background services and scheduled jobs";
@@ -87,7 +87,16 @@ program exactly as written; K3 Up never runs commands through a shell. To use sh
 features, register the shell itself, such as `--exe sh -- -c 'cmd1 && cmd2'`.
 
 Boolean flags take an optional value, so `--start-at-boot=false` is explicit. The
-definition is validated locally before it is sent to the agent.",
+definition is validated locally before it is sent to the agent.
+
+Recovery applies to services only: --restart decides whether a service comes back after it
+exits, --max-restarts caps the retries (or `unlimited` lifts the cap), and --restart-delay
+with --restart-backoff sets the wait before each retry. The retry count resets after the
+service has run for 60 seconds. Passing these flags with --job is an error.
+
+Exit code 0 is a success. --success-exit-code adds codes that count as success too, for
+services and jobs: a job that exits with one of them is completed, and a service with
+--restart on-failure is not restarted.",
         after_long_help = "\
 Examples:
   k3up create web --exe node --cwd /srv/web --env PORT=8080 -- server.js
@@ -96,7 +105,10 @@ Examples:
   k3up create backup --exe /usr/local/bin/backup.sh --job --cron '0 0 2 * * *' \\
       --timezone Europe/Berlin --catch-up
   k3up create poller --exe python3 --job --every 300 --run-timeout 60 -- poll.py
-  k3up create api --exe ./bin/api --depends-on database --restart always --max-restarts 10"
+  k3up create api --exe ./bin/api --depends-on database --restart always --max-restarts 10
+  k3up create sentinel --exe ./sentinel --restart always --max-restarts unlimited \\
+      --restart-backoff fixed --restart-delay 5
+  k3up create loader --exe python --job --every 1800 --success-exit-code 3 -- -m trnx.load"
     )]
     Create {
         /// Name: 1 to 64 letters, digits, hyphens or underscores
@@ -132,9 +144,12 @@ Change parts of a definition. Only the flags you give change; everything else is
 The result is validated locally and then saved by the agent.
 
 --env adds or replaces one variable; --unset-env removes one; --clear-env removes all.
---depends-on replaces the whole dependency list. Arguments after -- replace the whole
-argument list. Boolean flags take an optional value, so `--start-at-boot=false` turns a
-setting off. The name cannot be changed: create a new workload instead.
+--depends-on and --success-exit-code replace their whole lists. Arguments after -- replace
+the whole argument list. Boolean flags take an optional value, so `--start-at-boot=false`
+turns a setting off. The name cannot be changed: create a new workload instead.
+
+Restart settings (--restart, --max-restarts, --restart-delay, --restart-backoff) apply to
+services only, and are refused for a job.
 
 The agent refuses to change a workload that is running or wanted running. Stop it first,
 or pass --restart-running to stop it, apply the change and start it again.",
@@ -142,6 +157,9 @@ or pass --restart-running to stop it, apply the change and start it again.",
 Examples:
   k3up edit web --env PORT=9090 --restart-running
   k3up edit web --description 'Public API' --max-restarts 10 --stop-timeout 10
+  k3up edit web --max-restarts unlimited --restart-backoff fixed --restart-delay 5
+  k3up edit loader --success-exit-code 3 --success-exit-code 75
+  k3up edit loader --clear-success-exit-codes
   k3up edit web --unset-env DEBUG --clear-readiness
   k3up edit backup --cron '0 30 3 * * *' --timezone UTC
   k3up edit backup --clear-schedule
@@ -177,6 +195,9 @@ Examples:
         /// Remove every program argument
         #[arg(long, help_heading = "Clearing")]
         clear_args: bool,
+        /// Remove every extra success exit code
+        #[arg(long, help_heading = "Clearing")]
+        clear_success_exit_codes: bool,
         /// If the workload is running, stop it, apply the change and start it again
         #[arg(long)]
         restart_running: bool,
@@ -231,8 +252,8 @@ Examples:
         long_about = "\
 Start a workload. Dependencies that are not ready are started first, and the workload waits
 for them. Starting a running workload does nothing. With --wait, return once a service is
-running (after its TCP check, if it has one) or a job has exited with code 0, and exit with
-1 if it fails or stops before then.",
+running (after its TCP check, if it has one) or a job has exited with code 0 or one of its
+success exit codes, and exit with 1 if it fails or stops before then.",
         after_long_help = "\
 Examples:
   k3up start web
@@ -691,12 +712,18 @@ pub struct WorkloadFlags {
     pub restart: Option<RestartArg>,
     #[arg(long, hide = true, conflicts_with = "restart")]
     pub never_restart: bool,
-    /// Restarts allowed before giving up, 0 to 100 [default: 5]
-    #[arg(long, value_name = "N", help_heading = "Recovery")]
-    pub max_restarts: Option<u32>,
-    /// Delay before the first restart, doubling each time, 1 to 300 [default: 2]
+    /// Restarts allowed before giving up: 0 to 100, or unlimited [default: 5]
+    #[arg(long, value_name = "N|unlimited", help_heading = "Recovery")]
+    pub max_restarts: Option<RestartLimit>,
+    /// Delay before a restart, 1 to 300 [default: 2]
     #[arg(long, value_name = "SECS", help_heading = "Recovery")]
     pub restart_delay: Option<u64>,
+    /// exponential doubles the delay after each restart, up to 300s; fixed keeps it [default: exponential]
+    #[arg(long, value_enum, value_name = "MODE", help_heading = "Recovery")]
+    pub restart_backoff: Option<BackoffArg>,
+    /// Exit code besides 0 that counts as success, repeatable; replaces the list
+    #[arg(long, value_name = "CODE", help_heading = "Recovery")]
+    pub success_exit_code: Vec<i32>,
     /// Time allowed for a graceful stop before the process is killed, 1 to 30 [default: 5]
     #[arg(long, value_name = "SECS", help_heading = "Recovery")]
     pub stop_timeout: Option<u64>,
@@ -763,6 +790,21 @@ impl From<RestartArg> for Restart {
             RestartArg::Never => Restart::Never,
             RestartArg::OnFailure => Restart::OnFailure,
             RestartArg::Always => Restart::Always,
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackoffArg {
+    Exponential,
+    Fixed,
+}
+
+impl From<BackoffArg> for RestartBackoff {
+    fn from(value: BackoffArg) -> Self {
+        match value {
+            BackoffArg::Exponential => RestartBackoff::Exponential,
+            BackoffArg::Fixed => RestartBackoff::Fixed,
         }
     }
 }

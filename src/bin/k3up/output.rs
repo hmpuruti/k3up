@@ -51,7 +51,7 @@ fn print_response(response: Response, json: bool) -> Result<bool> {
     } else if !success {
         eprintln!("{}", response.message);
     } else if let Some(manifest) = response.manifest {
-        println!("{}", toml::to_string_pretty(&manifest)?);
+        println!("{}", manifest.to_toml()?);
     } else if let Some(text) = response.text {
         println!("{text}");
     } else if !response.workloads.is_empty() {
