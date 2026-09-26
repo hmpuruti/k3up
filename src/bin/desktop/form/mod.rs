@@ -166,6 +166,10 @@ impl Form {
     /// Returns a notice when the message could not be applied.
     pub fn update(&mut self, message: FormMessage) -> Option<String> {
         match message {
+            FormMessage::Text(Field::Group, value) => {
+                self.group = value;
+                self.sync_folders();
+            }
             FormMessage::Text(field, value) => self.set_text(field, value),
             FormMessage::Kind(kind) => {
                 self.kind = kind;
@@ -239,6 +243,13 @@ impl Form {
             FormMessage::Editor(action) => self.editor.perform(action),
         }
         None
+    }
+
+    /// The combo box clears its own text after a pick, so it is rebuilt around the stored
+    /// group; refocusing then shows the value instead of an empty field.
+    fn sync_folders(&mut self) {
+        let folders = self.folders.options().to_vec();
+        self.folders = combo_box::State::with_selection(folders, Some(&self.group));
     }
 
     fn set_text(&mut self, field: Field, value: String) {
@@ -456,9 +467,16 @@ mod tests {
         form.update(FormMessage::Raw(false));
         assert_eq!(form.folders.options(), folders);
         form.update(FormMessage::Text(Field::Group, " batch/nightly ".into()));
+        assert_eq!(form.group, " batch/nightly ");
         assert_eq!(form.workload().unwrap().group, "batch/nightly");
+        assert_eq!(form.folders.options(), folders);
+        form.update(FormMessage::Text(Field::Group, "batch/nightly/x".into()));
+        assert_eq!(form.group, "batch/nightly/x");
+        // The combo box's own text is private; its Debug output shows what a refocus draws.
+        assert!(format!("{:?}", form.folders).contains("value: \"batch/nightly/x\""));
         form.update(FormMessage::Text(Field::Group, String::new()));
         assert_eq!(form.workload().unwrap().group, "");
+        assert_eq!(form.folders.options(), folders);
     }
 
     #[test]
