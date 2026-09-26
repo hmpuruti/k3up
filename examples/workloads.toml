@@ -21,7 +21,6 @@ executable = "/bin/echo"
 args = ["Scheduled job completed"]
 working_directory = "/tmp"
 kind = "job"
-restart = "never"
 
 [workloads.schedule]
 every_secs = 3600

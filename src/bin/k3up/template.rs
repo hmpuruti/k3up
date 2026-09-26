@@ -15,8 +15,10 @@ kind = "service"                           # service | job; default service
 start_at_boot = true                       # default false
 depends_on = ["migrate"]                   # workloads that must be ready first; default []
 restart = "on_failure"                     # never | on_failure | always; default on_failure
-max_restarts = 5                           # 0 to 100; default 5
-restart_delay_secs = 2                     # 1 to 300, doubles after each restart; default 2
+max_restarts = 5                           # 0 to 100, or "unlimited"; default 5. The count resets after 60s of running
+restart_delay_secs = 2                     # 1 to 300; default 2
+restart_backoff = "exponential"            # exponential | fixed; default exponential. exponential doubles the delay each time, up to 300s
+success_exit_codes = []                    # exit codes besides 0 that count as success; default []
 stop_timeout_secs = 5                      # 1 to 30; default 5
 # run_timeout_secs = 3600                  # optional; the run ends with exit code 124 after it
 readiness_tcp = "127.0.0.1:8080"           # optional, services only; IP:port that must accept connections
@@ -31,7 +33,8 @@ timezone = "UTC"                           # IANA name; default UTC
 action = "restart"                         # start | restart; default start; jobs allow start only
 missed = "skip"                            # skip | run_once; default skip
 
-# A job runs to completion each time it is started or scheduled. It is never restarted.
+# A job runs to completion each time it is started or scheduled. It is never restarted, so
+# the restart settings above do not apply to it.
 [[workloads]]
 name = "migrate"
 description = "Database migration"
@@ -39,6 +42,7 @@ executable = "/usr/local/bin/node"
 args = ["migrate.js"]
 working_directory = "/srv/web"
 kind = "job"
+success_exit_codes = [3]                   # this job also succeeds when it exits with 3
 run_timeout_secs = 600
 
 [workloads.schedule]
@@ -51,7 +55,9 @@ missed = "run_once"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3up::model::{Kind, Manifest, PathStyle, Restart, ScheduleAction};
+    use k3up::model::{
+        Kind, Manifest, PathStyle, Restart, RestartBackoff, RestartLimit, ScheduleAction,
+    };
 
     #[test]
     fn template_is_a_valid_manifest_showing_every_field() {
@@ -68,7 +74,20 @@ mod tests {
             web.schedule.as_ref().unwrap().action,
             ScheduleAction::Restart
         );
+        assert_eq!(web.max_restarts, RestartLimit::Count(5));
+        assert_eq!(web.restart_backoff, RestartBackoff::Exponential);
+        assert!(web.success_exit_codes.is_empty());
         assert_eq!(manifest.workloads[1].run_timeout_secs, Some(600));
+        assert_eq!(manifest.workloads[1].success_exit_codes, [3]);
+        let job = &toml::from_str::<toml::Value>(TEMPLATE).unwrap()["workloads"][1];
+        for field in [
+            "restart",
+            "max_restarts",
+            "restart_delay_secs",
+            "restart_backoff",
+        ] {
+            assert!(job.get(field).is_none(), "{field}");
+        }
         for field in [
             "name",
             "description",
@@ -81,6 +100,8 @@ mod tests {
             "restart",
             "max_restarts",
             "restart_delay_secs",
+            "restart_backoff",
+            "success_exit_codes",
             "stop_timeout_secs",
             "run_timeout_secs",
             "readiness_tcp",

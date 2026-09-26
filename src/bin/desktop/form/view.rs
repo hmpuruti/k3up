@@ -10,13 +10,18 @@ use iced::{
     Length::Fill,
     widget::{Space, column, container, pick_list, row, scrollable, text, text_editor, toggler},
 };
-use k3up::model::{Kind, Missed, Restart, ScheduleAction};
+use k3up::model::{Kind, Missed, Restart, RestartBackoff, ScheduleAction};
 
 const KINDS: [(&str, Kind); 2] = [("Service", Kind::Service), ("Job", Kind::Job)];
 const RESTARTS: [(&str, Restart); 3] = [
     ("Never", Restart::Never),
     ("On failure", Restart::OnFailure),
     ("Always", Restart::Always),
+];
+const LIMITS: [(&str, bool); 2] = [("Up to", false), ("Unlimited", true)];
+const BACKOFFS: [(&str, RestartBackoff); 2] = [
+    ("Doubling", RestartBackoff::Exponential),
+    ("Fixed", RestartBackoff::Fixed),
 ];
 const CADENCES: [(&str, Cadence); 3] = [
     ("Manual", Cadence::Manual),
@@ -277,6 +282,12 @@ fn lifecycle(form: &Form, names: Vec<String>) -> Element<'_, Message> {
         .spacing(theme::SPACE_LG)
         .align_y(Alignment::End),
         dependencies(form, names),
+        mono_field(
+            "SUCCESS EXIT CODES",
+            "—",
+            &form.success_codes,
+            Field::SuccessCodes
+        ),
     ]
     .spacing(theme::SPACE_LG);
     if !form.is_job() {
@@ -346,13 +357,7 @@ fn recovery(form: &Form) -> Element<'_, Message> {
     if form.restart != Restart::Never {
         content = content.push(
             row![
-                number_field(
-                    "MAX RESTARTS",
-                    "5",
-                    &form.max_restarts,
-                    Field::MaxRestarts,
-                    ""
-                ),
+                max_restarts(form),
                 number_field(
                     "RESTART DELAY",
                     "2",
@@ -361,10 +366,34 @@ fn recovery(form: &Form) -> Element<'_, Message> {
                     "s"
                 ),
             ]
-            .spacing(theme::SPACE_MD),
+            .spacing(theme::SPACE_MD)
+            .align_y(Alignment::End),
         );
+        content = content.push(widgets::field(
+            "BACKOFF",
+            widgets::segmented(&BACKOFFS, form.backoff, |value| {
+                Message::Form(FormMessage::Backoff(value))
+            }),
+        ));
     }
     widgets::section("Recovery", content)
+}
+
+fn max_restarts(form: &Form) -> Element<'_, Message> {
+    let mut control = row![widgets::segmented(&LIMITS, form.unlimited, |value| {
+        Message::Form(FormMessage::Unlimited(value))
+    })]
+    .spacing(theme::SPACE_SM)
+    .align_y(Alignment::Center);
+    if !form.unlimited {
+        control = control.push(
+            widgets::input("5", &form.max_restarts, |value| {
+                Message::Form(FormMessage::Text(Field::MaxRestarts, value))
+            })
+            .width(Fill),
+        );
+    }
+    widgets::field("MAX RESTARTS", control)
 }
 
 fn limits(form: &Form) -> Element<'_, Message> {

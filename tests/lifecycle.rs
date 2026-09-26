@@ -7,7 +7,12 @@ use std::{collections::BTreeMap, time::Duration};
 fn fixture() {
     use std::io::Write;
     match std::env::var("K3UP_FIXTURE").unwrap_or_default().as_str() {
-        "exit" => std::process::exit(7),
+        "exit" => std::process::exit(
+            std::env::var("K3UP_EXIT_CODE")
+                .ok()
+                .and_then(|code| code.parse().ok())
+                .unwrap_or(7),
+        ),
         "job" => {
             println!("job completed");
         }
@@ -144,7 +149,7 @@ async fn restart_budget_ends_a_crash_loop() {
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::open(dir.path()).unwrap();
     let mut workload = spec("crasher", "exit", dir.path());
-    workload.max_restarts = 1;
+    workload.max_restarts = RestartLimit::Count(1);
     put(&mut engine, workload).await;
     engine
         .handle(Command::Start {
@@ -157,6 +162,110 @@ async fn restart_budget_ends_a_crash_loop() {
     assert_eq!(failed.last_exit, Some(7));
     assert!(failed.reason.contains("restart limit"));
     assert!(!failed.desired_running);
+}
+
+#[tokio::test]
+async fn unlimited_restarts_keep_retrying_with_a_fixed_delay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    let mut workload = spec("sentinel", "exit", dir.path());
+    workload.restart = Restart::Always;
+    workload.max_restarts = RestartLimit::Unlimited;
+    workload.restart_backoff = RestartBackoff::Fixed;
+    put(&mut engine, workload).await;
+    engine
+        .handle(Command::Start {
+            name: "sentinel".into(),
+        })
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let retrying = loop {
+        engine.tick().await.unwrap();
+        let current = status(&mut engine, "sentinel").await;
+        assert_ne!(current.state, "failed", "{}", current.reason);
+        if current.restart_count >= 6 {
+            break current;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} retries: {}",
+            current.restart_count,
+            current.reason
+        );
+        if current.state == "backoff" {
+            assert!(engine.next_wake() <= Duration::from_millis(1005));
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    };
+    assert!(retrying.desired_running);
+    assert!(
+        retrying.reason.contains("retry 6 in 1s"),
+        "{}",
+        retrying.reason
+    );
+    engine
+        .handle(Command::Stop {
+            name: "sentinel".into(),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn listed_exit_codes_complete_a_job_and_release_its_dependents() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    let mut loader = spec("loader", "exit", dir.path());
+    loader.kind = Kind::Job;
+    loader.success_exit_codes = vec![3];
+    loader
+        .environment
+        .insert("K3UP_EXIT_CODE".into(), "3".into());
+    put(&mut engine, loader).await;
+    let mut worker = spec("worker", "pulse", dir.path());
+    worker.depends_on.push("loader".into());
+    put(&mut engine, worker).await;
+    engine
+        .handle(Command::Start {
+            name: "worker".into(),
+        })
+        .await
+        .unwrap();
+    until(&mut engine, "worker", "running").await;
+    let completed = status(&mut engine, "loader").await;
+    assert_eq!(completed.state, "completed");
+    assert_eq!(completed.last_exit, Some(3));
+    assert!(
+        completed
+            .reason
+            .contains("exited with code 3, counted as success"),
+        "{}",
+        completed.reason
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn on_failure_services_are_not_restarted_after_a_listed_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    let mut service = spec("service", "exit", dir.path());
+    service.success_exit_codes = vec![3];
+    service
+        .environment
+        .insert("K3UP_EXIT_CODE".into(), "3".into());
+    put(&mut engine, service).await;
+    engine
+        .handle(Command::Start {
+            name: "service".into(),
+        })
+        .await
+        .unwrap();
+    let completed = until(&mut engine, "service", "completed").await;
+    assert_eq!(completed.restart_count, 0);
+    assert_eq!(completed.last_exit, Some(3));
+    assert!(!completed.desired_running);
 }
 
 #[tokio::test]

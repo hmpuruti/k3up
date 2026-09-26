@@ -688,38 +688,51 @@ impl Engine {
                     },
                 )
             }
-            Err(error) => self.exited(name, 1, format!("Launch failed: {error:#}")),
+            Err(error) => self.exited(name, 1, format!("Launch failed: {error:#}"), false),
         }
     }
 
-    fn exited(&mut self, name: &str, code: i32, reason: String) -> Result<()> {
+    fn counts_as_success(&self, name: &str, code: i32) -> bool {
+        self.entries[name].status.workload.is_success(code)
+    }
+
+    fn exited(&mut self, name: &str, code: i32, reason: String, success: bool) -> Result<()> {
         let entry = self.entries.get_mut(name).unwrap();
         entry.process.take(); // Drop closes the process group, including children left behind by the parent.
         self.forget(name);
         let entry = self.entries.get_mut(name).unwrap();
         entry.status.pid = None;
         entry.status.last_exit = Some(code);
+        let reason = if success && code != 0 {
+            format!("{reason}, counted as success")
+        } else {
+            reason
+        };
         let spec = &entry.status.workload;
         // Jobs finish once; retrying scheduled jobs requires an explicit future execution.
         let retry = entry.status.desired_running
             && spec.kind == Kind::Service
             && (spec.restart == Restart::Always
-                || (spec.restart == Restart::OnFailure && code != 0));
+                || (spec.restart == Restart::OnFailure && !success));
 
-        let message = if retry && entry.status.restart_count < spec.max_restarts {
-            let delay = spec
-                .restart_delay_secs
-                .saturating_mul(2u64.saturating_pow(entry.status.restart_count.min(16)))
-                .min(300);
-            entry.status.restart_count += 1;
+        let message = if retry && spec.max_restarts.allows(entry.status.restart_count) {
+            let delay = retry_delay(
+                spec.restart_backoff,
+                spec.restart_delay_secs,
+                entry.status.restart_count,
+            );
+            let attempt = entry.status.restart_count.saturating_add(1);
+            entry.status.restart_count = attempt;
             entry.retry_at = Some(Utc::now() + Duration::seconds(delay as i64));
             entry.status.state = State::Backoff;
-            format!(
-                "{reason}; retry {}/{} in {delay}s",
-                entry.status.restart_count, spec.max_restarts
-            )
+            match spec.max_restarts {
+                RestartLimit::Count(limit) => {
+                    format!("{reason}; retry {attempt}/{limit} in {delay}s")
+                }
+                RestartLimit::Unlimited => format!("{reason}; retry {attempt} in {delay}s"),
+            }
         } else {
-            entry.status.state = if code == 0 {
+            entry.status.state = if success {
                 State::Completed
             } else {
                 State::Failed
@@ -775,7 +788,8 @@ impl Engine {
             }
         }
         if let Some((code, reason)) = exit {
-            self.exited(name, code, reason)?;
+            let success = self.counts_as_success(name, code);
+            self.exited(name, code, reason, success)?;
         }
         if self.entries[name].status.state == State::Starting {
             let address = self.entries[name]
@@ -798,7 +812,7 @@ impl Engine {
                 (now - start).num_seconds()
                     >= self.entries[name].status.workload.startup_timeout_secs as i64
             }) {
-                self.exited(name, 124, "TCP readiness timed out".into())?;
+                self.exited(name, 124, "TCP readiness timed out".into(), false)?;
             }
         }
         if self.entries[name].status.state == State::Running

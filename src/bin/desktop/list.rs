@@ -146,7 +146,8 @@ fn card_meta(status: &Status, now: DateTime<Utc>) -> String {
             .unwrap_or_default(),
         State::Backoff => format!(
             "retry {}/{}",
-            status.restart_count, status.workload.max_restarts
+            status.restart_count,
+            format::restart_limit(status.workload.max_restarts)
         ),
         State::Failed => status
             .last_exit

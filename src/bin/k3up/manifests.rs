@@ -39,11 +39,8 @@ pub fn export(client: &Client, output: Option<PathBuf>) -> Result<Response> {
     let Some(output) = output else {
         return Ok(response);
     };
-    std::fs::write(
-        &output,
-        toml::to_string_pretty(response.manifest.as_ref().unwrap())?,
-    )
-    .with_context(|| format!("Write {}", output.display()))?;
+    std::fs::write(&output, response.manifest.as_ref().unwrap().to_toml()?)
+        .with_context(|| format!("Write {}", output.display()))?;
     Ok(Response::success(format!("Saved {}", output.display())))
 }
 

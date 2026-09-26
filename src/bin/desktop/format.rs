@@ -1,6 +1,6 @@
 use crate::theme::Tone;
 use chrono::{DateTime, TimeDelta, Utc};
-use k3up::model::{Kind, Missed, Restart, Schedule, ScheduleAction, State, Status};
+use k3up::model::{Kind, Missed, Restart, RestartLimit, Schedule, ScheduleAction, State, Status};
 
 pub fn state_tone(state: State) -> Tone {
     match state {
@@ -42,6 +42,13 @@ pub fn restart_label(restart: Restart) -> &'static str {
         Restart::Never => "Never",
         Restart::OnFailure => "On failure",
         Restart::Always => "Always",
+    }
+}
+
+pub fn restart_limit(limit: RestartLimit) -> String {
+    match limit {
+        RestartLimit::Count(count) => count.to_string(),
+        RestartLimit::Unlimited => "∞".into(),
     }
 }
 

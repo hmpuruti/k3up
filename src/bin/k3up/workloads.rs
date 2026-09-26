@@ -59,6 +59,7 @@ pub struct Edit {
     pub clear_readiness: bool,
     pub clear_run_timeout: bool,
     pub clear_args: bool,
+    pub clear_success_exit_codes: bool,
     pub restart_running: bool,
     pub args: Vec<String>,
 }
@@ -94,6 +95,9 @@ pub fn edit(client: &Client, request: Edit) -> Result<Response> {
     }
     if request.clear_args {
         workload.args.clear();
+    }
+    if request.clear_success_exit_codes {
+        workload.success_exit_codes.clear();
     }
     if let Some(exe) = &request.exe {
         workload.executable = resolve::executable(exe)?.to_string_lossy().into();
@@ -160,6 +164,14 @@ fn apply_flags(workload: &mut Workload, flags: &WorkloadFlags) -> Result<()> {
     if let Some(address) = &flags.readiness_tcp {
         workload.readiness_tcp = Some(address.clone());
     }
+    let restart_given = flags.never_restart
+        || flags.restart.is_some()
+        || flags.max_restarts.is_some()
+        || flags.restart_delay.is_some()
+        || flags.restart_backoff.is_some();
+    if restart_given && workload.kind == Kind::Job {
+        bail!("Restart settings apply to services only");
+    }
     if flags.never_restart {
         workload.restart = k3up::model::Restart::Never;
     } else if let Some(restart) = flags.restart {
@@ -170,6 +182,12 @@ fn apply_flags(workload: &mut Workload, flags: &WorkloadFlags) -> Result<()> {
     }
     if let Some(delay) = flags.restart_delay {
         workload.restart_delay_secs = delay;
+    }
+    if let Some(backoff) = flags.restart_backoff {
+        workload.restart_backoff = backoff.into();
+    }
+    if !flags.success_exit_code.is_empty() {
+        workload.success_exit_codes = flags.success_exit_code.clone();
     }
     if let Some(timeout) = flags.stop_timeout {
         workload.stop_timeout_secs = timeout;
@@ -262,7 +280,7 @@ pub fn show(client: &Client, name: &str) -> Result<Outcome> {
         workloads: vec![status.workload.clone()],
     };
     Ok(Outcome::Custom {
-        text: toml::to_string_pretty(&manifest)?.trim_end().to_string(),
+        text: manifest.to_toml()?.trim_end().to_string(),
         json: serde_json::to_value(&status)?,
         ok: true,
     })
