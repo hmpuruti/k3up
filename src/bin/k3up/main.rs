@@ -1,5 +1,6 @@
 mod agent;
 mod cli;
+mod groups;
 mod health;
 mod manifests;
 mod output;
@@ -9,11 +10,25 @@ mod systemd;
 mod template;
 mod workloads;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser};
 use cli::{Action, AgentCommand, Args, PathCommand};
 use k3up::{client::Client, platform, protocol::Response};
 use output::Outcome;
+
+enum Target {
+    Name(String),
+    Folder(String),
+}
+
+/// clap already insists on exactly one of the two; this keeps the match total.
+fn target(name: Option<String>, group: Option<String>) -> Result<Target> {
+    match (name, group) {
+        (Some(name), None) => Ok(Target::Name(name)),
+        (None, Some(folder)) => Ok(Target::Folder(folder)),
+        _ => bail!("Give a workload name or --group PATH, not both"),
+    }
+}
 
 fn run(args: Args) -> Result<Outcome> {
     let client = Client::new(
@@ -55,6 +70,7 @@ fn run(args: Args) -> Result<Outcome> {
             clear_run_timeout,
             clear_args,
             clear_success_exit_codes,
+            clear_group,
             restart_running,
             args,
         } => workloads::edit(
@@ -71,25 +87,42 @@ fn run(args: Args) -> Result<Outcome> {
                 clear_run_timeout,
                 clear_args,
                 clear_success_exit_codes,
+                clear_group,
                 restart_running,
                 args,
             },
         )?
         .into(),
         Action::Show { name } => workloads::show(&client, &name)?,
-        Action::List => client.send(k3up::protocol::Command::List)?.into(),
+        Action::List { group } => groups::list(&client, group.as_deref())?.into(),
         Action::Status { name } => client.send(k3up::protocol::Command::Get { name })?.into(),
         Action::Start {
             name,
+            group,
             wait,
             timeout,
-        } => workloads::start(&client, &name, wait, timeout)?.into(),
-        Action::Stop { name } => client.send(k3up::protocol::Command::Stop { name })?.into(),
+        } => match target(name, group)? {
+            Target::Name(name) => workloads::start(&client, &name, wait, timeout)?.into(),
+            Target::Folder(folder) => {
+                groups::act(&client, &folder, groups::Verb::Start, wait, timeout)?
+            }
+        },
+        Action::Stop { name, group } => match target(name, group)? {
+            Target::Name(name) => client.send(k3up::protocol::Command::Stop { name })?.into(),
+            Target::Folder(folder) => groups::act(&client, &folder, groups::Verb::Stop, false, 0)?,
+        },
         Action::Restart {
             name,
+            group,
             wait,
             timeout,
-        } => workloads::restart(&client, &name, wait, timeout)?.into(),
+        } => match target(name, group)? {
+            Target::Name(name) => workloads::restart(&client, &name, wait, timeout)?.into(),
+            Target::Folder(folder) => {
+                groups::act(&client, &folder, groups::Verb::Restart, wait, timeout)?
+            }
+        },
+        Action::Groups => groups::groups(&client)?,
         Action::Remove { name, stop } => workloads::remove(&client, name, stop)?.into(),
         Action::Logs {
             name,
@@ -105,7 +138,9 @@ fn run(args: Args) -> Result<Outcome> {
         } => workloads::schedule(&client, name, schedule, clear, restart)?.into(),
         Action::Validate { file } => manifests::validate(&file)?.into(),
         Action::Apply { file, dry_run } => manifests::apply(&client, &file, dry_run)?.into(),
-        Action::Export { output } => manifests::export(&client, output)?.into(),
+        Action::Export { output, group } => {
+            manifests::export(&client, output, group.as_deref())?.into()
+        }
         Action::Template => manifests::template().into(),
         Action::Stats { name, watch } => health::stats(&client, name, watch, args.json)?,
         Action::Health { strict } => health::health(&client, strict)?,

@@ -59,11 +59,14 @@ fn header(status: &Status) -> Element<'_, Message> {
     let mut heading = row![
         text(&status.workload.name).size(theme::TEXT_SECTION + 2),
         widgets::kind_tag(status.workload.kind),
-        Space::with_width(Fill),
-        widgets::status_pill(status.state),
     ]
     .spacing(theme::SPACE_MD)
     .align_y(Alignment::Center);
+    if !status.workload.group.is_empty() {
+        heading = heading.push(widgets::pill(&status.workload.group, Tone::Neutral));
+    }
+    heading = heading.push(Space::with_width(Fill));
+    heading = heading.push(widgets::status_pill(status.state));
     heading = heading.push(widgets::icon_button(
         glyph::CLOSE,
         "Close",

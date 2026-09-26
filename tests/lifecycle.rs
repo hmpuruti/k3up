@@ -379,7 +379,7 @@ async fn refuses_live_configuration_changes_and_reaps_timed_out_jobs() {
         })
         .await
         .unwrap();
-    workload.description = "changed".into();
+    workload.args.push("--changed".into());
     assert!(
         engine
             .handle(Command::Put {
@@ -392,6 +392,55 @@ async fn refuses_live_configuration_changes_and_reaps_timed_out_jobs() {
     let failed = until(&mut engine, "limited", "failed").await;
     assert_eq!(failed.last_exit, Some(124));
     assert!(failed.pid.is_none());
+}
+
+#[tokio::test]
+async fn relabelling_a_running_workload_keeps_its_process_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    let mut workload = spec("worker", "pulse", dir.path());
+    put(&mut engine, workload.clone()).await;
+    engine
+        .handle(Command::Start {
+            name: "worker".into(),
+        })
+        .await
+        .unwrap();
+    let running = until(&mut engine, "worker", "running").await;
+    workload.group = "Watchtower/Entra".into();
+    workload.description = "Users".into();
+    let response = engine
+        .handle(Command::Put {
+            workload: Box::new(workload.clone()),
+            create_only: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.message, "Update worker");
+    let relabelled = status(&mut engine, "worker").await;
+    assert_eq!(relabelled.workload, workload);
+    assert_eq!(relabelled.pid, running.pid);
+    assert_eq!(relabelled.state, "running");
+    assert_eq!(relabelled.reason, running.reason);
+    assert!(relabelled.desired_running);
+    workload.group = "a//b".into();
+    assert!(
+        engine
+            .handle(Command::Put {
+                workload: Box::new(workload.clone()),
+                create_only: false,
+            })
+            .await
+            .is_err()
+    );
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let mut engine = Engine::open(dir.path()).unwrap();
+    let reopened = status(&mut engine, "worker").await;
+    assert_eq!(reopened.workload.group, "Watchtower/Entra");
+    assert_eq!(reopened.workload.description, "Users");
+    assert!(reopened.desired_running);
+    engine.shutdown().await.unwrap();
 }
 
 #[cfg(unix)]

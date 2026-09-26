@@ -20,6 +20,12 @@ Services and jobs
   back. A job runs to completion each time it is started or scheduled, and is never
   restarted. Both can have a schedule, dependencies, environment variables and timeouts.
 
+Groups
+  A workload can sit in a folder such as watchtower/entra, up to five levels deep. Folders
+  are for finding and acting on workloads together: list, start, stop, restart and export
+  take --group, and `k3up groups` shows the tree. Folders never affect dependencies or
+  start order, and are matched without regard to case.
+
 Data directory
   The agent keeps its database, logs and socket in one directory:
     macOS and Linux   ~/.local/share/k3up
@@ -29,7 +35,7 @@ Data directory
 
 Command groups
   Workloads   create, edit, show, list, status, start, stop, restart, remove, logs,
-              events, schedule
+              events, schedule, groups
   Manifests   validate, apply, export, template
   Health      stats, health
   Agent       agent install, uninstall, start, stop, status, install-service,
@@ -96,10 +102,14 @@ service has run for 60 seconds. Passing these flags with --job is an error.
 
 Exit code 0 is a success. --success-exit-code adds codes that count as success too, for
 services and jobs: a job that exits with one of them is completed, and a service with
---restart on-failure is not restarted.",
+--restart on-failure is not restarted.
+
+--group puts the workload in a folder such as watchtower/entra, so that list, start, stop,
+restart and export can act on the folder. Folders never affect dependencies or start order.",
         after_long_help = "\
 Examples:
   k3up create web --exe node --cwd /srv/web --env PORT=8080 -- server.js
+  k3up create entra-users --exe /opt/watchtower/sync --group watchtower/entra -- entra
   k3up create web --exe /usr/local/bin/node --readiness-tcp 127.0.0.1:8080 \\
       --start-at-boot --start --wait -- server.js
   k3up create backup --exe /usr/local/bin/backup.sh --job --cron '0 0 2 * * *' \\
@@ -151,11 +161,14 @@ turns a setting off. The name cannot be changed: create a new workload instead.
 Restart settings (--restart, --max-restarts, --restart-delay, --restart-backoff) apply to
 services only, and are refused for a job.
 
-The agent refuses to change a workload that is running or wanted running. Stop it first,
-or pass --restart-running to stop it, apply the change and start it again.",
+The agent refuses to change a running workload, except for --group, --clear-group and
+--description, which are labels and apply at once. For anything else, stop it first, or pass
+--restart-running to stop it, apply the change and start it again.",
         after_long_help = "\
 Examples:
   k3up edit web --env PORT=9090 --restart-running
+  k3up edit web --group watchtower/entra
+  k3up edit web --clear-group
   k3up edit web --description 'Public API' --max-restarts 10 --stop-timeout 10
   k3up edit web --max-restarts unlimited --restart-backoff fixed --restart-delay 5
   k3up edit loader --success-exit-code 3 --success-exit-code 75
@@ -198,6 +211,9 @@ Examples:
         /// Remove every extra success exit code
         #[arg(long, help_heading = "Clearing")]
         clear_success_exit_codes: bool,
+        /// Take the workload out of its folder
+        #[arg(long, help_heading = "Clearing", conflicts_with = "group")]
+        clear_group: bool,
         /// If the workload is running, stop it, apply the change and start it again
         #[arg(long)]
         restart_running: bool,
@@ -221,15 +237,26 @@ Examples:
         /// Workload to print
         name: String,
     },
-    /// List every workload with its state
+    /// List every workload with its state, by folder
     #[command(
         display_order = 4,
+        long_about = "\
+List every workload with its state, process, restart count and last reason. Workloads are
+printed under their folder, sorted by folder and then by name, with ungrouped workloads
+last. --group limits the list to one folder and its subfolders. With --json, the workloads
+are listed by name, each with its full definition, including \"group\".",
         after_long_help = "\
 Examples:
   k3up list
-  k3up list --json | jq -r '.workloads[] | select(.state == \"failed\") | .workload.name'"
+  k3up list --group watchtower
+  k3up list --json | jq -r '.workloads[] | select(.state == \"failed\") | .workload.name'
+  k3up list --json | jq -r '.workloads[] | select(.workload.group == \"watchtower/entra\") | .workload.name'"
     )]
-    List,
+    List {
+        /// Only this folder and its subfolders
+        #[arg(long, value_name = "PATH")]
+        group: Option<String>,
+    },
     /// Show one workload's state, process and last reason
     #[command(
         display_order = 5,
@@ -253,16 +280,25 @@ Examples:
 Start a workload. Dependencies that are not ready are started first, and the workload waits
 for them. Starting a running workload does nothing. With --wait, return once a service is
 running (after its TCP check, if it has one) or a job has exited with code 0 or one of its
-success exit codes, and exit with 1 if it fails or stops before then.",
+success exit codes, and exit with 1 if it fails or stops before then.
+
+With --group instead of a name, start every workload in that folder and its subfolders, in
+dependency order, and print one line per workload. --wait and --timeout then apply to the
+whole folder. Every workload is attempted; the exit code is 1 if any of them failed.",
         after_long_help = "\
 Examples:
   k3up start web
   k3up start web --wait --timeout 120
-  k3up start migrate --wait"
+  k3up start migrate --wait
+  k3up start --group watchtower/entra --wait"
     )]
     Start {
         /// Workload to start
-        name: String,
+        #[arg(required_unless_present = "group", conflicts_with = "group")]
+        name: Option<String>,
+        /// Start every workload in this folder and its subfolders, in dependency order
+        #[arg(long, value_name = "PATH")]
+        group: Option<String>,
         /// Wait until a service is running or a job has completed
         #[arg(long)]
         wait: bool,
@@ -276,26 +312,47 @@ Examples:
         long_about = "\
 Stop a workload. The agent sends a termination request, waits for the stop timeout, then
 kills the process. The stop is remembered: the workload stays stopped after an agent restart
-until you start it again or its schedule runs. Workloads that depend on it keep running.",
+until you start it again or its schedule runs. Workloads that depend on it keep running.
+
+With --group instead of a name, stop every workload in that folder and its subfolders, in
+reverse dependency order, and print one line per workload. Every workload is attempted; the
+exit code is 1 if any of them could not be stopped.",
         after_long_help = "\
 Examples:
-  k3up stop web"
+  k3up stop web
+  k3up stop --group watchtower"
     )]
     Stop {
         /// Workload to stop
-        name: String,
+        #[arg(required_unless_present = "group", conflicts_with = "group")]
+        name: Option<String>,
+        /// Stop every workload in this folder and its subfolders, in reverse dependency order
+        #[arg(long, value_name = "PATH")]
+        group: Option<String>,
     },
     /// Stop and start a workload
     #[command(
         display_order = 8,
+        long_about = "\
+Stop a workload and start it again. With --wait, return once it is running or, for a job,
+has completed, and exit with 1 if it fails before then.
+
+With --group instead of a name, restart every workload in that folder and its subfolders,
+in dependency order, and print one line per workload. --wait and --timeout then apply to the
+whole folder. Every workload is attempted; the exit code is 1 if any of them failed.",
         after_long_help = "\
 Examples:
   k3up restart web
-  k3up restart web --wait"
+  k3up restart web --wait
+  k3up restart --group watchtower/entra --wait --timeout 120"
     )]
     Restart {
         /// Workload to restart
-        name: String,
+        #[arg(required_unless_present = "group", conflicts_with = "group")]
+        name: Option<String>,
+        /// Restart every workload in this folder and its subfolders, in dependency order
+        #[arg(long, value_name = "PATH")]
+        group: Option<String>,
         /// Wait until a service is running or a job has completed
         #[arg(long)]
         wait: bool,
@@ -391,6 +448,23 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "schedule_action")]
         restart: bool,
     },
+    /// Show the folder tree with counts and states
+    #[command(
+        display_order = 13,
+        long_about = "\
+Show the folder tree: every folder with the number of workloads inside it, including its
+subfolders, and how many are in each state. Folders come from the group field of each
+workload, such as watchtower/entra, and are matched without regard to case. Workloads
+without a folder are counted on a final line.
+
+With --json, print a list of folders, each with \"path\", \"workloads\", \"running\" and
+\"attention\", where attention counts the failed, backoff and blocked workloads.",
+        after_long_help = "\
+Examples:
+  k3up groups
+  k3up groups --json | jq -r '.[] | select(.attention > 0) | .path'"
+    )]
+    Groups,
     /// Check a TOML manifest without contacting the agent
     #[command(
         display_order = 20,
@@ -428,15 +502,22 @@ Examples:
     /// Save every definition as a TOML manifest
     #[command(
         display_order = 22,
+        long_about = "\
+Print every definition as a TOML manifest, or save it with --output. --group exports only
+one folder and its subfolders, which is a way to move part of a fleet to another machine.",
         after_long_help = "\
 Examples:
   k3up export
-  k3up export --output workloads.toml"
+  k3up export --output workloads.toml
+  k3up export --group watchtower --output watchtower.toml"
     )]
     Export {
         /// File to write; prints to standard output when omitted
         #[arg(long, value_name = "FILE")]
         output: Option<PathBuf>,
+        /// Only this folder and its subfolders
+        #[arg(long, value_name = "PATH")]
+        group: Option<String>,
     },
     /// Print a commented manifest showing every field
     #[command(
@@ -679,6 +760,9 @@ pub struct WorkloadFlags {
     /// Short description
     #[arg(long, value_name = "TEXT", help_heading = "Definition")]
     pub description: Option<String>,
+    /// Folder such as watchtower/entra: up to 5 levels of letters, digits, spaces, - _ .
+    #[arg(long, value_name = "PATH", help_heading = "Definition")]
+    pub group: Option<String>,
     /// Run as a job, which exits when done, instead of a service
     #[arg(
         long,
@@ -873,6 +957,37 @@ mod tests {
         assert!(flags.never_restart);
         assert_eq!(args, ["server.js"]);
         assert!(Args::try_parse_from(["k3up", "install-agent"]).is_ok());
+    }
+
+    #[test]
+    fn group_actions_take_a_name_or_a_folder() {
+        let args =
+            Args::try_parse_from(["k3up", "start", "--group", "watchtower", "--wait"]).unwrap();
+        let Action::Start {
+            name, group, wait, ..
+        } = args.command
+        else {
+            panic!("expected start");
+        };
+        assert_eq!(name, None);
+        assert_eq!(group.as_deref(), Some("watchtower"));
+        assert!(wait);
+        let args = Args::try_parse_from(["k3up", "stop", "web"]).unwrap();
+        let Action::Stop { name, group } = args.command else {
+            panic!("expected stop");
+        };
+        assert_eq!(name.as_deref(), Some("web"));
+        assert_eq!(group, None);
+        assert!(Args::try_parse_from(["k3up", "restart"]).is_err());
+        assert!(Args::try_parse_from(["k3up", "restart", "web", "--group", "x"]).is_err());
+        assert!(
+            Args::try_parse_from(["k3up", "edit", "web", "--group", "x", "--clear-group"]).is_err()
+        );
+        let args = Args::try_parse_from(["k3up", "edit", "web", "--clear-group"]).unwrap();
+        let Action::Edit { clear_group, .. } = args.command else {
+            panic!("expected edit");
+        };
+        assert!(clear_group);
     }
 
     #[test]

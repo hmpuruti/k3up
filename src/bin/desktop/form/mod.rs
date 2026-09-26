@@ -1,6 +1,6 @@
 pub mod view;
 
-use iced::widget::text_editor;
+use iced::widget::{combo_box, text_editor};
 use k3up::model::{
     Kind, Missed, Restart, RestartBackoff, RestartLimit, Schedule, ScheduleAction, Workload,
 };
@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 pub enum Field {
     Name,
     Description,
+    Group,
     Executable,
     Directory,
     Readiness,
@@ -63,6 +64,8 @@ pub struct Form {
     pub editor: text_editor::Content,
     pub name: String,
     pub description: String,
+    pub group: String,
+    pub folders: combo_box::State<String>,
     pub executable: String,
     pub directory: String,
     pub arguments: Vec<String>,
@@ -89,7 +92,8 @@ pub struct Form {
 }
 
 impl Form {
-    pub fn new(spec: Workload, editing: bool) -> Self {
+    /// `folders` are the existing folder paths, offered as suggestions for the group.
+    pub fn new(spec: Workload, editing: bool, folders: Vec<String>) -> Self {
         let schedule = spec.schedule.clone();
         Self {
             editing,
@@ -97,6 +101,8 @@ impl Form {
             editor: text_editor::Content::with_text(&spec.to_toml().unwrap_or_default()),
             name: spec.name.clone(),
             description: spec.description.clone(),
+            group: spec.group.clone(),
+            folders: combo_box::State::with_selection(folders, Some(&spec.group)),
             executable: spec.executable.clone(),
             directory: spec.working_directory.clone(),
             arguments: spec.args.clone(),
@@ -160,6 +166,10 @@ impl Form {
     /// Returns a notice when the message could not be applied.
     pub fn update(&mut self, message: FormMessage) -> Option<String> {
         match message {
+            FormMessage::Text(Field::Group, value) => {
+                self.group = value;
+                self.sync_folders();
+            }
             FormMessage::Text(field, value) => self.set_text(field, value),
             FormMessage::Kind(kind) => {
                 self.kind = kind;
@@ -222,7 +232,8 @@ impl Form {
                         // still reads as a rename and Save refuses it.
                         let base = self.base.clone();
                         let editing = self.editing;
-                        *self = Self::new(spec, editing);
+                        let folders = self.folders.options().to_vec();
+                        *self = Self::new(spec, editing, folders);
                         self.base = base;
                         self.raw = raw;
                     }
@@ -232,6 +243,13 @@ impl Form {
             FormMessage::Editor(action) => self.editor.perform(action),
         }
         None
+    }
+
+    /// The combo box clears its own text after a pick, so it is rebuilt around the stored
+    /// group; refocusing then shows the value instead of an empty field.
+    fn sync_folders(&mut self) {
+        let folders = self.folders.options().to_vec();
+        self.folders = combo_box::State::with_selection(folders, Some(&self.group));
     }
 
     fn set_text(&mut self, field: Field, value: String) {
@@ -257,6 +275,7 @@ impl Form {
         let slot = match field {
             Field::Name => &mut self.name,
             Field::Description => &mut self.description,
+            Field::Group => &mut self.group,
             Field::Executable => &mut self.executable,
             Field::Directory => &mut self.directory,
             Field::Readiness => &mut self.readiness,
@@ -280,6 +299,7 @@ impl Form {
         let mut spec = self.base.clone();
         spec.name = self.name.trim().into();
         spec.description = self.description.trim().into();
+        spec.group = self.group.trim().into();
         spec.executable = self.executable.trim().into();
         spec.working_directory = self.directory.trim().into();
         spec.args = self.arguments.clone();
@@ -364,7 +384,7 @@ mod tests {
 
     /// Paths must be absolute on the platform running the tests.
     fn filled() -> Form {
-        let mut form = Form::new(Workload::default(), false);
+        let mut form = Form::new(Workload::default(), false, vec![]);
         form.name = "worker".into();
         (form.executable, form.directory) = if cfg!(windows) {
             (
@@ -412,12 +432,12 @@ mod tests {
         original.restart_delay_secs = 5;
         original.restart_backoff = RestartBackoff::Fixed;
         original.success_exit_codes = vec![3, 75];
-        let form = Form::new(original.clone(), true);
+        let form = Form::new(original.clone(), true, vec![]);
         assert!(form.unlimited);
         assert_eq!(form.success_codes, "3, 75");
         assert_eq!(form.workload().unwrap(), original);
 
-        let mut form = Form::new(original.clone(), true);
+        let mut form = Form::new(original.clone(), true, vec![]);
         form.update(FormMessage::Raw(true));
         form.update(FormMessage::Raw(false));
         assert_eq!(form.workload().unwrap(), original);
@@ -432,6 +452,31 @@ mod tests {
         assert!(spec.success_exit_codes.is_empty());
         form.update(FormMessage::Text(Field::SuccessCodes, "3,".into()));
         assert_eq!(form.workload().unwrap().success_exit_codes, [3]);
+    }
+
+    #[test]
+    fn group_round_trips_and_keeps_its_suggestions() {
+        let mut original = filled().workload().unwrap();
+        original.group = "Watchtower/Entra".into();
+        let folders = vec!["watchtower".to_string(), "Watchtower/Entra".to_string()];
+        let mut form = Form::new(original.clone(), true, folders.clone());
+        assert_eq!(form.group, "Watchtower/Entra");
+        assert_eq!(form.workload().unwrap(), original);
+        form.update(FormMessage::Raw(true));
+        assert!(form.editor.text().contains("group = \"Watchtower/Entra\""));
+        form.update(FormMessage::Raw(false));
+        assert_eq!(form.folders.options(), folders);
+        form.update(FormMessage::Text(Field::Group, " batch/nightly ".into()));
+        assert_eq!(form.group, " batch/nightly ");
+        assert_eq!(form.workload().unwrap().group, "batch/nightly");
+        assert_eq!(form.folders.options(), folders);
+        form.update(FormMessage::Text(Field::Group, "batch/nightly/x".into()));
+        assert_eq!(form.group, "batch/nightly/x");
+        // The combo box's own text is private; its Debug output shows what a refocus draws.
+        assert!(format!("{:?}", form.folders).contains("value: \"batch/nightly/x\""));
+        form.update(FormMessage::Text(Field::Group, String::new()));
+        assert_eq!(form.workload().unwrap().group, "");
+        assert_eq!(form.folders.options(), folders);
     }
 
     #[test]

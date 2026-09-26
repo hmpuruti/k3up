@@ -7,6 +7,7 @@ use crate::{
     schedules,
     sidebar::{self, Link},
     theme::{self, Mode, Tone},
+    tree,
     widgets::{self, glyph},
 };
 use chrono::{DateTime, TimeDelta, Utc};
@@ -20,11 +21,13 @@ use iced::{
 use k3up::{
     autostart::LoginAgent,
     client::Client,
+    group,
     metrics::{Metrics, Point, ProcessProbe, Usage, WorkloadUsage},
     model::{Event, State, Status, Workload},
-    protocol::Command,
+    protocol::{Command, Response},
 };
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -97,6 +100,8 @@ pub struct App {
     dismissed_warning: Option<String>,
     form: Option<Form>,
     confirming_remove: bool,
+    collapsed: BTreeSet<String>,
+    confirming_stop: Option<String>,
     now: DateTime<Utc>,
     login: Option<LoginAgent>,
     login_enabled: Option<bool>,
@@ -157,6 +162,8 @@ impl App {
             dismissed_warning: None,
             form: None,
             confirming_remove: false,
+            collapsed: BTreeSet::new(),
+            confirming_stop: None,
             now: Utc::now(),
             login,
             login_enabled: None,
@@ -478,6 +485,56 @@ impl App {
         self.log_generation += 1;
     }
 
+    fn folders(&self) -> Vec<String> {
+        group::tree(&self.statuses)
+            .folders
+            .into_iter()
+            .map(|folder| folder.path)
+            .collect()
+    }
+
+    /// Starts or stops everything in a folder, one request at a time in dependency order.
+    fn folder_action(&mut self, folder: &str, stop: bool) -> Task<Message> {
+        let names = tree::members(&self.statuses, folder, stop);
+        if !self.ready() || names.is_empty() {
+            return Task::none();
+        }
+        self.busy = true;
+        self.notice = None;
+        let client = self.client.clone();
+        let session = self.session;
+        let folder = folder.to_owned();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut problems = vec![];
+                    for name in &names {
+                        let name = name.clone();
+                        let command = if stop {
+                            Command::Stop { name: name.clone() }
+                        } else {
+                            Command::Start { name: name.clone() }
+                        };
+                        let response =
+                            client.send(command).map_err(|error| format!("{error:#}"))?;
+                        if !response.ok {
+                            problems.push(format!("{name}: {}", response.message));
+                        }
+                    }
+                    Ok(Box::new(folder_outcome(
+                        &folder,
+                        names.len(),
+                        stop,
+                        problems,
+                    )))
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            move |result| Message::ActionDone { session, result },
+        )
+    }
+
     fn select(&mut self, name: String) {
         if self.selected.as_ref() == Some(&name) {
             self.page = Page::Workloads;
@@ -665,6 +722,7 @@ impl App {
                     Ok(response) if response.ok => {
                         self.form = None;
                         self.confirming_remove = false;
+                        self.confirming_stop = None;
                         self.notice = Some(Notice::success(response.message, self.now));
                     }
                     Ok(response) => self.notice = Some(Notice::error(response.message)),
@@ -694,6 +752,8 @@ impl App {
                 self.notice = None;
                 self.form = None;
                 self.confirming_remove = false;
+                self.collapsed.clear();
+                self.confirming_stop = None;
                 self.metrics = None;
                 self.charts.clear();
             }
@@ -701,6 +761,7 @@ impl App {
                 self.page = page;
                 self.form = None;
                 self.confirming_remove = false;
+                self.confirming_stop = None;
             }
             Message::Select(name) => self.select(name),
             Message::Deselect => {
@@ -716,13 +777,14 @@ impl App {
                 self.charts.clear();
             }
             Message::New => {
-                self.form = Some(Form::new(Workload::default(), false));
+                self.form = Some(Form::new(Workload::default(), false, self.folders()));
                 self.notice = None;
                 self.confirming_remove = false;
             }
             Message::Edit => {
                 if let Some(status) = self.selected_status() {
-                    self.form = Some(Form::new(status.workload.clone(), true));
+                    let form = Form::new(status.workload.clone(), true, self.folders());
+                    self.form = Some(form);
                     self.notice = None;
                     self.confirming_remove = false;
                 }
@@ -749,6 +811,19 @@ impl App {
             Message::Restart => {
                 if let Some(name) = self.selected.clone() {
                     return self.action(Command::Restart { name });
+                }
+            }
+            Message::ToggleFolder(key) => {
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+            }
+            Message::StartFolder(folder) => return self.folder_action(&folder, false),
+            Message::StopFolder(folder) => self.confirming_stop = Some(folder),
+            Message::CancelStopFolder => self.confirming_stop = None,
+            Message::ConfirmStopFolder => {
+                if let Some(folder) = self.confirming_stop.clone() {
+                    return self.folder_action(&folder, true);
                 }
             }
             Message::Remove => self.confirming_remove = true,
@@ -944,13 +1019,16 @@ impl App {
             None => list::placeholder(),
         };
         let body = row![
-            list::view(
-                &self.statuses,
-                self.filter,
-                &self.search,
-                self.selected.as_deref(),
-                self.now,
-            ),
+            list::view(list::Context {
+                statuses: &self.statuses,
+                filter: self.filter,
+                search: &self.search,
+                selected: self.selected.as_deref(),
+                collapsed: &self.collapsed,
+                confirming_stop: self.confirming_stop.as_deref(),
+                ready: self.ready(),
+                now: self.now,
+            }),
             detail,
         ]
         .spacing(theme::SPACE_LG)
@@ -959,6 +1037,20 @@ impl App {
             .spacing(theme::SPACE_XL)
             .height(Fill)
             .into()
+    }
+}
+
+fn folder_outcome(folder: &str, total: usize, stop: bool, problems: Vec<String>) -> Response {
+    let verb = if stop { "Stopped" } else { "Started" };
+    let done = total - problems.len();
+    let noun = if total == 1 { "workload" } else { "workloads" };
+    if problems.is_empty() {
+        Response::success(format!("{verb} {done} {noun} in {folder}"))
+    } else {
+        Response::error(format!(
+            "{verb} {done} of {total} {noun} in {folder}. {}",
+            problems.join("; ")
+        ))
     }
 }
 

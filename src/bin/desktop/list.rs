@@ -1,16 +1,32 @@
 use crate::{
     format,
     message::{Filter, Message},
-    theme,
+    theme::{self, Tone},
+    tree::{self, Row},
     widgets::{self, glyph},
 };
 use chrono::{DateTime, Utc};
 use iced::{
     Alignment, Element,
     Length::Fill,
-    widget::{button, column, container, row, scrollable, text},
+    widget::{Space, button, column, container, row, scrollable, text},
 };
-use k3up::model::{State, Status};
+use k3up::{
+    group::{self, Folder},
+    model::{State, Status},
+};
+use std::collections::BTreeSet;
+
+pub struct Context<'a> {
+    pub statuses: &'a [Status],
+    pub filter: Filter,
+    pub search: &'a str,
+    pub selected: Option<&'a str>,
+    pub collapsed: &'a BTreeSet<String>,
+    pub confirming_stop: Option<&'a str>,
+    pub ready: bool,
+    pub now: DateTime<Utc>,
+}
 
 pub fn matches(status: &Status, filter: Filter, search: &str) -> bool {
     let by_filter = match filter {
@@ -23,32 +39,40 @@ pub fn matches(status: &Status, filter: Filter, search: &str) -> bool {
     by_filter
         && (needle.is_empty()
             || status.workload.name.to_lowercase().contains(&needle)
-            || status.workload.description.to_lowercase().contains(&needle))
+            || status.workload.description.to_lowercase().contains(&needle)
+            || status.workload.group.to_lowercase().contains(&needle))
 }
 
-pub fn view<'a>(
-    statuses: &'a [Status],
-    filter: Filter,
-    search: &'a str,
-    selected: Option<&'a str>,
-    now: DateTime<Utc>,
-) -> Element<'a, Message> {
-    let visible: Vec<&Status> = statuses
+pub fn view(ctx: Context<'_>) -> Element<'_, Message> {
+    let visible: Vec<&Status> = ctx
+        .statuses
         .iter()
-        .filter(|status| matches(status, filter, search))
+        .filter(|status| matches(status, ctx.filter, ctx.search))
         .collect();
-    let body: Element<_> = if statuses.is_empty() {
+    let body: Element<_> = if ctx.statuses.is_empty() {
         widgets::empty_state(glyph::RING, "No workloads", None)
     } else if visible.is_empty() {
         widgets::empty_state(glyph::RING, "No matches", None)
     } else {
+        let tree = group::tree(&visible);
         let mut items = column![].spacing(theme::SPACE_SM);
-        for status in visible {
-            items = items.push(card(
-                status,
-                selected == Some(status.workload.name.as_str()),
-                now,
-            ));
+        for entry in tree::rows(&tree, ctx.collapsed) {
+            match entry {
+                Row::Folder { folder, collapsed } => {
+                    items = items.push(folder_row(folder, collapsed, ctx.ready));
+                    if ctx
+                        .confirming_stop
+                        .is_some_and(|path| group::same(path, &folder.path))
+                    {
+                        items = items.push(indented(folder.depth, stop_prompt(folder, ctx.ready)));
+                    }
+                }
+                Row::Workload { index, depth } => {
+                    let status = visible[index];
+                    let selected = ctx.selected == Some(status.workload.name.as_str());
+                    items = items.push(indented(depth, card(status, selected, ctx.now)));
+                }
+            }
         }
         scrollable(container(items).padding(iced::Padding {
             right: 10.0,
@@ -60,8 +84,8 @@ pub fn view<'a>(
         .into()
     };
     column![
-        widgets::clip(widgets::input("Search", search, Message::Search)),
-        filters(statuses, filter),
+        widgets::clip(widgets::input("Search", ctx.search, Message::Search)),
+        filters(ctx.statuses, ctx.filter),
         body,
     ]
     .spacing(theme::SPACE_MD)
@@ -95,6 +119,82 @@ fn filters<'a>(statuses: &'a [Status], active: Filter) -> Element<'a, Message> {
         );
     }
     chips.into()
+}
+
+fn indented<'a>(depth: usize, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    row![
+        Space::with_width(depth as f32 * tree::INDENT),
+        content.into()
+    ]
+    .into()
+}
+
+/// The folder is read, not borrowed, so the row outlives the tree it came from.
+fn folder_row<'a>(folder: &Folder, collapsed: bool, ready: bool) -> Element<'a, Message> {
+    let path = folder.path.clone();
+    let symbol = if collapsed {
+        glyph::FOLDED
+    } else {
+        glyph::UNFOLDED
+    };
+    let toggle = button(
+        row![
+            widgets::glyph(symbol, 14).width(12).center(),
+            text(folder.name().to_owned()).size(theme::TEXT_BODY),
+            widgets::faint(folder.workloads().to_string(), theme::TEXT_META),
+            Space::with_width(Fill),
+            widgets::glyph(glyph::DOT, 8).style(theme::text_toned(tree::tone(folder))),
+        ]
+        .spacing(theme::SPACE_SM)
+        .align_y(Alignment::Center),
+    )
+    .width(Fill)
+    .padding([6, 8])
+    .style(theme::folder)
+    .on_press(Message::ToggleFolder(group::key(&folder.path)));
+    let actions = row![
+        widgets::icon_button(
+            glyph::PLAY,
+            "Start all",
+            ready.then(|| Message::StartFolder(path.clone())),
+        ),
+        widgets::icon_button(
+            glyph::STOP,
+            "Stop all",
+            ready.then_some(Message::StopFolder(path)),
+        ),
+    ];
+    indented(
+        folder.depth,
+        row![toggle, actions]
+            .spacing(theme::SPACE_XS)
+            .align_y(Alignment::Center),
+    )
+}
+
+fn stop_prompt<'a>(folder: &Folder, ready: bool) -> Element<'a, Message> {
+    let count = folder.workloads();
+    let noun = if count == 1 { "workload" } else { "workloads" };
+    container(
+        column![
+            widgets::toned(
+                format!("Stop {count} {noun} in {}?", folder.name()),
+                theme::TEXT_META,
+                Tone::Danger,
+            ),
+            row![
+                Space::with_width(Fill),
+                widgets::secondary("Keep", Some(Message::CancelStopFolder)),
+                widgets::danger("Stop", ready.then_some(Message::ConfirmStopFolder)),
+            ]
+            .spacing(theme::SPACE_SM),
+        ]
+        .spacing(theme::SPACE_SM),
+    )
+    .padding([theme::SPACE_SM, theme::SPACE_MD])
+    .width(Fill)
+    .style(theme::banner(Tone::Danger))
+    .into()
 }
 
 fn card<'a>(status: &'a Status, selected: bool, now: DateTime<Utc>) -> Element<'a, Message> {
