@@ -64,7 +64,10 @@ pub fn view(ctx: Context<'_>) -> Element<'_, Message> {
                         .confirming_stop
                         .is_some_and(|path| group::same(path, &folder.path))
                     {
-                        items = items.push(indented(folder.depth, stop_prompt(folder, ctx.ready)));
+                        items = items.push(indented(
+                            folder.depth,
+                            stop_prompt(ctx.statuses, folder, ctx.ready),
+                        ));
                     }
                 }
                 Row::Workload { index, depth } => {
@@ -172,8 +175,9 @@ fn folder_row<'a>(folder: &Folder, collapsed: bool, ready: bool) -> Element<'a, 
     )
 }
 
-fn stop_prompt<'a>(folder: &Folder, ready: bool) -> Element<'a, Message> {
-    let count = folder.workloads();
+/// Counts the whole folder, not just what the filter shows, because that is what stops.
+fn stop_prompt<'a>(statuses: &[Status], folder: &Folder, ready: bool) -> Element<'a, Message> {
+    let count = tree::members(statuses, &folder.path, true).len();
     let noun = if count == 1 { "workload" } else { "workloads" };
     container(
         column![
