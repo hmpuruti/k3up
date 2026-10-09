@@ -10,10 +10,6 @@ use std::{
 const LABEL: &str = "com.k3.up.agent";
 #[cfg(target_os = "linux")]
 const UNIT: &str = "k3up-agent.service";
-#[cfg(windows)]
-const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-#[cfg(windows)]
-const RUN_VALUE: &str = "K3 Up";
 const OPT_OUT: &str = "login-item-disabled";
 
 /// The agent executable shipped beside the running program, if there is one. Inside the macOS
@@ -44,8 +40,8 @@ pub enum Registration {
 /// Starts the agent for the current user at login and on demand.
 ///
 /// macOS uses a launchd LaunchAgent and Linux a systemd user service; both restart the agent
-/// after a crash. On Windows a Run entry launches the agent at login; it has no supervisor to
-/// restart the agent after a crash.
+/// after a crash. Windows has no login item: the agent runs as a machine service instead, see
+/// `windows_host`, and this only launches agents for other data directories.
 #[derive(Clone, Debug)]
 pub struct LoginAgent {
     agent: PathBuf,
@@ -280,118 +276,7 @@ impl LoginAgent {
     }
 }
 
-#[cfg(windows)]
-impl LoginAgent {
-    fn run_entry(&self) -> Result<String> {
-        // A trailing backslash would escape the closing quote.
-        let data = self.data.to_string_lossy();
-        Ok(format!(
-            "\"{}\" --data-dir \"{}\"",
-            self.agent.display(),
-            data.trim_end_matches('\\')
-        ))
-    }
-
-    fn registered_entry(&self) -> Option<String> {
-        use windows_sys::Win32::{
-            Foundation::ERROR_SUCCESS,
-            System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW},
-        };
-        let key = crate::win32::wide(RUN_KEY.as_ref());
-        let value = crate::win32::wide(RUN_VALUE.as_ref());
-        let mut bytes = 0u32;
-        // SAFETY: NUL-terminated names; a null buffer asks only for the size.
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                value.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut bytes,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return None;
-        }
-        let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
-        // SAFETY: the buffer is at least `bytes` long, as reported by the first call.
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                value.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                buffer.as_mut_ptr().cast(),
-                &mut bytes,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return None;
-        }
-        let length = buffer
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(buffer.len());
-        Some(String::from_utf16_lossy(&buffer[..length]))
-    }
-
-    /// Matches `run_entry`, which records the data directory as given.
-    fn entry_marker(&self) -> String {
-        let data = self.data.to_string_lossy();
-        format!("--data-dir \"{}\"", data.trim_end_matches('\\'))
-    }
-
-    fn install(&self) -> Result<()> {
-        use windows_sys::Win32::{
-            Foundation::ERROR_SUCCESS,
-            System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW},
-        };
-        let key = crate::win32::wide(RUN_KEY.as_ref());
-        let value = crate::win32::wide(RUN_VALUE.as_ref());
-        let data = crate::win32::wide(self.run_entry()?.as_ref());
-        // SAFETY: all buffers are NUL-terminated and outlive the call.
-        let status = unsafe {
-            RegSetKeyValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                value.as_ptr(),
-                REG_SZ,
-                data.as_ptr().cast(),
-                (data.len() * 2) as u32,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(std::io::Error::from_raw_os_error(status as i32))
-                .context("Write login entry");
-        }
-        Ok(())
-    }
-
-    fn uninstall(&self) -> Result<()> {
-        use windows_sys::Win32::{
-            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
-            System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyValueW},
-        };
-        let key = crate::win32::wide(RUN_KEY.as_ref());
-        let value = crate::win32::wide(RUN_VALUE.as_ref());
-        // SAFETY: NUL-terminated names that outlive the call.
-        let status = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) };
-        if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
-            return Err(std::io::Error::from_raw_os_error(status as i32))
-                .context("Remove login entry");
-        }
-        Ok(())
-    }
-
-    fn start_supervised(&self) -> Result<()> {
-        anyhow::bail!("Windows has no per-user agent supervisor")
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl LoginAgent {
     fn registered_entry(&self) -> Option<String> {
         None
@@ -402,6 +287,9 @@ impl LoginAgent {
     }
 
     fn install(&self) -> Result<()> {
+        if cfg!(windows) {
+            anyhow::bail!("On Windows the agent runs as the K3 Up service. Run `k3up agent install` from an elevated terminal")
+        }
         anyhow::bail!("Starting the agent at login is not supported on this system")
     }
 

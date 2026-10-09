@@ -49,7 +49,7 @@ K3 Up is written in Rust. It has no browser runtime, no .NET, no listening netwo
 |---|---|---|---|
 | macOS | Yes | Yes | launchd agent |
 | Linux | Yes | Yes (X11 or Wayland) | systemd user service |
-| Windows | Yes, per user or as a machine service | Yes | Run entry, or the Windows service |
+| Windows | Yes, as a machine service | Yes | Windows service, from boot |
 
 macOS is the most tested platform. The Linux and Windows versions are newer and have seen less real-world use, so please report what you find.
 
@@ -65,7 +65,7 @@ Prebuilt downloads are attached to each release on the GitHub Releases page:
 | Linux (x86-64) | `k3up-linux-x86_64.tar.gz` | `k3up`, `k3up-agent`, `k3up-desktop` |
 
 The builds are not code-signed yet, so each system asks you to confirm the first launch:
-- **Windows:** run `k3up-setup-x86_64.exe` and choose **More info → Run anyway** when SmartScreen appears. Setup installs for your account only, so it needs no administrator rights. It adds K3 Up to the Start menu, starts the agent, and sets it to start at login. Remove K3 Up from **Settings → Apps**; it asks whether to keep your workloads and logs.
+- **Windows:** run `k3up-setup-x86_64.exe` and choose **More info → Run anyway** when SmartScreen appears. Setup asks for administrator rights. It installs into `C:\Program Files\K3 Up`, adds K3 Up to the Start menu and the system PATH for every user, and installs the agent as a Windows service that runs as SYSTEM and starts at boot. Setup removes a per-user copy from an earlier version and keeps its data, see [Windows](#windows). Remove K3 Up from **Settings → Apps**; it asks whether to keep the workloads and logs.
 - **macOS:** move `K3 Up.app` to Applications first, then right-click it and choose **Open**. The app refuses to set up its login item when run from the download location.
 - **Linux:** extract the archive somewhere permanent and run `./k3up-desktop`.
 
@@ -121,15 +121,15 @@ Open the desktop app:
 ./target/release/k3up-desktop
 ```
 
-On first launch the app finds the agent next to its own executable, registers it to start at login, and starts it. You don't run the agent yourself.
+On macOS and Linux, the app finds the agent next to its own executable on first launch, registers it to start at login, and starts it. On Windows the installer has already set the agent up as a service. You don't run the agent yourself.
 
-| System | Login item | If the agent crashes |
+| System | Started by | If the agent crashes |
 |---|---|---|
-| macOS | `~/Library/LaunchAgents/com.k3.up.agent.plist` | launchd restarts it |
-| Linux | systemd user service `k3up-agent.service` | systemd restarts it |
-| Windows | `K3 Up` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | the app starts it next time it opens |
+| macOS | `~/Library/LaunchAgents/com.k3.up.agent.plist`, at login | launchd restarts it |
+| Linux | systemd user service `k3up-agent.service`, at login | systemd restarts it |
+| Windows | the `K3Up` service, at boot | the service manager restarts it |
 
-macOS shows a "Background Items Added" notice the first time. The **Start at login** switch in the connection panel removes or restores the login item without stopping the running agent. To open the panel, click the connection status at the bottom of the sidebar. You can also use it to connect to a different agent.
+macOS shows a "Background Items Added" notice the first time. On macOS and Linux, the **Start at login** switch in the connection panel removes or restores the login item without stopping the running agent. To open the panel, click the connection status at the bottom of the sidebar. You can also use it to connect to a different agent.
 
 Choose **New** to register a workload. The form covers every setting; **TOML** in its header switches to the raw definition.
 
@@ -140,9 +140,9 @@ The agent keeps its database, logs and socket in one directory:
 | System | Default |
 |---|---|
 | macOS and Linux | `~/.local/share/k3up` |
-| Windows | `%LOCALAPPDATA%\K3 Up` |
+| Windows | `%ProgramData%\K3 Up`, shared by every user |
 
-Set `K3UP_DATA_DIR`, or pass `--data-dir` to every program, to use another directory. Automatic agent setup applies only to the default directory. With a custom directory, start the agent yourself:
+Set `K3UP_DATA_DIR`, or pass `--data-dir` to every program, to use another directory. Automatic agent setup, and the Windows service, apply only to the default directory. With a custom directory, start the agent yourself:
 
 ```sh
 k3up-agent --data-dir ~/k3up-test
@@ -162,7 +162,7 @@ k3up agent status
 
 - **Linux:** the login item is a systemd user service, which normally runs only while you are logged in. To keep the agent running without a login session, an administrator enables lingering once: `sudo loginctl enable-linger $USER`.
 - **macOS:** the login item is a launchd agent in `~/Library/LaunchAgents`, which runs while you are logged in. The first `agent install` shows a "Background Items Added" notice.
-- **Windows:** `agent install` writes a Run entry for your account and starts the agent. For a service that runs for every user without a login, use `agent install-service` from an elevated terminal instead, see [Windows](#windows).
+- **Windows:** `agent install` installs the agent as a service running as SYSTEM, which starts at boot without anyone logging in. Run it from an elevated terminal. See [Windows](#windows).
 
 `agent uninstall` reverses the install and keeps your data.
 
@@ -227,12 +227,12 @@ Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`
 
 | Command | What it does |
 |---|---|
-| `agent install` | Register the agent found beside `k3up` as a login item, start it and wait until it answers. Safe to repeat. Clears an opt-out made in the app. |
-| `agent uninstall` | Remove the login item, stop the agent and wait for it to exit. Data is kept. |
-| `agent start` | Start the agent now without registering it. |
-| `agent stop` | Stop the agent and every workload, and wait for it to exit. |
-| `agent status` | Reachability, version, process, uptime, data directory, executable, login item and workload counts. Exits with 1 when unreachable. |
-| `agent install-service`, `agent uninstall-service` | The Windows machine service, see [Windows](#windows). |
+| `agent install` | Register the agent found beside `k3up` as a login item, start it and wait until it answers. Safe to repeat. Clears an opt-out made in the app. On Windows, the same as `agent install-service`. |
+| `agent uninstall` | Remove the login item, stop the agent and wait for it to exit. Data is kept. On Windows, the same as `agent uninstall-service`. |
+| `agent start` | Start the agent now without registering it. On Windows, starts the service. |
+| `agent stop` | Stop the agent and every workload, and wait for it to exit. On Windows, stops the service until the next boot. |
+| `agent status` | Reachability, version, process, uptime, data directory, executable, login item or Windows service state, and workload counts. Exits with 1 when unreachable. |
+| `agent install-service`, `agent uninstall-service` | The Windows service, see [Windows](#windows). |
 
 **Other**
 
@@ -247,7 +247,9 @@ Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`
 
 ### Changes outside the data directory
 
-Four commands change the system: `agent install` and `agent uninstall` add or remove a login item, and `agent install-service` and `agent uninstall-service` add or remove the Windows service. The login item only serves the default data directory, so `agent install` and `agent uninstall` refuse any other. Every other command only reads and writes the data directory.
+Four commands change the system: `agent install` and `agent uninstall` add or remove a login item, and `agent install-service` and `agent uninstall-service` add or remove the Windows service, its programs in Program Files and its entry on the system PATH. On Windows, `agent install` and `agent uninstall` are the same as the service commands. The login item and the service only serve the default data directory, so these commands refuse any other. Every other command only reads and writes the data directory.
+
+On Windows, `agent start` and `agent stop` with the default data directory start and stop the service. They need no elevation, but they affect every user of the machine.
 
 To try K3 Up without changing the system, use a scratch directory and start the agent directly:
 
@@ -309,7 +311,7 @@ Three commands print their own shape. `show --json` prints the status object its
 
 When the agent is not reachable it prints `{ "reachable": false, "error": "...", "data_dir": "...", "login_item": false, "login_item_elsewhere": false }` and exits with 1.
 
-`login_item` is true only when the login item starts the agent for this data directory. There is one login item per user account; `login_item_elsewhere` is true when it belongs to a different data directory.
+`login_item` is true only when the login item starts the agent for this data directory. There is one login item per user account; `login_item_elsewhere` is true when it belongs to a different data directory. On Windows there is no login item, and for the default data directory both objects also have `service`: `running`, `stopped`, `starting`, `stopping`, `paused` or `not_installed`.
 
 ### Exit codes
 
@@ -503,17 +505,31 @@ systemctl --user status k3up-example-worker.service
 
 ### Windows
 
-The installer and the desktop app run the agent under your own account. To run it instead as a machine-wide service, place `k3up.exe` and `k3up-agent.exe` in the same folder and run this from an elevated terminal:
+On Windows the agent always runs as the `K3Up` service, under the LocalSystem account. It starts at boot, before anyone logs in, and keeps running when users log off. If it crashes or exits with an error, the service manager restarts it after 5 seconds, and again after every further failure. Workloads run as SYSTEM too, so `start_at_boot` services come back after every reboot.
+
+The installer sets this up. Without the installer, put `k3up.exe` and `k3up-agent.exe` (and optionally `k3up-desktop.exe`) in one folder and run this from an elevated terminal:
 
 ```powershell
-.\k3up.exe agent install-service
-sc.exe start K3Up
-.\k3up.exe --data-dir "$env:ProgramData\K3 Up" list
+.\k3up.exe agent install
+k3up agent status
 ```
 
-Installation copies the agent to `%ProgramFiles%\K3 Up` and keeps data in `%ProgramData%\K3 Up`. Both folders are created with access limited to SYSTEM and Administrators. If any step fails, the installer removes what it created. `.\k3up.exe agent uninstall-service` stops and removes the service; the folders are left in place for you to review.
+`agent install` copies the programs to `%ProgramFiles%\K3 Up`, adds that folder to the system PATH, keeps data in `%ProgramData%\K3 Up`, installs or updates the service, starts it and waits until it answers. Running it again updates an installation in place: it stops the service, which stops its workloads, replaces the programs and starts it again with the same workloads. The data folder is accessible to SYSTEM and Administrators only. If it already exists and belongs to another account, installation stops, because that account could have placed files the service would trust. If any step fails, what that attempt created is removed. `k3up agent uninstall`, from an elevated terminal, stops and removes the service; the folders are left in place for you to review.
 
-The machine service runs as LocalSystem, and so do its workloads. Clients need an elevated terminal to reach it.
+Every logged-in user manages the same agent from a normal, non-elevated terminal or the desktop app: `k3up list`, `k3up create`, `k3up agent start`, `k3up agent stop` and the rest work for everyone. This means any interactive user can run programs as SYSTEM. Only install K3 Up on machines where every user who can log in is trusted with that. Processes that are not part of an interactive logon, such as other services or scheduled tasks set to run whether the user is logged on or not, cannot reach the agent.
+
+Programs that run as SYSTEM see a different environment from your own account: `%USERPROFILE%` is `C:\Windows\System32\config\systemprofile`, mapped network drives and your user environment variables are missing, and they have no desktop. Use absolute paths, set the variables a program needs with `--env`, and give the full path of interpreters such as `node` or `python` that are installed for one user only.
+
+Earlier versions installed K3 Up for one user, with data in `%LOCALAPPDATA%\K3 Up`. Setup removes that copy and its login entry, and leaves the data in place. To move those workloads to the service, start a temporary agent for the old data directory, export, stop it, and apply the export to the service:
+
+```powershell
+k3up --data-dir "$env:LOCALAPPDATA\K3 Up" agent start
+k3up --data-dir "$env:LOCALAPPDATA\K3 Up" export --output old.toml
+k3up --data-dir "$env:LOCALAPPDATA\K3 Up" agent stop
+k3up apply old.toml
+```
+
+The temporary agent starts the workloads that were running when it last stopped, until `agent stop`.
 
 Each workload runs in a Job Object, so its processes end if the agent stops unexpectedly. Windows has no universal way to ask an arbitrary program to shut down gracefully. A stop therefore waits for the stop timeout and then ends the Job Object.
 
@@ -521,7 +537,7 @@ Each workload runs in a Job Object, so its processes end if the agent stops unex
 
 - The agent listens only on a local Unix socket or named pipe, never on a network port.
 - On macOS and Linux, the socket and data directory are readable by their owner only.
-- On Windows, the named pipe admits only SYSTEM, Administrators and the account that started the agent. Clients refuse a pipe created by any other account.
+- On Windows, the service's named pipe admits SYSTEM, Administrators and every interactive user, who can read and write it but not create another instance of it. An agent started for another data directory admits only SYSTEM, Administrators and the account that started it. Clients refuse a pipe created by any account other than SYSTEM, Administrators or their own.
 
 Anyone who can reach the agent can run programs under its account, so treat access to it accordingly.
 
@@ -531,7 +547,8 @@ Workload definitions, including environment variables, are stored in plain text 
 
 - Requests are handled one at a time, so a slow stop delays other requests until it finishes.
 - There is no secret storage, per-workload user accounts, resource limits or ongoing health checks.
-- There are no signed installers or in-place upgrades yet.
+- There are no signed installers yet. Only the Windows installer upgrades an installation in place.
+- On Windows every workload runs as SYSTEM; there is no way to run one as another account.
 - The desktop app manages agents on the local machine only.
 
 ## Project layout
@@ -544,9 +561,9 @@ Workload definitions, including environment variables, are stored in plain text 
 | `src/store.rs` | SQLite storage for definitions and activity |
 | `src/metrics.rs` | Machine and workload resource sampling |
 | `src/platform.rs` | Process containment and platform endpoints |
-| `src/autostart.rs` | Starting the agent at login |
+| `src/autostart.rs` | Starting the agent at login on macOS and Linux |
 | `src/systemd.rs` | Native systemd unit generation |
-| `src/windows_host.rs`, `src/win32.rs` | Windows service hosting and security |
+| `src/windows_host.rs`, `src/win32.rs` | The Windows service: hosting, installation and security |
 | `src/health.rs` | Health thresholds shared by the command line and the app |
 | `src/bin/agent.rs` | The `k3up-agent` program |
 | `src/bin/k3up/` | The `k3up` command line, one module per command group |

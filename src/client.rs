@@ -20,6 +20,14 @@ impl Client {
         }
     }
     pub fn send(&self, command: Command) -> Result<Response> {
+        #[cfg(windows)]
+        if platform::is_machine_data_dir(&self.data_dir)
+            && matches!(std::fs::exists(&self.data_dir), Ok(false))
+        {
+            bail!(
+                "The K3 Up service is not installed. Run `k3up agent install` from an elevated terminal"
+            );
+        }
         let data = std::fs::canonicalize(&self.data_dir)
             .context("Agent data directory does not exist. Start k3up-agent first")?;
         let request = serde_json::to_vec(&Request {
@@ -49,8 +57,7 @@ impl Client {
             let deadline = std::time::Instant::now() + Duration::from_secs(120);
             let pipe = loop {
                 match std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
+                    .access_mode(crate::win32::PIPE_CLIENT_ACCESS)
                     .security_qos_flags(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
                     .open(&endpoint)
                 {
@@ -60,6 +67,11 @@ impl Client {
                             && std::time::Instant::now() < deadline =>
                     {
                         std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(error) if platform::is_machine_data_dir(&self.data_dir) => {
+                        return Err(error).context(
+                            "Cannot reach the K3 Up service. Start it with `k3up agent start`",
+                        );
                     }
                     Err(error) => {
                         return Err(error).context(

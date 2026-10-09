@@ -115,14 +115,18 @@ fn run(args: Args) -> Result<Outcome> {
             AgentCommand::Start => agent::start(&client)?.into(),
             AgentCommand::Stop { timeout } => agent::stop(&client, timeout)?.into(),
             AgentCommand::Status => agent::status(&client)?,
-            AgentCommand::InstallService => agent::install_service(&client.data_dir)?.into(),
-            AgentCommand::UninstallService => agent::uninstall_service()?.into(),
+            AgentCommand::InstallService { timeout } => {
+                agent::install_service(&client, timeout)?.into()
+            }
+            AgentCommand::UninstallService { timeout } => {
+                agent::uninstall_service(&client, timeout)?.into()
+            }
         },
-        Action::InstallAgent => agent::install_service(&client.data_dir)?.into(),
-        Action::UninstallAgent => agent::uninstall_service()?.into(),
+        Action::InstallAgent => agent::install_service(&client, 120)?.into(),
+        Action::UninstallAgent => agent::uninstall_service(&client, 120)?.into(),
         Action::Path(command) => match command {
-            PathCommand::Add { dir } => path::add(dir)?.into(),
-            PathCommand::Remove { dir } => path::remove(dir)?.into(),
+            PathCommand::Add { dir, system } => path::add(dir, system)?.into(),
+            PathCommand::Remove { dir, system } => path::remove(dir, system)?.into(),
         },
         Action::Completions { shell } => {
             clap_complete::generate(shell, &mut Args::command(), "k3up", &mut std::io::stdout());

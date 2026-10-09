@@ -12,8 +12,9 @@ The agent
   k3up talks to a local agent, k3up-agent, which starts your programs, restarts them when
   they crash, runs them on a schedule and brings them back after a reboot. The agent keeps
   running when you close k3up or the desktop app. Only `k3up agent stop`, `k3up agent
-  uninstall` or a shutdown of the machine stops it, and the login item starts it again at
-  the next login.
+  uninstall` or a shutdown of the machine stops it. On macOS and Linux a login item starts
+  it again at the next login. On Windows it is a service running as SYSTEM: it starts at
+  boot, before anyone logs in, and every logged-in user manages the same agent.
 
 Services and jobs
   A service is kept running. When it exits, its restart policy decides whether it comes
@@ -23,9 +24,9 @@ Services and jobs
 Data directory
   The agent keeps its database, logs and socket in one directory:
     macOS and Linux   ~/.local/share/k3up
-    Windows           %LOCALAPPDATA%\\K3 Up
+    Windows           %ProgramData%\\K3 Up, shared by every user
   Set K3UP_DATA_DIR, or pass --data-dir to every command, to use another one. The login
-  item always manages the default directory.
+  item and the Windows service always manage the default directory.
 
 Command groups
   Workloads   create, edit, show, list, status, start, stop, restart, remove, logs,
@@ -43,13 +44,15 @@ Output and exit codes
 
 Changes outside the data directory
   agent install, agent uninstall, install-service and uninstall-service change the system:
-  a login item, a Windows service. Every other command only touches the data directory.
+  a login item, or on Windows a service and Program Files. Every other command only
+  touches the data directory.
   To try K3 Up without changing the system, use a scratch directory and `agent start`:
     K3UP_DATA_DIR=/tmp/k3try k3up agent start";
 
 const START_HERE: &str = "\
 Start here:
-  k3up agent install      (registers a login item, see Changes outside the data directory)
+  k3up agent install      (a login item, or the Windows service; see Changes outside the
+                           data directory)
   k3up create web --exe node --cwd /srv/web --env PORT=8080 \\
       --readiness-tcp 127.0.0.1:8080 --start-at-boot -- server.js
   k3up start web --wait
@@ -577,14 +580,17 @@ Examples:
 
 #[derive(Subcommand)]
 pub enum AgentCommand {
-    /// Register the agent to start at login, and start it now
+    /// Register the agent to start at login, or at boot on Windows, and start it now
     #[command(
         long_about = "\
 Register the agent found beside k3up as a login item, start it, and wait until it answers.
-The login item is a launchd agent on macOS, a systemd user service on Linux and a Run entry
-on Windows. Running it again is safe: it refreshes the login item and leaves a running agent
-alone. An earlier opt-out made in the desktop app is cleared, since you are asking for the
-login item explicitly. The login item always manages the default data directory.
+The login item is a launchd agent on macOS and a systemd user service on Linux. Running it
+again is safe: it refreshes the login item and leaves a running agent alone. An earlier
+opt-out made in the desktop app is cleared, since you are asking for the login item
+explicitly. The login item always manages the default data directory.
+
+On Windows this is the same as install-service: it installs the agent as a service running
+as SYSTEM, which starts at boot and serves every user. Run it from an elevated terminal.
 
 This changes the system outside the data directory. To try K3 Up in a scratch directory
 instead, use `k3up agent start`.",
@@ -599,7 +605,9 @@ Examples:
         long_about = "\
 Remove the login item, ask the agent to stop, and wait until it has exited. Stopping the
 agent stops every workload. The data directory, with its definitions, logs and history, is
-kept. The desktop app will not register the login item again until you ask it to.",
+kept. The desktop app will not register the login item again until you ask it to.
+
+On Windows this is the same as uninstall-service, and needs an elevated terminal.",
         after_long_help = "\
 Examples:
   k3up agent uninstall"
@@ -614,8 +622,9 @@ Examples:
         long_about = "\
 Start the agent found beside k3up and wait until it answers. With the default data
 directory, the registered login item is used when there is one, so the agent is supervised.
-With another --data-dir, the agent is launched directly. Does nothing if an agent is already
-running for the directory.",
+On Windows the default data directory belongs to the service, which this starts; no
+elevation is needed. With another --data-dir, the agent is launched directly under your
+account. Does nothing if an agent is already running for the directory.",
         after_long_help = "\
 Examples:
   k3up agent start
@@ -626,8 +635,9 @@ Examples:
     #[command(
         long_about = "\
 Ask the agent to stop and wait until it has exited. It stops every workload in reverse
-dependency order first. A stopped agent is not restarted by launchd or systemd; start it
-again with `k3up agent start`, or it starts at the next login.",
+dependency order first. A stopped agent is not restarted by launchd, systemd or the Windows
+service manager; start it again with `k3up agent start`, or it starts at the next login, or
+on Windows at the next boot.",
         after_long_help = "\
 Examples:
   k3up agent stop
@@ -642,8 +652,9 @@ Examples:
     #[command(
         long_about = "\
 Show whether the agent answers, its version, process, uptime, data directory and executable,
-whether the login item is registered, and how many workloads are defined, running and in
-need of attention. Exits with 1 when the agent is not reachable.",
+whether the login item is registered, or on Windows the state of the service, and how many
+workloads are defined, running and in need of attention. Exits with 1 when the agent is not
+reachable.",
         after_long_help = "\
 Examples:
   k3up agent status
@@ -654,34 +665,56 @@ Examples:
     #[command(
         long_about = "\
 Install the agent as a Windows service running as LocalSystem, for every user on the
-machine. Copies k3up-agent.exe from beside k3up.exe into Program Files and keeps its data in
-%ProgramData%\\K3 Up. Run from an elevated terminal, then `sc.exe start K3Up`. Clients need
-an elevated terminal and --data-dir pointing at that data directory.",
+machine, start it, and wait until it answers. Copies k3up-agent.exe, k3up.exe and
+k3up-desktop.exe from beside k3up.exe into %ProgramFiles%\\K3 Up and keeps the data in
+%ProgramData%\\K3 Up. The service starts at boot, before anyone logs in, and the service
+manager restarts it if it crashes. Workloads run as SYSTEM.
+
+Every logged-in user can manage it without elevation, so any of them can run programs as
+SYSTEM. Running it again updates an existing installation and keeps its workloads. Run it
+from an elevated terminal.",
         after_long_help = "\
 Examples:
   k3up agent install-service
-  sc.exe start K3Up
-  k3up --data-dir \"$env:ProgramData\\K3 Up\" list"
+  k3up agent status"
     )]
-    InstallService,
+    InstallService {
+        /// Seconds to wait for a running service to stop before it is updated
+        #[arg(long, default_value_t = 120, value_name = "SECS")]
+        timeout: u64,
+    },
     /// Stop and remove the Windows machine service
     #[command(
         long_about = "\
 Stop the Windows service and remove its registration. The Program Files and ProgramData
-folders are left in place for review.",
+folders are left in place for review. Run it from an elevated terminal.",
         after_long_help = "\
 Examples:
   k3up agent uninstall-service"
     )]
-    UninstallService,
+    UninstallService {
+        /// Seconds to wait for the service to stop
+        #[arg(long, default_value_t = 120, value_name = "SECS")]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum PathCommand {
     /// Add a folder to the user's PATH (Windows)
-    Add { dir: PathBuf },
+    Add {
+        dir: PathBuf,
+        /// Change the PATH of every user instead. Needs an elevated terminal
+        #[arg(long)]
+        system: bool,
+    },
     /// Remove a folder from the user's PATH (Windows)
-    Remove { dir: PathBuf },
+    Remove {
+        dir: PathBuf,
+        /// Change the PATH of every user instead. Needs an elevated terminal
+        #[arg(long)]
+        system: bool,
+    },
 }
 
 #[derive(ClapArgs, Clone, Default)]

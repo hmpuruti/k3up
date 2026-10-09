@@ -14,6 +14,24 @@ use tokio::{
 type Envelope = (Request, oneshot::Sender<Response>);
 
 pub async fn run(data_dir: PathBuf, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
+    run_with(data_dir, shutdown, Access::Owner).await
+}
+
+/// Who may connect to the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// The account running the agent, and on Windows also SYSTEM and Administrators.
+    Owner,
+    /// Also every interactive user. Used by the Windows machine service.
+    #[cfg(windows)]
+    Interactive,
+}
+
+pub async fn run_with(
+    data_dir: PathBuf,
+    shutdown: impl std::future::Future<Output = ()>,
+    access: Access,
+) -> Result<()> {
     let data = platform::prepare_dir(&data_dir)?;
     let lock = OpenOptions::new()
         .create(true)
@@ -37,7 +55,14 @@ pub async fn run(data_dir: PathBuf, shutdown: impl std::future::Future<Output = 
         listener
     };
     #[cfg(windows)]
-    let mut listener = pipe(&endpoint, true)?;
+    let sddl = match access {
+        Access::Owner => crate::win32::PIPE_SDDL,
+        Access::Interactive => crate::win32::SERVICE_PIPE_SDDL,
+    };
+    #[cfg(not(windows))]
+    let (sddl, _) = ("", access);
+    #[cfg(windows)]
+    let mut listener = pipe(&endpoint, true, sddl)?;
     println!("K3 Up agent listening at {endpoint}");
     let generation = engine.subscribe();
     let mut exits = ChildExits::new()?;
@@ -62,7 +87,7 @@ pub async fn run(data_dir: PathBuf, shutdown: impl std::future::Future<Output = 
                 else { match engine.handle(request.command).await { Ok(response) => response, Err(error) => Response::error(format!("{error:#}")) } };
                 let _ = reply.send(response);
             }
-            accepted = accept(&mut listener, &endpoint) => {
+            accepted = accept(&mut listener, &endpoint, sddl) => {
                 let stream = match accepted {
                     Ok(stream) => stream,
                     Err(error) => {
@@ -122,13 +147,18 @@ impl ChildExits {
 async fn accept(
     listener: &mut tokio::net::UnixListener,
     _: &str,
+    _: &str,
 ) -> Result<tokio::net::UnixStream> {
     Ok(listener.accept().await.map(|(stream, _)| stream)?)
 }
 
 #[cfg(windows)]
-fn pipe(endpoint: &str, first: bool) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-    let mut attributes = crate::win32::SecurityAttributes::from_sddl(crate::win32::PIPE_SDDL)?;
+fn pipe(
+    endpoint: &str,
+    first: bool,
+    sddl: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let mut attributes = crate::win32::SecurityAttributes::from_sddl(sddl)?;
     // SAFETY: attributes outlives the call and holds a valid security descriptor.
     Ok(unsafe {
         tokio::net::windows::named_pipe::ServerOptions::new()
@@ -143,9 +173,10 @@ fn pipe(endpoint: &str, first: bool) -> Result<tokio::net::windows::named_pipe::
 async fn accept(
     listener: &mut tokio::net::windows::named_pipe::NamedPipeServer,
     endpoint: &str,
+    sddl: &str,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     listener.connect().await?;
-    let next = pipe(endpoint, false)?;
+    let next = pipe(endpoint, false, sddl)?;
     Ok(std::mem::replace(listener, next))
 }
 

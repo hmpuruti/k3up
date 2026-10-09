@@ -7,13 +7,31 @@ pub fn default_data_dir() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_else(|| ".".into())).join("K3 Up")
+        machine_data_dir()
     }
     #[cfg(not(windows))]
     {
         PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
             .join(".local/share/k3up")
     }
+}
+
+/// The data directory of the Windows service, shared by every user on the machine.
+#[cfg(windows)]
+pub fn machine_data_dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into()))
+        .join("K3 Up")
+}
+
+/// Whether `path` names the Windows service's data directory.
+#[cfg(windows)]
+pub fn is_machine_data_dir(path: &Path) -> bool {
+    let normal = |path: &Path| {
+        std::path::absolute(path)
+            .ok()
+            .map(|path| path.to_string_lossy().trim_end_matches('\\').to_lowercase())
+    };
+    normal(path).is_some_and(|path| Some(path) == normal(&machine_data_dir()))
 }
 
 pub fn prepare_dir(path: &Path) -> Result<PathBuf> {

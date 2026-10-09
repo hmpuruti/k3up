@@ -34,39 +34,53 @@ fn same(entry: &str, dir: &str) -> bool {
     !entry.trim().is_empty() && normal(entry) == normal(dir)
 }
 
-/// Adds `dir` to the current user's PATH. Returns whether anything changed.
-#[cfg(windows)]
-pub fn add(dir: &std::path::Path) -> anyhow::Result<bool> {
-    update(dir, with_entry)
+/// Whose PATH to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// The current user's PATH.
+    User,
+    /// The PATH of every user on the machine. Needs an elevated process.
+    System,
 }
 
-/// Removes `dir` from the current user's PATH. Returns whether anything changed.
+/// Adds `dir` to a PATH. Returns whether anything changed.
 #[cfg(windows)]
-pub fn remove(dir: &std::path::Path) -> anyhow::Result<bool> {
-    update(dir, without_entry)
+pub fn add(dir: &std::path::Path, scope: Scope) -> anyhow::Result<bool> {
+    update(dir, scope, with_entry)
+}
+
+/// Removes `dir` from a PATH. Returns whether anything changed.
+#[cfg(windows)]
+pub fn remove(dir: &std::path::Path, scope: Scope) -> anyhow::Result<bool> {
+    update(dir, scope, without_entry)
 }
 
 #[cfg(windows)]
-fn update(dir: &std::path::Path, change: fn(&str, &str) -> Option<String>) -> anyhow::Result<bool> {
-    let current = registry::read()?;
+fn update(
+    dir: &std::path::Path,
+    scope: Scope,
+    change: fn(&str, &str) -> Option<String>,
+) -> anyhow::Result<bool> {
+    let current = registry::read(scope)?;
     let Some(updated) = change(&current, &dir.to_string_lossy()) else {
         return Ok(false);
     };
-    registry::write(&updated)?;
+    registry::write(scope, &updated)?;
     registry::announce();
     Ok(true)
 }
 
 #[cfg(windows)]
 mod registry {
+    use super::Scope;
     use crate::win32::wide;
     use anyhow::{Context, Result};
     use std::{ffi::OsStr, ptr};
     use windows_sys::Win32::{
         Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
         System::Registry::{
-            HKEY_CURRENT_USER, REG_EXPAND_SZ, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
-            RegGetValueW, RegSetKeyValueW,
+            HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_EXPAND_SZ, RRF_NOEXPAND,
+            RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW, RegSetKeyValueW,
         },
         UI::WindowsAndMessaging::{
             HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
@@ -74,18 +88,27 @@ mod registry {
     };
 
     const KEY: &str = "Environment";
+    const SYSTEM_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
     const VALUE: &str = "Path";
 
+    fn location(scope: Scope) -> (HKEY, &'static str, &'static str) {
+        match scope {
+            Scope::User => (HKEY_CURRENT_USER, KEY, "user"),
+            Scope::System => (HKEY_LOCAL_MACHINE, SYSTEM_KEY, "system"),
+        }
+    }
+
     /// The raw value, with `%VARIABLES%` left unexpanded so they survive the rewrite.
-    pub fn read() -> Result<String> {
-        let key = wide(OsStr::new(KEY));
+    pub fn read(scope: Scope) -> Result<String> {
+        let (root, key, name) = location(scope);
+        let key = wide(OsStr::new(key));
         let value = wide(OsStr::new(VALUE));
         let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
         let mut bytes = 0u32;
         // SAFETY: NUL-terminated names; a null buffer asks only for the size.
         let status = unsafe {
             RegGetValueW(
-                HKEY_CURRENT_USER,
+                root,
                 key.as_ptr(),
                 value.as_ptr(),
                 flags,
@@ -99,13 +122,13 @@ mod registry {
         }
         if status != ERROR_SUCCESS {
             return Err(std::io::Error::from_raw_os_error(status as i32))
-                .context("Read the user PATH");
+                .with_context(|| format!("Read the {name} PATH"));
         }
         let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
         // SAFETY: the buffer is at least `bytes` long, as reported by the first call.
         let status = unsafe {
             RegGetValueW(
-                HKEY_CURRENT_USER,
+                root,
                 key.as_ptr(),
                 value.as_ptr(),
                 flags,
@@ -116,7 +139,7 @@ mod registry {
         };
         if status != ERROR_SUCCESS {
             return Err(std::io::Error::from_raw_os_error(status as i32))
-                .context("Read the user PATH");
+                .with_context(|| format!("Read the {name} PATH"));
         }
         let length = buffer
             .iter()
@@ -125,14 +148,15 @@ mod registry {
         Ok(String::from_utf16_lossy(&buffer[..length]))
     }
 
-    pub fn write(path: &str) -> Result<()> {
-        let key = wide(OsStr::new(KEY));
+    pub fn write(scope: Scope, path: &str) -> Result<()> {
+        let (root, key, name) = location(scope);
+        let key = wide(OsStr::new(key));
         let value = wide(OsStr::new(VALUE));
         let data = wide(OsStr::new(path));
         // SAFETY: all buffers are NUL-terminated and outlive the call.
         let status = unsafe {
             RegSetKeyValueW(
-                HKEY_CURRENT_USER,
+                root,
                 key.as_ptr(),
                 value.as_ptr(),
                 REG_EXPAND_SZ,
@@ -142,7 +166,7 @@ mod registry {
         };
         if status != ERROR_SUCCESS {
             return Err(std::io::Error::from_raw_os_error(status as i32))
-                .context("Write the user PATH");
+                .with_context(|| format!("Write the {name} PATH"));
         }
         Ok(())
     }

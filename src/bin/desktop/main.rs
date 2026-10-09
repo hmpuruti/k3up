@@ -46,6 +46,14 @@ fn main() -> iced::Result {
     let managed = options.data_dir.is_none();
     let data = options.data_dir.unwrap_or_else(platform::default_data_dir);
     if options.start_agent || options.register_agent {
+        // On Windows the agent is a service that starts at boot; there is no login item.
+        #[cfg(windows)]
+        if platform::is_machine_data_dir(&data) {
+            if let Err(error) = k3up::windows_host::start() {
+                eprintln!("{error:#}");
+            }
+            return Ok(());
+        }
         if let Some(agent) = bundled_agent() {
             let login = LoginAgent::new(agent, data);
             // A reinstall must not undo a login item the user turned off.
@@ -62,8 +70,9 @@ fn main() -> iced::Result {
         return Ok(());
     }
     // Only the default agent is set up automatically; an explicit --data-dir is left alone.
+    // On Windows the service manager keeps the agent running instead.
     let login = bundled_agent()
-        .filter(|_| managed)
+        .filter(|_| managed && !cfg!(windows))
         .map(|agent| LoginAgent::new(agent, data.clone()));
     let icon = window::icon::from_file_data(
         include_bytes!("../../../assets/branding/k3-up-app-icon.png"),
