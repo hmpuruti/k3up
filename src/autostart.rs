@@ -288,7 +288,9 @@ impl LoginAgent {
 
     fn install(&self) -> Result<()> {
         if cfg!(windows) {
-            anyhow::bail!("On Windows the agent runs as the K3 Up service. Run `k3up agent install` from an elevated terminal")
+            anyhow::bail!(
+                "On Windows the agent runs as the K3 Up service. Run `k3up agent install` from an elevated terminal"
+            )
         }
         anyhow::bail!("Starting the agent at login is not supported on this system")
     }

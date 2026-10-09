@@ -23,11 +23,13 @@ pub fn remove(dir: PathBuf, system: bool) -> Result<Response> {
     #[cfg(windows)]
     {
         let (scope, name) = scope(system);
-        Ok(Response::success(if k3up::user_path::remove(&dir, scope)? {
-            format!("Removed {} from the {name} PATH", dir.display())
-        } else {
-            format!("{} is not on the {name} PATH", dir.display())
-        }))
+        Ok(Response::success(
+            if k3up::user_path::remove(&dir, scope)? {
+                format!("Removed {} from the {name} PATH", dir.display())
+            } else {
+                format!("{} is not on the {name} PATH", dir.display())
+            },
+        ))
     }
     #[cfg(not(windows))]
     {

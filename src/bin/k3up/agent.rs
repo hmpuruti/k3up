@@ -186,7 +186,11 @@ pub fn status(client: &Client) -> Result<Outcome> {
         Err(error) => return Ok(unreachable(&format!("{error:#}"), &data_dir, &starter)),
     };
     let Some(info) = info else {
-        return Ok(unreachable("Agent gave no information", &data_dir, &starter));
+        return Ok(unreachable(
+            "Agent gave no information",
+            &data_dir,
+            &starter,
+        ));
     };
     let statuses = checked(client.send(Command::List)?)?.workloads;
     let running = statuses
