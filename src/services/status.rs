@@ -25,12 +25,75 @@ pub struct Service {
     pub instance: Option<String>,
 }
 
-/// The value after `--instance` in a service's command line. Instances are hexadecimal, so
-/// they need no quoting.
+/// The value after `--instance` in a service's command line.
 pub fn instance_of(command_line: &str) -> Option<String> {
-    let mut words = command_line.split_whitespace();
-    words.find(|word| *word == "--instance")?;
-    words.next().map(|word| word.trim_matches('"').to_string())
+    let mut words = split_command_line(command_line).into_iter();
+    words.find(|word| word == "--instance")?;
+    words.next()
+}
+
+/// Splits a command line the way Windows programs read their arguments, so a quoted data
+/// directory that contains ` --instance ` is not mistaken for the option.
+fn split_command_line(line: &str) -> Vec<String> {
+    let mut chars = line.trim_start().chars().peekable();
+    let mut words = vec![];
+    // The program path ends at the closing quote or at whitespace, without escapes.
+    let mut program = String::new();
+    if chars.peek() == Some(&'"') {
+        chars.next();
+        program.extend(chars.by_ref().take_while(|c| *c != '"'));
+    } else {
+        while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+            program.push(c);
+        }
+    }
+    words.push(program);
+    loop {
+        while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+        if chars.peek().is_none() {
+            return words;
+        }
+        words.push(next_argument(&mut chars));
+    }
+}
+
+fn next_argument(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut word = String::new();
+    let mut quoted = false;
+    while let Some(&c) = chars.peek() {
+        match c {
+            ' ' | '\t' if !quoted => break,
+            '\\' => {
+                let mut slashes = 0;
+                while chars.next_if(|c| *c == '\\').is_some() {
+                    slashes += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    word.extend(std::iter::repeat_n('\\', slashes / 2));
+                    if slashes % 2 == 1 {
+                        word.push('"');
+                        chars.next();
+                    }
+                } else {
+                    word.extend(std::iter::repeat_n('\\', slashes));
+                }
+            }
+            '"' => {
+                chars.next();
+                if quoted && chars.peek() == Some(&'"') {
+                    word.push('"');
+                    chars.next();
+                } else {
+                    quoted = !quoted;
+                }
+            }
+            _ => {
+                word.push(c);
+                chars.next();
+            }
+        }
+    }
+    word
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,6 +308,31 @@ mod tests {
         assert_eq!(
             status("web", present(), Some(&current), Some(stale)).state,
             State::Stopped
+        );
+    }
+
+    #[test]
+    fn a_quoted_path_that_mentions_the_option_is_not_the_option() {
+        assert_eq!(
+            instance_of(
+                r#""C:\k3up-host.exe" --data-dir "C:\svc --instance stale" --workload web --instance 0a1b"#
+            ),
+            Some("0a1b".into())
+        );
+    }
+
+    #[test]
+    fn command_lines_follow_windows_quoting() {
+        assert_eq!(
+            split_command_line(r#""C:\Program Files\h.exe" a\\"b c" "d\"e" f\g "h""i" "C:\dir\\""#),
+            [
+                r"C:\Program Files\h.exe",
+                r"a\b c",
+                r#"d"e"#,
+                r"f\g",
+                r#"h"i"#,
+                r"C:\dir\",
+            ]
         );
     }
 

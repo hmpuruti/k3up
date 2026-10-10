@@ -9,7 +9,8 @@ use std::path::PathBuf;
 struct Args {
     #[arg(long, value_name = "DIR")]
     data_dir: PathBuf,
-    #[arg(long, value_name = "NAME")]
+    // Workload names may start with a hyphen.
+    #[arg(long, value_name = "NAME", allow_hyphen_values = true)]
     workload: String,
     /// The definition's instance, recorded in the workload's state.
     #[arg(long, value_name = "ID")]
@@ -28,5 +29,17 @@ fn main() {
         let _ = (args.data_dir, args.workload, args.instance);
         eprintln!("k3up-host runs only on Windows");
         std::process::exit(2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workload_names_may_start_with_a_hyphen() {
+        let args = Args::try_parse_from(["k3up-host", "--data-dir", "/d", "--workload", "-worker"])
+            .unwrap();
+        assert_eq!(args.workload, "-worker");
     }
 }
