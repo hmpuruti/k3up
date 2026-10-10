@@ -43,6 +43,18 @@ fn fixture() {
     }
 }
 
+/// A temporary folder whose ancestors only administrators may move, as services mode requires:
+/// inside ProgramData rather than a user profile.
+fn protected_temp_dir() -> tempfile::TempDir {
+    let base = k3up::win32::program_data().unwrap().join("K3UpTests");
+    if let Err(error) = k3up::win32::create_dir_with(&base, k3up::win32::PRIVATE_DIR_SDDL) {
+        assert!(base.is_dir(), "{error:#}");
+    }
+    let dir = tempfile::tempdir_in(&base).unwrap();
+    k3up::win32::set_owner_to_administrators(dir.path()).unwrap();
+    dir
+}
+
 /// A data directory in services mode with its own service name prefix. Dropping it deletes
 /// every service with that prefix, even after a failed assertion.
 struct Machine {
@@ -63,7 +75,7 @@ impl Machine {
             return None;
         }
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = protected_temp_dir();
         let data = dir.path().join("data");
         setup::prepare(&data).unwrap();
         let prefix = format!(
@@ -1246,4 +1258,28 @@ fn programs_are_installed_only_from_protected_folders() {
     assert!(k3up::win32::is_protected(
         &k3up::win32::program_files().unwrap()
     ));
+}
+
+#[test]
+fn a_data_directory_below_a_folder_users_control_is_refused() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(k3up::services::check(&machine.data).unwrap());
+    let default = k3up::win32::program_data().unwrap().join("K3 Up");
+    assert!(k3up::win32::ancestors_protected(&default));
+
+    let dir = protected_temp_dir();
+    let open = dir.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    icacls(&open, &["/grant", "*S-1-5-32-545:(OI)(CI)F"]);
+    let data = open.join("data");
+    setup::prepare(&data).unwrap();
+    assert!(k3up::win32::is_protected(&data));
+    assert!(!k3up::win32::ancestors_protected(&data));
+    let error = k3up::services::check(&data).unwrap_err().to_string();
+    assert!(
+        error.ends_with("is not protected; services mode refuses it. Remove it and run `k3up services enable` from an elevated terminal"),
+        "{error}"
+    );
 }

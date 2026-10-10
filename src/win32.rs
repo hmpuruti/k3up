@@ -312,6 +312,44 @@ pub fn is_protected(path: &Path) -> bool {
         && pinned.security().is_ok_and(|security| security.protected())
 }
 
+/// Whether every folder above `path`, up to the volume root, stays where it is: none is a
+/// link, and no account other than SYSTEM, Administrators and TrustedInstaller may rename,
+/// delete or re-permission it or what it holds. Otherwise someone could swap a folder on the
+/// way to the data directory for a link to their own copy after the checks.
+pub fn ancestors_protected(path: &Path) -> bool {
+    let Ok(path) = std::path::absolute(path) else {
+        return false;
+    };
+    path.ancestors().skip(1).all(|folder| {
+        let Ok(pinned) = Pinned::open(folder, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL)
+        else {
+            return false;
+        };
+        matches!(pinned.is_link(), Ok(false))
+            && pinned
+                .security()
+                .is_ok_and(|security| security.keeps_children_in_place())
+    })
+}
+
+/// Opens a file to read it, without following a link, and only if it resolves to a path
+/// directly inside its folder as that folder resolves, so a link swapped in for the folder
+/// is caught. Others may read but not change or delete the file while it is open.
+pub fn open_inside(path: &Path) -> Result<std::fs::File> {
+    let parent = path.parent().context("The file has no folder")?;
+    let folder = Pinned::open(parent, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_NO_DELETE)
+        .with_context(|| format!("Open {}", parent.display()))?;
+    let file = Pinned::open(path, FILE_GENERIC_READ, FILE_SHARE_READ)
+        .with_context(|| format!("Open {}", path.display()))?;
+    if file.is_link()? || file.final_path()?.parent() != Some(folder.final_path()?.as_path()) {
+        bail!(
+            "{} leads to another location; services mode refuses it",
+            path.display()
+        );
+    }
+    Ok(file.into_file())
+}
+
 /// # Safety
 /// `owner` must point to a valid SID, and `dacl` must be null or point to a valid ACL.
 unsafe fn trusted_owner_and_dacl(owner: PSID, dacl: *const ACL) -> bool {
@@ -411,9 +449,11 @@ unsafe fn is_trusted_installer(sid: PSID) -> bool {
 }
 
 /// Whether a data directory may be trusted as a services mode directory: the directory and
-/// its marker are protected.
+/// its marker are protected, and so are the folders above it.
 pub fn is_trusted_machine_dir(path: &Path) -> bool {
-    is_protected(path) && is_protected(&path.join(crate::services::files::MARKER))
+    is_protected(path)
+        && is_protected(&path.join(crate::services::files::MARKER))
+        && ancestors_protected(path)
 }
 
 pub fn program_data() -> Result<PathBuf> {

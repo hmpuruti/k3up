@@ -57,6 +57,27 @@ pub enum Ace {
     },
 }
 
+/// Rights over a folder that let an account move what it holds or the folder itself: delete
+/// a child, delete, change permissions, take ownership, and generic all.
+const MOVE_RIGHTS: u32 = 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000;
+
+/// Whether no untrusted account may rename, delete or re-permission a folder above the data
+/// directory, or what it holds, given that its owner is trusted. Creating new entries is
+/// fine: nobody can rename or delete an entry they do not own and were not granted.
+pub fn keeps_children_in_place(aces: &[Ace]) -> bool {
+    aces.iter().all(|ace| match *ace {
+        Ace::Deny
+        | Ace::Allow {
+            inherit_only: true, ..
+        }
+        | Ace::Unknown { inherit_only: true } => true,
+        Ace::Unknown { .. } => false,
+        Ace::Allow {
+            principal, mask, ..
+        } => principal != Principal::Other || mask & MOVE_RIGHTS == 0,
+    })
+}
+
 /// Whether only trusted principals may change an object with these entries, given that its
 /// owner is trusted, which also covers CREATOR OWNER. Inherit-only entries are skipped: they
 /// reach new children only, and whoever creates one needs a grant that already counts here.
@@ -172,6 +193,51 @@ mod tests {
         }
         assert!(only_trusted_may_change(&[Ace::Unknown {
             inherit_only: true
+        }]));
+    }
+
+    #[test]
+    fn folders_above_the_data_directory_must_keep_it_in_place() {
+        let allow = |principal, mask, inherit_only| Ace::Allow {
+            principal,
+            mask,
+            inherit_only,
+        };
+        // C:\ProgramData: users may read and create entries, CREATOR OWNER gets full control
+        // of what they create.
+        let program_data = [
+            allow(Principal::Trusted, 0x1f01ff, false),
+            allow(Principal::Other, 0x1200a9, false),
+            allow(Principal::Other, 0x116, false),
+            allow(Principal::CreatorOwner, 0x1000_0000, true),
+        ];
+        assert!(keeps_children_in_place(&program_data));
+        assert!(keeps_children_in_place(&[allow(
+            Principal::Other,
+            0x1f01ff,
+            true
+        )]));
+        for mask in [
+            0x1f01ff,
+            0x1301bf,
+            0x40,
+            0x1_0000,
+            0x4_0000,
+            0x8_0000,
+            0x1000_0000,
+        ] {
+            assert!(
+                !keeps_children_in_place(&[allow(Principal::Other, mask, false)]),
+                "{mask:#x}"
+            );
+            assert!(keeps_children_in_place(&[allow(
+                Principal::Trusted,
+                mask,
+                false
+            )]));
+        }
+        assert!(!keeps_children_in_place(&[Ace::Unknown {
+            inherit_only: false
         }]));
     }
 

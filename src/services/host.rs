@@ -165,8 +165,18 @@ impl Host {
                 ),
             ));
         }
-        files::read_definition(&definition)
-            .and_then(|spec| spec.context("Definition missing"))
+        if !crate::win32::ancestors_protected(self.layout.root()) {
+            return Err(Refusal::new(
+                EXIT_UNTRUSTED,
+                "a folder above the data directory is not protected",
+                anyhow!(
+                    "Every folder above {} must not be a link, and only SYSTEM, Administrators and TrustedInstaller may move or change it",
+                    self.layout.root().display()
+                ),
+            ));
+        }
+        crate::win32::open_inside(&definition)
+            .and_then(|file| files::definition_from(file, &definition))
             .and_then(|spec| check(spec, &self.name))
             .map_err(|error| {
                 Refusal::new(

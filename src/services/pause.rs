@@ -48,6 +48,23 @@ pub fn while_stopped(
     }
 }
 
+/// Turns services mode on: stops the running workloads, installs the programs, repairs the
+/// data folders, and only then starts what it stopped, since a host started before the
+/// repair would refuse the folders. A failed install skips the repair. Every stopped workload
+/// is started again whatever failed.
+pub fn install_then_repair(
+    control: &mut impl Control,
+    running: &[String],
+    install: impl FnOnce() -> Result<Vec<String>>,
+    repair: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<Vec<String>> {
+    while_stopped(control, running, || {
+        let mut lines = install()?;
+        lines.extend(repair()?);
+        Ok(lines)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +164,70 @@ mod tests {
             error.to_string(),
             "a did not start again: access denied\nc did not start again: access denied"
         );
+    }
+
+    /// Records stops and starts in a log it shares with the steps between them.
+    struct Recorder<'a>(&'a std::cell::RefCell<Vec<String>>);
+
+    impl Control for Recorder<'_> {
+        fn stop(&mut self, name: &str) -> Result<()> {
+            self.0.borrow_mut().push(format!("stop {name}"));
+            Ok(())
+        }
+
+        fn start(&mut self, name: &str) -> Result<()> {
+            self.0.borrow_mut().push(format!("start {name}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn workloads_start_again_only_after_the_repair() {
+        for repair_fails in [false, true] {
+            let log = std::cell::RefCell::new(vec![]);
+            let result = install_then_repair(
+                &mut Recorder(&log),
+                &running()[..2],
+                || {
+                    log.borrow_mut().push("install".into());
+                    Ok(vec![])
+                },
+                || {
+                    log.borrow_mut().push("repair".into());
+                    if repair_fails {
+                        bail!("repair failed");
+                    }
+                    Ok(vec![])
+                },
+            );
+            assert_eq!(
+                *log.borrow(),
+                [
+                    "stop a", "stop b", "install", "repair", "start a", "start b"
+                ]
+            );
+            assert_eq!(
+                result.err().map(|error| error.to_string()),
+                repair_fails.then(|| "repair failed".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_install_skips_the_repair_and_still_starts_everything() {
+        let log = std::cell::RefCell::new(vec![]);
+        let error = install_then_repair(
+            &mut Recorder(&log),
+            &running()[..1],
+            || bail!("copy failed"),
+            || {
+                log.borrow_mut().push("repair".into());
+                Ok(vec![])
+            },
+        )
+        .unwrap_err();
+        assert_eq!(*log.borrow(), ["stop a", "start a"]);
+        assert_eq!(error.to_string(), "copy failed");
     }
 
     #[test]

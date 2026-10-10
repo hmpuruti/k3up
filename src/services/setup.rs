@@ -3,7 +3,7 @@ use super::{
     backend::{Backend, Settings},
     files::{self, Layout},
     host,
-    pause::{Control, while_stopped},
+    pause::{Control, install_then_repair},
     scm,
     status::Scm,
 };
@@ -58,11 +58,37 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
     }
     let own = LoginAgent::new(PathBuf::new(), crate::platform::login_data_dir());
     super::refuse_user_agent(own.registration(), own.is_running())?;
+    if !crate::win32::ancestors_protected(data) {
+        bail!(
+            "A folder above {} can be moved or changed by users who aren't administrators, so services mode refuses it",
+            data.display()
+        );
+    }
     let _lock = lock_if_prepared(data)?;
-    let mut lines = install_programs(&settings.prefix)?;
-    prepare(data)?;
-    lines.push(format!("Services mode is on for {}", data.display()));
-    Ok(lines)
+    let target = install_dir()?;
+    let sources = program_sources(&target)?;
+    let prefix = settings.prefix.as_str();
+    let running: Vec<String> = scm::list(prefix)?
+        .into_iter()
+        .filter(|service| matches!(service.scm, Scm::Running | Scm::Starting))
+        .filter_map(|service| Some(service.name.get(prefix.len()..)?.to_string()))
+        .collect();
+    install_then_repair(
+        &mut Services { prefix },
+        &running,
+        || match sources {
+            Some(sources) => copy_programs(sources, &target),
+            None => Ok(vec![format!(
+                "Programs are already in {}",
+                target.display()
+            )]),
+        },
+        || {
+            prepare(data)?;
+            Ok(vec![format!("Services mode is on for {}", data.display())])
+        },
+    )
+    .context("Turning services mode on did not finish")
 }
 
 /// The lock that commands changing services hold, once a protected folder exists to hold it.
@@ -74,33 +100,21 @@ fn lock_if_prepared(data: &Path) -> Result<Option<files::Lock>> {
     super::backend::lock(data).map(Some)
 }
 
-/// Copies the programs into Program Files. Running services lock the host, so they are
-/// stopped for the copy and started again afterwards.
-fn install_programs(prefix: &str) -> Result<Vec<String>> {
+/// The programs beside the running k3up.exe to copy into `target`, or `None` when they
+/// already run from there. Running services lock the host, so the copy happens while they
+/// are stopped.
+fn program_sources(target: &Path) -> Result<Option<Vec<(&'static str, File)>>> {
     let source = std::env::current_exe()?
         .parent()
         .context("Locate the folder of k3up.exe")?
         .to_path_buf();
-    let target = install_dir()?;
     if !source.join(PROGRAMS[0]).is_file() {
         bail!("Place k3up-host.exe beside k3up.exe");
     }
-    if same_dir(&source, &target) {
-        return Ok(vec![format!(
-            "Programs are already in {}",
-            target.display()
-        )]);
+    if same_dir(&source, target) {
+        return Ok(None);
     }
-    let sources = open_sources(&source, &target)?;
-    let running: Vec<String> = scm::list(prefix)?
-        .into_iter()
-        .filter(|service| matches!(service.scm, Scm::Running | Scm::Starting))
-        .filter_map(|service| Some(service.name.get(prefix.len()..)?.to_string()))
-        .collect();
-    while_stopped(&mut Services { prefix }, &running, || {
-        copy_programs(sources, &target)
-    })
-    .context("Updating the programs in Program Files failed")
+    open_sources(&source, target).map(Some)
 }
 
 /// The programs in `source` to install in `target`, held open so nobody can change them before

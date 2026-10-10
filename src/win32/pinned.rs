@@ -2,7 +2,7 @@
 //! one and the changes made to it apply to the same object even if its path is swapped for a
 //! link in between.
 use super::{
-    Principal, SecurityAttributes, current_user_is, principal, system_or_administrators,
+    Principal, SecurityAttributes, aces, current_user_is, principal, system_or_administrators,
     trusted_owner_and_dacl,
 };
 use anyhow::{Context, Result};
@@ -219,6 +219,17 @@ impl Security {
     pub(super) fn protected(&self) -> bool {
         // SAFETY: the owner and DACL point into the descriptor, which lives as long as self.
         unsafe { trusted_owner_and_dacl(self.owner, self.dacl) }
+    }
+
+    /// Owned by SYSTEM, Administrators or TrustedInstaller, and no one else may move, delete
+    /// or re-permission it or what it holds.
+    pub(super) fn keeps_children_in_place(&self) -> bool {
+        // SAFETY: the owner and DACL point into the descriptor, which lives as long as self.
+        unsafe {
+            principal(self.owner) == Principal::Trusted
+                && aces(self.dacl)
+                    .is_some_and(|aces| crate::services::keeps_children_in_place(&aces))
+        }
     }
 }
 

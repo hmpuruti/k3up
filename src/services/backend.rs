@@ -612,7 +612,7 @@ impl Backend {
     fn watch(&self, since: u64, timeout_ms: u64) -> Result<Response> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(60_000));
         loop {
-            let current = status::generation(&self.statuses()?);
+            let current = status::generation(&self.statuses()?, files::events_mark(&self.layout));
             let now = Instant::now();
             if current != since || now >= deadline {
                 return Ok(Response {

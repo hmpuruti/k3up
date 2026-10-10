@@ -171,11 +171,14 @@ fn starting(status: &mut Status) {
 }
 
 /// FNV-1a over every status, stable between processes and releases.
-pub fn generation(statuses: &[Status]) -> u64 {
+/// `events` is `files::events_mark`, so an event that changes no status still wakes watchers.
+pub fn generation(statuses: &[Status], events: u64) -> u64 {
     let text = serde_json::to_string(statuses).unwrap_or_default();
-    text.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ byte as u64).wrapping_mul(0x100000001b3)
-    })
+    text.bytes()
+        .chain(events.to_le_bytes())
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+        })
 }
 
 #[cfg(test)]
@@ -358,10 +361,14 @@ mod tests {
         let one = status("web", Definition::Present(Box::new(web())), None, None);
         let mut two = one.clone();
         assert_eq!(
-            generation(std::slice::from_ref(&one)),
-            generation(std::slice::from_ref(&two))
+            generation(std::slice::from_ref(&one), 5),
+            generation(std::slice::from_ref(&two), 5)
+        );
+        assert_ne!(
+            generation(std::slice::from_ref(&one), 5),
+            generation(std::slice::from_ref(&one), 6)
         );
         two.state = State::Running;
-        assert_ne!(generation(&[one]), generation(&[two]));
+        assert_ne!(generation(&[one], 5), generation(&[two], 5));
     }
 }

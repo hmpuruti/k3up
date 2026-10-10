@@ -165,7 +165,10 @@ pub fn definition_text(workload: &Workload) -> Result<String> {
 /// Reads a whole file, refusing one larger than `READ_LIMIT`, so a huge or corrupt file
 /// cannot exhaust memory.
 fn read_bounded(path: &Path) -> std::io::Result<String> {
-    let file = File::open(path)?;
+    read_bounded_from(File::open(path)?)
+}
+
+fn read_bounded_from(file: File) -> std::io::Result<String> {
     if file.metadata()?.len() > READ_LIMIT {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
@@ -204,9 +207,17 @@ pub fn read_definition(path: &Path) -> Result<Option<Workload>> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
     };
-    let workload: Workload =
-        toml::from_str(&text).with_context(|| format!("Invalid definition {}", path.display()))?;
-    Ok(Some(workload))
+    parse_definition(&text, path).map(Some)
+}
+
+/// Reads a definition from a file already opened, so the checks made on that handle apply.
+pub fn definition_from(file: File, path: &Path) -> Result<Workload> {
+    let text = read_bounded_from(file).with_context(|| format!("Read {}", path.display()))?;
+    parse_definition(&text, path)
+}
+
+fn parse_definition(text: &str, path: &Path) -> Result<Workload> {
+    toml::from_str(text).with_context(|| format!("Invalid definition {}", path.display()))
 }
 
 /// The names of the files in `dir` with the given extension, sorted. A missing folder is empty.
@@ -390,6 +401,32 @@ fn own(path: &Path) {
     let _ = path;
 }
 
+/// A value that changes whenever an event is recorded: the last id handed out, read without
+/// waiting for the lock. Users who may not open the administrators' folder get the size and
+/// modification time of every event file instead.
+pub fn events_mark(layout: &Layout) -> u64 {
+    if let Ok(text) = read_bounded(&layout.sequence())
+        && let Ok(id) = text.trim().parse::<i64>()
+    {
+        return id as u64;
+    }
+    let mut mark = 0xcbf29ce484222325u64;
+    for name in names(&layout.events_dir(), "jsonl").unwrap_or_default() {
+        let Ok(metadata) = std::fs::metadata(layout.events(&name)) else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_nanos() as u64);
+        for value in [metadata.len(), modified] {
+            mark = (mark ^ value).wrapping_mul(0x100000001b3);
+        }
+    }
+    mark
+}
+
 /// Newest first, at most one page, only with ids above `after`. Only the end of a large file
 /// is read.
 pub fn read_events(layout: &Layout, name: Option<&str>, after: Option<i64>) -> Result<Vec<Event>> {
@@ -538,6 +575,25 @@ mod tests {
         assert!(!layout.events("a").exists());
         drop(held);
         append_event(&layout, "a", "recorded").unwrap();
+    }
+
+    #[test]
+    fn recording_an_event_changes_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(&dir);
+        let empty = events_mark(&layout);
+        append_event(&layout, "a", "Log rotation failed").unwrap();
+        let first = events_mark(&layout);
+        assert_ne!(first, empty);
+        append_event(&layout, "a", "Log rotation failed").unwrap();
+        assert_ne!(events_mark(&layout), first);
+
+        // Without the sequence, as for users who may not read it, file sizes still move.
+        std::fs::remove_file(layout.sequence()).unwrap();
+        let from_files = events_mark(&layout);
+        append_event(&layout, "b", "Log rotation failed").unwrap();
+        std::fs::remove_file(layout.sequence()).unwrap();
+        assert_ne!(events_mark(&layout), from_files);
     }
 
     #[test]
