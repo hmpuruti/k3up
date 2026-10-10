@@ -557,7 +557,11 @@ mod tests {
                 } else {
                     crate::win32::SHARED_DIR_SDDL
                 };
-                if crate::win32::create_dir_with(&folder, sddl).is_err() {
+                if let Err(error) = crate::win32::create_dir_with(&folder, sddl) {
+                    assert!(
+                        std::env::var_os("K3UP_REQUIRE_ELEVATION").is_none(),
+                        "K3UP_REQUIRE_ELEVATION is set, but the tests are not elevated: {error:#}"
+                    );
                     eprintln!("skipped: not elevated");
                     return None;
                 }
