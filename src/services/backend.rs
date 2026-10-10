@@ -320,18 +320,29 @@ impl Backend {
         } else {
             changes.join("\n")
         };
-        if dry_run {
-            return Ok(Response::success(format!("Preview only\n{message}")));
+        if dry_run || plan.is_empty() {
+            let preview = if dry_run { "Preview only\n" } else { "" };
+            return Ok(Response::success(format!("{preview}{message}")));
         }
-        for change in plan {
-            self.save(change)?;
+        let mut steps = self.preflight(plan)?;
+        self.commit(&mut steps)?;
+        for step in &steps {
+            self.event(
+                &step.change.workload.name,
+                if step.change.relabel {
+                    "Definition saved; group or description changed"
+                } else {
+                    "Definition saved"
+                },
+            );
         }
+        self.start_new(&steps)?;
         Ok(Response::success(message))
     }
 
-    fn save(&self, change: Change) -> Result<()> {
-        let workload = &change.workload;
-        let name = &workload.name;
+    /// Checks what can be checked before the first change, and records what each change
+    /// replaces so that `commit` can undo it.
+    fn preflight(&self, plan: Vec<Change>) -> Result<Vec<Step>> {
         let folder = self.layout.workloads();
         if !crate::win32::is_protected(&folder) {
             bail!(
@@ -339,39 +350,124 @@ impl Backend {
                 folder.display()
             );
         }
-        let path = self.layout.definition(name);
-        write_definition(&path, workload)?;
-        let service = self.service_name(name);
-        let registration = self.registration(&service);
-        let registered = if change.registered {
-            scm::reconfigure(workload, &registration)
-        } else {
-            scm::create(workload, &registration)
-        };
-        if let Err(error) = registered {
-            let restored = match &change.previous {
-                Some(previous) => write_definition(&path, previous),
-                None => std::fs::remove_file(&path).map_err(Into::into),
-            };
-            if let Err(restore) = restored {
-                return Err(error.context(format!("Restoring the definition failed: {restore:#}")));
-            }
-            return Err(error);
+        if plan.iter().any(|change| !change.registered) {
+            scm::check_create_access()?;
         }
-        self.event(
-            name,
-            if change.relabel {
-                "Definition saved; group or description changed"
-            } else {
-                "Definition saved"
-            },
-        );
-        // New definitions can opt into starting right away, as they do with the agent.
-        if change.previous.is_none() && workload.start_at_boot && workload.kind == Kind::Service {
-            scm::start(&service)
-                .with_context(|| format!("Created {name}, but it did not start"))?;
+        plan.into_iter()
+            .map(|change| {
+                let name = &change.workload.name;
+                let path = self.layout.definition(name);
+                let file = match std::fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("Read {}", path.display()));
+                    }
+                };
+                let service = if change.registered {
+                    Some(scm::snapshot(&self.service_name(name))?)
+                } else {
+                    None
+                };
+                Ok(Step {
+                    change,
+                    file,
+                    service,
+                    written: false,
+                    created: false,
+                })
+            })
+            .collect()
+    }
+
+    /// Saves every change, or none: after a failure, the changes made so far are undone.
+    fn commit(&self, steps: &mut [Step]) -> Result<()> {
+        for index in 0..steps.len() {
+            if let Err(error) = self.save(&mut steps[index]) {
+                return Err(self.roll_back(&steps[..=index], error));
+            }
         }
         Ok(())
+    }
+
+    fn save(&self, step: &mut Step) -> Result<()> {
+        let workload = &step.change.workload;
+        write_definition(&self.layout.definition(&workload.name), workload)?;
+        step.written = true;
+        let service = self.service_name(&workload.name);
+        let registration = self.registration(&service);
+        if step.service.is_some() {
+            return scm::reconfigure(workload, &registration);
+        }
+        scm::create(workload, &registration)?;
+        step.created = true;
+        Ok(())
+    }
+
+    fn roll_back(&self, steps: &[Step], error: anyhow::Error) -> anyhow::Error {
+        let failures: Vec<String> = steps
+            .iter()
+            .rev()
+            .filter(|step| step.written)
+            .filter_map(|step| {
+                let undone = self.undo(step).err()?;
+                Some(format!("{}: {undone:#}", step.change.workload.name))
+            })
+            .collect();
+        if failures.is_empty() {
+            error.context("Saving failed and every change was undone")
+        } else {
+            error.context(format!(
+                "Saving failed and undoing it did not finish ({})",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    fn undo(&self, step: &Step) -> Result<()> {
+        let name = &step.change.workload.name;
+        let service = self.service_name(name);
+        match &step.service {
+            Some(snapshot) => scm::restore(&service, snapshot)?,
+            None if step.created => scm::delete(&service)?,
+            None => {}
+        }
+        let path = self.layout.definition(name);
+        match &step.file {
+            Some(bytes) => {
+                files::write_atomic(&path, bytes, crate::win32::set_owner_to_administrators)
+            }
+            None => match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != ErrorKind::NotFound => {
+                    Err(error).with_context(|| format!("Delete {}", path.display()))
+                }
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// New definitions can opt into starting right away, as they do with the agent.
+    fn start_new(&self, steps: &[Step]) -> Result<()> {
+        let failures: Vec<String> = steps
+            .iter()
+            .map(|step| &step.change)
+            .filter(|change| {
+                let workload = &change.workload;
+                change.previous.is_none()
+                    && workload.start_at_boot
+                    && workload.kind == Kind::Service
+            })
+            .filter_map(|change| {
+                let name = &change.workload.name;
+                let error = scm::start(&self.service_name(name)).err()?;
+                Some(format!("Created {name}, but it did not start: {error:#}"))
+            })
+            .collect();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(failures.join("\n")))
+        }
     }
 
     fn remove(&self, name: &str) -> Result<Response> {
@@ -489,6 +585,16 @@ struct Change {
     previous: Option<Workload>,
     registered: bool,
     relabel: bool,
+}
+
+/// A change with what it replaces: the definition file's bytes, and the service's settings
+/// when the service already existed.
+struct Step {
+    change: Change,
+    file: Option<Vec<u8>>,
+    service: Option<scm::Snapshot>,
+    written: bool,
+    created: bool,
 }
 
 /// Owned by Administrators, which the host requires before it trusts a definition.

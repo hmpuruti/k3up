@@ -4,13 +4,17 @@
 #![cfg(windows)]
 
 use k3up::{
-    model::{Kind, Restart, RestartBackoff, RestartLimit, Schedule, State, Status, Workload},
+    model::{
+        Kind, Manifest, Restart, RestartBackoff, RestartLimit, Schedule, State, Status, Workload,
+    },
     protocol::{Command, Response},
     services::{Backend, Settings, files, scm, setup},
 };
 use std::{
-    collections::BTreeMap,
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+    ptr,
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
@@ -662,4 +666,371 @@ fn a_broken_definition_never_leaks_into_files_every_user_reads() {
     assert!(!state.contains("hunter2"), "{state}");
     assert!(!events.contains("hunter2"), "{events}");
     assert!(machine.log("leaky").contains("k3up-host: Refusing to run"));
+}
+
+const USERS_READ: u32 = 0x1200a9;
+
+/// The marker's owner and access as SDDL, and the rights its DACL gives the Users group.
+fn marker_security(data: &Path) -> (String, u32) {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_SUCCESS, LocalFree},
+        Security::{
+            ACL,
+            Authorization::{
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetEffectiveRightsFromAclW,
+                GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SDDL_REVISION_1, SE_FILE_OBJECT,
+                TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+            },
+            CreateWellKnownSid, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, WinBuiltinUsersSid,
+        },
+    };
+    let path = k3up::win32::wide(data.join(files::MARKER).as_os_str());
+    let wanted = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    // SAFETY: every out-pointer is valid for its call; the DACL points into the descriptor,
+    // and the descriptor and the string are freed once read.
+    unsafe {
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let status = GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            wanted,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        );
+        assert_eq!(status, ERROR_SUCCESS);
+        let mut text = ptr::null_mut();
+        let mut length = 0;
+        assert_ne!(
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                wanted,
+                &mut text,
+                &mut length,
+            ),
+            0
+        );
+        let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(text, length as usize))
+            .trim_end_matches('\0')
+            .to_string();
+        let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut size = SECURITY_MAX_SID_SIZE;
+        assert_ne!(
+            CreateWellKnownSid(
+                WinBuiltinUsersSid,
+                ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut size,
+            ),
+            0
+        );
+        let users = TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstrName: sid.as_mut_ptr().cast(),
+        };
+        let mut rights = 0;
+        assert_eq!(
+            GetEffectiveRightsFromAclW(dacl, &users, &mut rights),
+            ERROR_SUCCESS
+        );
+        LocalFree(text.cast());
+        LocalFree(descriptor);
+        (sddl, rights)
+    }
+}
+
+#[test]
+fn every_user_may_read_the_marker_and_only_administrators_change_it() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let (sddl, users) = marker_security(&machine.data);
+    let (owner, dacl) = sddl.split_once("D:").unwrap();
+    assert_eq!(owner, "O:BA", "{sddl}");
+    let (flags, aces) = dacl.split_once('(').unwrap();
+    assert!(flags.contains('P'), "{sddl}");
+    let aces: BTreeSet<&str> = aces
+        .split(')')
+        .map(|ace| ace.trim_start_matches('('))
+        .filter(|ace| !ace.is_empty())
+        .collect();
+    assert_eq!(
+        aces,
+        BTreeSet::from(["A;;FA;;;SY", "A;;FA;;;BA", "A;;0x1200a9;;;BU"]),
+        "{sddl}"
+    );
+    assert_eq!(users, USERS_READ);
+    assert!(!k3up::services::grants_change(users));
+
+    // Markers written before Users could read them inherited only the administrators' access.
+    files::write_atomic(
+        &machine.data.join(files::MARKER),
+        b"",
+        k3up::win32::set_owner_to_administrators,
+    )
+    .unwrap();
+    assert_eq!(marker_security(&machine.data).1, 0);
+    setup::prepare(&machine.data).unwrap();
+    assert_eq!(marker_security(&machine.data).1, USERS_READ);
+}
+
+/// Runs k3up as this account with its administrator rights turned off, as a standard user
+/// would run it. Returns whether it succeeded, then its output and its errors.
+fn cli_as_standard_user(machine: &Machine, arguments: &[&str]) -> (bool, String, String) {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},
+        Security::{
+            CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
+            SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+            TOKEN_QUERY, WinBuiltinAdministratorsSid,
+        },
+        System::Threading::{
+            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
+            GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+            STARTUPINFOW, WaitForSingleObject,
+        },
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = std::fs::File::create(dir.path().join("stdout")).unwrap();
+    let stderr = std::fs::File::create(dir.path().join("stderr")).unwrap();
+    let mut line = format!("\"{CLI}\" --data-dir \"{}\" --json", machine.data.display());
+    for argument in arguments {
+        line.push_str(&format!(" \"{argument}\""));
+    }
+    let mut line: Vec<u16> = OsStr::new(&line).encode_wide().chain(Some(0)).collect();
+    let overrides = [
+        ("K3UP_SERVICE_PREFIX", machine.prefix.as_str()),
+        ("K3UP_HOST", HOST),
+    ];
+    let inherited = std::env::vars_os().filter(|(key, _)| {
+        !overrides
+            .iter()
+            .any(|(name, _)| key.eq_ignore_ascii_case(name))
+    });
+    let added = overrides.map(|(key, value)| (OsString::from(key), OsString::from(value)));
+    let mut environment = vec![];
+    for (key, value) in inherited.chain(added) {
+        environment.extend(key.encode_wide());
+        environment.push(u16::from(b'='));
+        environment.extend(value.encode_wide());
+        environment.push(0);
+    }
+    environment.push(0);
+    let mut code = 1;
+    // SAFETY: every pointer refers to a live, initialized buffer for its call, and each handle
+    // is closed once the process has ended.
+    unsafe {
+        let mut token: HANDLE = ptr::null_mut();
+        assert_ne!(
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
+                &mut token,
+            ),
+            0
+        );
+        let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut size = SECURITY_MAX_SID_SIZE;
+        assert_ne!(
+            CreateWellKnownSid(
+                WinBuiltinAdministratorsSid,
+                ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut size,
+            ),
+            0
+        );
+        let administrators = SID_AND_ATTRIBUTES {
+            Sid: sid.as_mut_ptr().cast(),
+            Attributes: 0,
+        };
+        let mut restricted: HANDLE = ptr::null_mut();
+        assert_ne!(
+            CreateRestrictedToken(
+                token,
+                DISABLE_MAX_PRIVILEGE,
+                1,
+                &administrators,
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                &mut restricted,
+            ),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        for file in [&stdout, &stderr] {
+            let handle = file.as_raw_handle() as HANDLE;
+            assert_ne!(
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT),
+                0
+            );
+        }
+        let startup = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdOutput: stdout.as_raw_handle() as HANDLE,
+            hStdError: stderr.as_raw_handle() as HANDLE,
+            ..Default::default()
+        };
+        let mut process = PROCESS_INFORMATION::default();
+        assert_ne!(
+            CreateProcessAsUserW(
+                restricted,
+                ptr::null(),
+                line.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                environment.as_ptr().cast(),
+                ptr::null(),
+                &startup,
+                &mut process,
+            ),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        WaitForSingleObject(process.hProcess, 120_000);
+        GetExitCodeProcess(process.hProcess, &mut code);
+        for handle in [process.hThread, process.hProcess, restricted, token] {
+            CloseHandle(handle);
+        }
+    }
+    drop((stdout, stderr));
+    let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+    (code == 0, read("stdout"), read("stderr"))
+}
+
+#[test]
+fn a_standard_user_sees_states_but_not_definitions_or_logs() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let mut reader = machine.workload("reader", "pulse");
+    reader.group = "shared".into();
+    assert!(machine.put(reader).ok);
+    machine.ok(Command::Start {
+        name: "reader".into(),
+    });
+    machine.until("reader", |status| status.state == State::Running);
+    machine.until_logged("reader", "tick");
+
+    let response = |arguments: &[&str]| {
+        let (success, stdout, stderr) = cli_as_standard_user(&machine, arguments);
+        let response: Response = serde_json::from_str(&stdout)
+            .unwrap_or_else(|error| panic!("{arguments:?}: {error}: {stdout} {stderr}"));
+        (success, response)
+    };
+    let (success, listed) = response(&["list"]);
+    assert!(success, "{}", listed.message);
+    assert_eq!(listed.workloads.len(), 1, "{:?}", listed.workloads);
+    assert_eq!(listed.workloads[0].state, State::Running);
+    assert_eq!(listed.workloads[0].workload.group, "shared");
+    assert!(listed.workloads[0].workload.executable.is_empty());
+
+    let (success, status) = response(&["status", "reader"]);
+    assert!(success, "{}", status.message);
+    assert_eq!(status.workloads[0].state, State::Running);
+    assert!(status.workloads[0].pid.is_some());
+
+    let (success, events) = response(&["events", "reader"]);
+    assert!(success, "{}", events.message);
+    assert!(!events.events.is_empty());
+
+    let (success, summary, stderr) = cli_as_standard_user(&machine, &["services", "status"]);
+    assert!(success, "{summary} {stderr}");
+    let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
+    assert_eq!(summary["enabled"], true);
+    assert_eq!(summary["workloads"]["running"], 1);
+
+    for arguments in [&["export"][..], &["logs", "reader"]] {
+        let (success, refused) = response(arguments);
+        assert!(!success);
+        assert!(
+            refused.message.starts_with("Access denied"),
+            "{arguments:?}: {}",
+            refused.message
+        );
+    }
+}
+
+#[test]
+fn a_failed_apply_leaves_every_workload_as_it_was() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let mut old = machine.workload("tx-old", "pulse");
+    old.group = "before".into();
+    old.description = "Before".into();
+    assert!(machine.put(old.clone()).ok);
+    let definition = machine.data.join("workloads").join("tx-old.toml");
+    let saved = std::fs::read(&definition).unwrap();
+    let config = machine.sc("qc", "tx-old");
+    let description = machine.sc("qdescription", "tx-old");
+
+    // Display names are unique, so this service makes creating tx-clash fail.
+    let foreign = machine.service("foreign");
+    let created = std::process::Command::new("sc.exe")
+        .args([
+            "create",
+            &foreign,
+            "binPath=",
+            r"C:\Windows\System32\cmd.exe",
+        ])
+        .args(["DisplayName=", "K3 Up: tx-clash"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stdout)
+    );
+
+    old.group = "after".into();
+    old.description = "After".into();
+    old.start_at_boot = true;
+    old.args.push("--quiet".into());
+    let failed = machine.send(Command::Apply {
+        manifest: Manifest {
+            version: 1,
+            workloads: vec![
+                old,
+                machine.workload("tx-new", "pulse"),
+                machine.workload("tx-clash", "pulse"),
+            ],
+        },
+        dry_run: false,
+    });
+    assert!(!failed.ok);
+    assert!(
+        failed
+            .message
+            .starts_with("Saving failed and every change was undone: Create service"),
+        "{}",
+        failed.message
+    );
+    assert!(failed.message.contains("tx-clash"), "{}", failed.message);
+
+    assert_eq!(std::fs::read(&definition).unwrap(), saved);
+    assert_eq!(machine.sc("qc", "tx-old"), config);
+    assert_eq!(machine.sc("qdescription", "tx-old"), description);
+    for name in ["tx-new", "tx-clash"] {
+        assert!(!scm::exists(&machine.service(name)).unwrap(), "{name}");
+        let file = machine.data.join("workloads").join(format!("{name}.toml"));
+        assert!(!file.exists(), "{name}");
+    }
+    assert!(scm::exists(&foreign).unwrap());
 }

@@ -56,7 +56,8 @@ VIAddVersionKey "LegalCopyright" "Copyright (c) K3. MIT License."
 !insertmacro MUI_LANGUAGE "English"
 
 ; Running programs lock their files. Ending the agent also ends its workloads through their
-; Job Objects; the agent starts them again when it next starts.
+; Job Objects; the agent starts them again when it next starts. k3up-host.exe is left alone:
+; services run their own copy from Program Files, and ending it would end their workloads.
 !macro StopK3Up
   nsExec::Exec 'taskkill /F /IM ${APP}'
   Pop $0
@@ -83,6 +84,7 @@ Section "K3 Up"
   File "${BINARIES}/${APP}"
   File "${BINARIES}/k3up-agent.exe"
   File "${BINARIES}/k3up.exe"
+  File "${BINARIES}/k3up-host.exe"
   File "k3up.ico"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateShortcut "$SMPROGRAMS\K3 Up.lnk" "$INSTDIR\${APP}" "" "$INSTDIR\k3up.ico"
@@ -117,6 +119,7 @@ Section "Uninstall"
   Delete "$INSTDIR\${APP}"
   Delete "$INSTDIR\k3up-agent.exe"
   Delete "$INSTDIR\k3up.exe"
+  Delete "$INSTDIR\k3up-host.exe"
   Delete "$INSTDIR\k3up.ico"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"

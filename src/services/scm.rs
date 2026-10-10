@@ -18,14 +18,18 @@ use windows_service::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_MORE_DATA, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
-        ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
+        ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_SERVICE_ALREADY_RUNNING,
+        ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST,
+        ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
     },
     System::Services::{
-        CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW, OpenSCManagerW,
-        SC_ENUM_PROCESS_INFO, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE,
-        SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATE_ALL, SERVICE_STOP_PENDING,
-        SERVICE_STOPPED, SERVICE_WIN32,
+        ChangeServiceConfigW, CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW,
+        EnumServicesStatusExW, OpenSCManagerW, QueryServiceConfig2W, SC_ENUM_PROCESS_INFO,
+        SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_CONFIG,
+        SERVICE_CONFIG_DELAYED_AUTO_START_INFO, SERVICE_CONFIG_DESCRIPTION,
+        SERVICE_DELAYED_AUTO_START_INFO, SERVICE_DESCRIPTIONW, SERVICE_NO_CHANGE, SERVICE_RUNNING,
+        SERVICE_START_PENDING, SERVICE_STATE_ALL, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+        SERVICE_WIN32,
     },
 };
 
@@ -305,6 +309,109 @@ pub fn reconfigure(workload: &Workload, at: &Registration) -> Result<()> {
         .change_config(&info(workload, at))
         .with_context(|| format!("Change service {}", at.service))?;
     configure(&handle, workload).with_context(|| format!("Configure service {}", at.service))
+}
+
+/// Fails unless this process may create services.
+pub fn check_create_access() -> Result<()> {
+    manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE).map(drop)
+}
+
+/// What `create` and `reconfigure` set on a service, as the service manager holds it, so a
+/// failed change can be undone. Failure actions are left out: K3 Up always sets the same ones.
+pub struct Snapshot {
+    start_type: u32,
+    command_line: Vec<u16>,
+    display_name: Vec<u16>,
+    description: String,
+    delayed: bool,
+}
+
+/// Opens the service with the rights a change needs, so a caller without them fails here,
+/// before anything has changed.
+pub fn snapshot(service: &str) -> Result<Snapshot> {
+    let handle = require(service, change_access())?;
+    let read = || -> Result<Snapshot> {
+        let config = handle.query_config()?;
+        let description = query_config2(&handle, SERVICE_CONFIG_DESCRIPTION, |buffer| {
+            // SAFETY: for this level the buffer starts with a SERVICE_DESCRIPTIONW whose
+            // string is null or points into the same buffer.
+            unsafe { wide_string((*buffer.cast::<SERVICE_DESCRIPTIONW>()).lpDescription) }
+        })?;
+        let delayed = query_config2(&handle, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, |buffer| {
+            // SAFETY: for this level the buffer starts with a SERVICE_DELAYED_AUTO_START_INFO.
+            unsafe { (*buffer.cast::<SERVICE_DELAYED_AUTO_START_INFO>()).fDelayedAutostart != 0 }
+        })?;
+        Ok(Snapshot {
+            start_type: config.start_type.to_raw(),
+            command_line: crate::win32::wide(config.executable_path.as_os_str()),
+            display_name: crate::win32::wide(&config.display_name),
+            description,
+            delayed,
+        })
+    };
+    read().with_context(|| format!("Read service {service}"))
+}
+
+/// Calls QueryServiceConfig2W for `level` and hands the filled buffer to `parse`.
+fn query_config2<T>(
+    handle: &windows_service::service::Service,
+    level: SERVICE_CONFIG,
+    parse: impl FnOnce(*const u8) -> T,
+) -> Result<T> {
+    // u64 elements keep the returned structure aligned.
+    let mut buffer = vec![0u64; 1024];
+    loop {
+        let mut needed = 0u32;
+        // SAFETY: the buffer is writable for the size passed; the out-pointer is valid.
+        let read = unsafe {
+            QueryServiceConfig2W(
+                handle.raw_handle(),
+                level,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * size_of::<u64>()) as u32,
+                &mut needed,
+            )
+        } != 0;
+        if read {
+            return Ok(parse(buffer.as_ptr().cast()));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return Err(error.into());
+        }
+        buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
+    }
+}
+
+/// Puts back the settings `snapshot` recorded.
+pub fn restore(service: &str, snapshot: &Snapshot) -> Result<()> {
+    let handle = require(service, change_access())?;
+    // SAFETY: the strings are NUL-terminated and outlive the call; null pointers and
+    // SERVICE_NO_CHANGE leave those settings as they are.
+    let changed = unsafe {
+        ChangeServiceConfigW(
+            handle.raw_handle(),
+            SERVICE_NO_CHANGE,
+            snapshot.start_type,
+            SERVICE_NO_CHANGE,
+            snapshot.command_line.as_ptr(),
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            snapshot.display_name.as_ptr(),
+        )
+    } != 0;
+    let restored = if changed {
+        handle
+            .set_description(&snapshot.description)
+            .and_then(|()| handle.set_delayed_auto_start(snapshot.delayed))
+            .map_err(Into::into)
+    } else {
+        Err(anyhow::Error::from(std::io::Error::last_os_error()))
+    };
+    restored.with_context(|| format!("Restore service {service}"))
 }
 
 pub fn start(service: &str) -> Result<()> {

@@ -50,6 +50,10 @@ pub const PRIVATE_DIR_SDDL: &str = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 pub const SHARED_DIR_SDDL: &str = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 /// Users may open the folder itself to reach the shared folders inside, and nothing more.
 pub const ROOT_DIR_SDDL: &str = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200a9;;;BU)";
+/// Every user may read the marker's permissions, which is how clients without administrator
+/// rights recognise services mode. The root's grant to users is not inherited, so it is set
+/// here explicitly.
+pub const MARKER_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)";
 
 pub fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
@@ -380,6 +384,45 @@ pub fn set_owner_to_administrators(path: &Path) -> Result<()> {
     if status != ERROR_SUCCESS {
         return Err(std::io::Error::from_raw_os_error(status as i32))
             .with_context(|| format!("Set the owner of {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Gives a file this process created the owner and DACL in `sddl`, with inheritance blocked.
+pub fn set_security(path: &Path, sddl: &str) -> Result<()> {
+    let attributes = SecurityAttributes::from_sddl(sddl)?;
+    let path_wide = wide(path.as_os_str());
+    let mut owner: PSID = ptr::null_mut();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut present = 0;
+    let mut defaulted = 0;
+    // SAFETY: the descriptor is valid while attributes lives; the owner and DACL point into it.
+    let status = unsafe {
+        if GetSecurityDescriptorOwner(attributes.descriptor(), &mut owner, &mut defaulted) == 0
+            || GetSecurityDescriptorDacl(
+                attributes.descriptor(),
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            ) == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("Read security descriptor");
+        }
+        SetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            ptr::null_mut(),
+            dacl,
+            ptr::null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .with_context(|| format!("Protect {}", path.display()));
     }
     Ok(())
 }

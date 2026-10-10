@@ -7,6 +7,8 @@ pub mod status;
 mod backend;
 #[cfg(windows)]
 pub mod host;
+#[cfg(any(windows, test))]
+mod pause;
 #[cfg(windows)]
 pub mod scm;
 #[cfg(windows)]

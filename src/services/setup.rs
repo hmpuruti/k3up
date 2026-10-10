@@ -2,10 +2,14 @@
 use super::{
     backend::{Backend, Settings},
     files::{self, Layout},
+    host,
+    pause::{Control, while_stopped},
     scm,
     status::Scm,
 };
-use crate::win32::{PRIVATE_DIR_SDDL, ROOT_DIR_SDDL, SHARED_DIR_SDDL, secure_dir};
+use crate::win32::{
+    MARKER_SDDL, PRIVATE_DIR_SDDL, ROOT_DIR_SDDL, SHARED_DIR_SDDL, secure_dir, set_security,
+};
 use anyhow::{Context, Result, bail};
 use std::{
     collections::BTreeMap,
@@ -22,7 +26,7 @@ pub fn install_dir() -> Result<PathBuf> {
 }
 
 /// Creates or secures the data directory and its folders, then writes the marker. Safe to
-/// repeat.
+/// repeat, and repeating it replaces a marker written with older permissions.
 pub fn prepare(data: &Path) -> Result<()> {
     let layout = Layout::new(data);
     secure_dir(data, ROOT_DIR_SDDL)?;
@@ -34,11 +38,9 @@ pub fn prepare(data: &Path) -> Result<()> {
     ] {
         secure_dir(&folder, sddl)?;
     }
-    files::write_atomic(
-        &layout.marker(),
-        b"",
-        crate::win32::set_owner_to_administrators,
-    )
+    files::write_atomic(&layout.marker(), b"", |path| {
+        set_security(path, MARKER_SDDL)
+    })
 }
 
 pub fn enable(data: &Path) -> Result<Vec<String>> {
@@ -74,22 +76,45 @@ fn install_programs(prefix: &str) -> Result<Vec<String>> {
     let running: Vec<String> = scm::list(prefix)?
         .into_iter()
         .filter(|service| matches!(service.scm, Scm::Running | Scm::Starting))
-        .map(|service| service.name)
+        .filter_map(|service| Some(service.name.get(prefix.len()..)?.to_string()))
         .collect();
-    let mut lines = vec![];
-    for service in &running {
-        scm::stop(service, Duration::from_secs(90))?;
-        lines.push(format!("Stopped {service}"));
+    while_stopped(&mut Services { prefix }, &running, || {
+        copy_programs(&source, &target)
+    })
+    .context("Updating the programs in Program Files failed")
+}
+
+/// Workload services, by workload name.
+struct Services<'a> {
+    prefix: &'a str,
+}
+
+impl Control for Services<'_> {
+    fn stop(&mut self, name: &str) -> Result<()> {
+        scm::stop(&format!("{}{name}", self.prefix), Duration::from_secs(90))
     }
-    let copied = copy_programs(&source, &target);
-    for service in &running {
-        match scm::start(service) {
-            Ok(()) => lines.push(format!("Started {service}")),
-            Err(error) => lines.push(format!("Could not start {service}: {error:#}")),
+
+    /// Waits for the host to run, since a host that cannot run stops again at once.
+    fn start(&mut self, name: &str) -> Result<()> {
+        let service = format!("{}{name}", self.prefix);
+        scm::start(&service)?;
+        let state = scm::wait(&service, scm::START_TIMEOUT, |state| {
+            matches!(state, Scm::Running | Scm::Stopped)
+        })?;
+        match state {
+            Some(Scm::Running) => Ok(()),
+            // A job that already finished reports no error code.
+            Some(Scm::Stopped) => match scm::specific_exit_code(&service)? {
+                None => Ok(()),
+                code => bail!("it stopped at once: {}", host::explain_exit(code)),
+            },
+            None => bail!("its service no longer exists"),
+            Some(_) => bail!(
+                "it did not start within {} seconds",
+                scm::START_TIMEOUT.as_secs()
+            ),
         }
     }
-    lines.extend(copied?);
-    Ok(lines)
 }
 
 fn copy_programs(source: &Path, target: &Path) -> Result<Vec<String>> {

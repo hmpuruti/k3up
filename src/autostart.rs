@@ -41,6 +41,20 @@ pub enum Registration {
     OtherDirectory,
 }
 
+/// The login agent the desktop app may register and start for `data`. A services mode
+/// directory has none: an agent there could not lock the protected folder, and registering it
+/// would replace the user's own login item.
+pub fn desktop_agent(
+    agent: Option<PathBuf>,
+    data: &std::path::Path,
+    services_mode: bool,
+) -> Option<LoginAgent> {
+    if services_mode {
+        return None;
+    }
+    Some(LoginAgent::new(agent?, data.to_path_buf()))
+}
+
 /// Starts the agent for the current user at login and on demand.
 ///
 /// macOS uses a launchd LaunchAgent and Linux a systemd user service; both restart the agent
@@ -526,6 +540,16 @@ mod tests {
         let marker = |data: &str| format!("--data-dir {}", crate::systemd::quoted(data));
         assert!(unit.contains(&marker("/srv/k3up")));
         assert!(!unit.contains(&marker("/srv/k3")));
+    }
+
+    #[test]
+    fn the_desktop_manages_no_agent_in_services_mode() {
+        let agent = PathBuf::from("/opt/k3up/k3up-agent");
+        let data = Path::new("/srv/k3up");
+        let login = desktop_agent(Some(agent.clone()), data, false).unwrap();
+        assert_eq!(login.data_dir(), data);
+        assert!(desktop_agent(Some(agent), data, true).is_none());
+        assert!(desktop_agent(None, data, false).is_none());
     }
 
     #[test]
