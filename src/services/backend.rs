@@ -20,6 +20,7 @@ use std::{
 
 pub const DEFAULT_PREFIX: &str = "K3Up_";
 const ELEVATE: &str = "Access denied. Run this from an elevated terminal";
+const STOPPED: &str = "Stopped by request";
 
 /// Where the services' host program is and how their names start.
 #[derive(Debug, Clone)]
@@ -91,11 +92,15 @@ impl Backend {
                 }),
                 ..Response::success("Configuration exported")
             }),
-            Command::Apply { manifest, dry_run } => self.apply(manifest, dry_run),
+            Command::Apply { manifest, dry_run } => {
+                let _lock = (!dry_run).then(|| self.lock()).transpose()?;
+                self.apply(manifest, dry_run)
+            }
             Command::Put {
                 workload,
                 create_only,
             } => {
+                let _lock = self.lock()?;
                 if create_only && self.known(&workload.name)? {
                     bail!(
                         "Workload '{}' already exists; use apply to update it",
@@ -110,8 +115,12 @@ impl Backend {
                     false,
                 )
             }
-            Command::Remove { name } => self.remove(&name),
+            Command::Remove { name } => {
+                let _lock = self.lock_known(&name)?;
+                self.remove(&name)
+            }
             Command::Start { name } => {
+                let _lock = self.lock_known(&name)?;
                 self.start(&name)?;
                 Ok(Response {
                     workloads: vec![self.get(&name)?],
@@ -119,10 +128,12 @@ impl Backend {
                 })
             }
             Command::Stop { name } => {
+                let _lock = self.lock_known(&name)?;
                 self.stop(&name)?;
                 Ok(Response::success(format!("Stopped {name}")))
             }
             Command::Restart { name } => {
+                let _lock = self.lock_known(&name)?;
                 self.stop(&name)?;
                 self.start(&name)?;
                 Ok(Response {
@@ -166,6 +177,22 @@ impl Backend {
             ),
             Command::Watch { since, timeout_ms } => self.watch(since, timeout_ms),
         }
+    }
+
+    /// Serialises every command that changes definitions or services, across processes.
+    fn lock(&self) -> Result<files::Lock> {
+        lock(self.layout.root())
+    }
+
+    /// Names an unknown workload as such before asking for the lock, which users without
+    /// administrator rights cannot take.
+    fn lock_known(&self, name: &str) -> Result<files::Lock> {
+        check_name(name)?;
+        let exists = scm::exists(&self.service_name(name))?;
+        if !status::known(&self.definition(name)?, exists) {
+            bail!("Unknown workload '{name}'");
+        }
+        self.lock()
     }
 
     fn service_name(&self, name: &str) -> String {
@@ -343,13 +370,7 @@ impl Backend {
     /// Checks what can be checked before the first change, and records what each change
     /// replaces so that `commit` can undo it.
     fn preflight(&self, plan: Vec<Change>) -> Result<Vec<Step>> {
-        let folder = self.layout.workloads();
-        if !crate::win32::is_protected(&folder) {
-            bail!(
-                "{} is not protected; services mode refuses to write definitions there. Run `k3up services enable` from an elevated terminal",
-                folder.display()
-            );
-        }
+        refuse_unprotected(&self.layout.workloads())?;
         if plan.iter().any(|change| !change.registered) {
             scm::check_create_access()?;
         }
@@ -552,7 +573,25 @@ impl Backend {
             Definition::Present(workload) => workload.stop_timeout_secs,
             _ => 30,
         };
-        scm::stop(&service, Duration::from_secs(timeout + 30))
+        scm::stop(&service, Duration::from_secs(timeout + 30))?;
+        self.record_stop(name)
+    }
+
+    /// A host that already ended, after a failure or a stop outside K3 Up, left its last
+    /// state behind; the request to stop replaces it.
+    fn record_stop(&self, name: &str) -> Result<()> {
+        let path = self.layout.state(name);
+        let mut state = files::read_state(&path).unwrap_or_default();
+        if state.state == State::Stopped {
+            return Ok(());
+        }
+        state.state = State::Stopped;
+        state.pid = None;
+        state.reason = STOPPED.into();
+        state.updated_at = Utc::now();
+        files::write_state(&path, &state)?;
+        self.event(name, STOPPED);
+        Ok(())
     }
 
     fn metrics(&self) -> Result<crate::metrics::Metrics> {
@@ -598,6 +637,27 @@ struct Step {
     service: Option<scm::Snapshot>,
     written: bool,
     created: bool,
+}
+
+/// The lock every command that changes services in the data directory `data` holds. It lives
+/// in the folder only administrators may write.
+pub fn lock(data: &Path) -> Result<files::Lock> {
+    let folder = Layout::new(data).workloads();
+    refuse_unprotected(&folder)?;
+    files::lock(&folder.join(".lock"), Duration::from_secs(60))
+}
+
+fn refuse_unprotected(folder: &Path) -> Result<()> {
+    // Users without administrator rights may not read the folder's permissions; this says
+    // so, rather than calling the folder unprotected.
+    crate::win32::owned_by_system_or_administrators(folder)?;
+    if !crate::win32::is_protected(folder) {
+        bail!(
+            "{} is not protected; services mode refuses to write definitions there. Run `k3up services enable` from an elevated terminal",
+            folder.display()
+        );
+    }
+    Ok(())
 }
 
 /// Owned by Administrators, which the host requires before it trusts a definition.

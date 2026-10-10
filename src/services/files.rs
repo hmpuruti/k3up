@@ -1,13 +1,18 @@
 use crate::model::{Event, State, Workload};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{ErrorKind, Write},
+    fs::{File, OpenOptions},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub const MARKER: &str = "services-mode";
+/// The last event id handed out, in the events folder.
+const SEQUENCE: &str = "sequence";
 const EVENTS_LIMIT: usize = 2000;
 const EVENTS_KEPT: usize = 1000;
 const EVENTS_PAGE: usize = 200;
@@ -133,7 +138,7 @@ fn rename(from: &Path, to: &Path) -> Result<()> {
             Ok(()) => return Ok(()),
             Err(error) if attempts < 20 && error.kind() == ErrorKind::PermissionDenied => {
                 attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(25));
+                std::thread::sleep(Duration::from_millis(25));
             }
             Err(error) => {
                 return Err(error).with_context(|| format!("Replace {}", to.display()));
@@ -188,43 +193,147 @@ pub fn write_state(path: &Path, state: &HostState) -> Result<()> {
     write_atomic(path, &serde_json::to_vec_pretty(state)?, |_| Ok(()))
 }
 
-/// Appends an event. Ids are microsecond timestamps, so events from separate files sort into
-/// one history. The file is cut back to its newest entries once it grows past the limit.
+/// Appends an event. Ids come from one sequence shared by every file in the folder, so they
+/// grow across all workloads whatever the clocks say, and the sequence stays locked until the
+/// event is written: a reader that has seen an id never misses a smaller one written later.
+/// The file is cut back to its newest entries once it grows past the limit.
 pub fn append_event(path: &Path, name: &str, message: &str) -> Result<()> {
+    let dir = path.parent().context("Locate the events folder")?;
+    let mut sequence = open_lock_file(&dir.join(SEQUENCE))?;
+    sequence
+        .lock_exclusive()
+        .context("Lock the event sequence")?;
+    let appended = next_event_id(&mut sequence, dir).and_then(|id| {
+        let event = Event {
+            id,
+            at: Utc::now(),
+            name: name.into(),
+            message: message.into(),
+        };
+        write_event(path, &serde_json::to_string(&event)?)
+    });
+    let _ = FileExt::unlock(&sequence);
+    appended
+}
+
+/// Holds an exclusive lock on a file until dropped.
+pub struct Lock(File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
+/// Takes the exclusive lock on `path` that every command changing services holds, waiting
+/// up to `wait` for another holder to finish.
+pub fn lock(path: &Path, wait: Duration) -> Result<Lock> {
+    let file = open_lock_file(path)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(Lock(file)),
+            Err(error) if error.raw_os_error() != fs2::lock_contended_error().raw_os_error() => {
+                return Err(error).with_context(|| format!("Lock {}", path.display()));
+            }
+            Err(_) if Instant::now() >= deadline => {
+                anyhow::bail!("Another k3up command is changing services; try again")
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// Opens a file used only for locking, creating it owned by Administrators when missing.
+fn open_lock_file(path: &Path) -> Result<File> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(_) => own(path),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("Create {}", path.display())),
+    }
+    refuse_redirected(path)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Open {}", path.display()))
+}
+
+/// Takes the next id and saves it before the event is written, so a failed write skips an
+/// id rather than reusing one. A missing or unreadable sequence continues after the largest
+/// id already written.
+fn next_event_id(sequence: &mut File, dir: &Path) -> Result<i64> {
+    let mut text = String::new();
+    sequence.seek(SeekFrom::Start(0))?;
+    sequence.read_to_string(&mut text)?;
+    let last = match text.trim().parse::<i64>() {
+        Ok(last) => last,
+        Err(_) => largest_event_id(dir)?,
+    };
+    let id = last + 1;
+    sequence.set_len(0)?;
+    sequence.seek(SeekFrom::Start(0))?;
+    sequence.write_all(id.to_string().as_bytes())?;
+    sequence.sync_all()?;
+    Ok(id)
+}
+
+fn largest_event_id(dir: &Path) -> Result<i64> {
+    let mut largest = 0;
+    for name in names(dir, "jsonl")? {
+        let Ok(text) = std::fs::read_to_string(dir.join(format!("{name}.jsonl"))) else {
+            continue;
+        };
+        let ids = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .map(|event| event.id);
+        largest = ids.fold(largest, i64::max);
+    }
+    Ok(largest)
+}
+
+fn write_event(path: &Path, line: &str) -> Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return write_atomic(path, format!("{line}\n").as_bytes(), |path| {
+                own(path);
+                Ok(())
+            });
+        }
         Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
     };
-    let last = text
-        .lines()
-        .next_back()
-        .and_then(|line| serde_json::from_str::<Event>(line).ok())
-        .map_or(0, |event| event.id);
-    let at = Utc::now();
-    let event = Event {
-        id: at.timestamp_micros().max(last + 1),
-        at,
-        name: name.into(),
-        message: message.into(),
-    };
-    let line = serde_json::to_string(&event)?;
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() >= EVENTS_LIMIT {
         let mut kept = lines[lines.len() + 1 - EVENTS_KEPT..].join("\n");
         kept.push('\n');
-        kept.push_str(&line);
+        kept.push_str(line);
         kept.push('\n');
-        return write_atomic(path, kept.as_bytes(), |_| Ok(()));
+        return write_atomic(path, kept.as_bytes(), |path| {
+            own(path);
+            Ok(())
+        });
     }
     refuse_redirected(path)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
+    let mut file = OpenOptions::new()
         .append(true)
         .open(path)
         .with_context(|| format!("Open {}", path.display()))?;
     file.write_all(format!("{line}\n").as_bytes())?;
     Ok(())
+}
+
+/// Makes Administrators the owner of a shared file this process created, which the host
+/// requires before it appends to the file. Best effort: if it fails, the file keeps this
+/// process's account as owner, and the host refuses it unless that is SYSTEM or
+/// Administrators.
+fn own(path: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = crate::win32::set_owner_to_administrators(path);
+    }
+    let _ = path;
 }
 
 /// Newest first, at most one page, only with ids above `after`.
@@ -286,6 +395,104 @@ mod tests {
             .collect();
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(text.ends_with(&format!("\"{}\"}}\n", EVENTS_LIMIT + 4)));
+    }
+
+    fn ids(layout: &Layout, name: &str) -> Vec<i64> {
+        std::fs::read_to_string(layout.events(name))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Event>(line).unwrap().id)
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_writers_share_one_increasing_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        std::fs::create_dir_all(layout.events_dir()).unwrap();
+        let writers: Vec<_> = (0..4)
+            .map(|writer| {
+                let path = layout.events(&format!("w{writer}"));
+                std::thread::spawn(move || {
+                    for index in 0..50 {
+                        append_event(&path, "w", &index.to_string()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let mut all = vec![];
+        for writer in 0..4 {
+            let ids = ids(&layout, &format!("w{writer}"));
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+            all.extend(ids);
+        }
+        all.sort();
+        assert_eq!(all, (1..=200).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn a_lost_or_broken_sequence_continues_after_the_largest_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        std::fs::create_dir_all(layout.events_dir()).unwrap();
+        let old = Event {
+            id: 1_700_000_000_000_000,
+            at: Utc::now(),
+            name: "a".into(),
+            message: "Written with a clock id".into(),
+        };
+        let line = format!("{}\n", serde_json::to_string(&old).unwrap());
+        std::fs::write(layout.events("a"), line).unwrap();
+        append_event(&layout.events("b"), "b", "after the upgrade").unwrap();
+        assert_eq!(ids(&layout, "b"), [old.id + 1]);
+
+        let sequence = layout.events_dir().join(SEQUENCE);
+        std::fs::write(&sequence, b"not a number").unwrap();
+        append_event(&layout.events("a"), "a", "after corruption").unwrap();
+        std::fs::remove_file(&sequence).unwrap();
+        append_event(&layout.events("b"), "b", "after deletion").unwrap();
+        assert_eq!(ids(&layout, "a"), [old.id, old.id + 2]);
+        assert_eq!(ids(&layout, "b"), [old.id + 1, old.id + 3]);
+        let merged: Vec<i64> = read_events(&layout, None, Some(old.id))
+            .unwrap()
+            .iter()
+            .map(|event| event.id)
+            .collect();
+        assert_eq!(merged, [old.id + 3, old.id + 2, old.id + 1]);
+    }
+
+    #[test]
+    fn a_second_holder_waits_and_then_gives_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".lock");
+        let held = lock(&path, Duration::ZERO).unwrap();
+        let started = Instant::now();
+        let refused = lock(&path, Duration::from_millis(300)).err().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(
+            refused.to_string(),
+            "Another k3up command is changing services; try again"
+        );
+        drop(held);
+        lock(&path, Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn a_failed_replacement_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k3up-host.exe");
+        std::fs::write(&path, b"old program").unwrap();
+        let failed = write_atomic(&path, b"new program", |_| anyhow::bail!("disk full"));
+        assert_eq!(failed.unwrap_err().to_string(), "disk full");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old program");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        write_atomic(&path, b"new program", |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new program");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

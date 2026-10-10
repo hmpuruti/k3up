@@ -9,7 +9,8 @@ use super::{
 };
 use crate::autostart::LoginAgent;
 use crate::win32::{
-    MARKER_SDDL, PRIVATE_DIR_SDDL, ROOT_DIR_SDDL, SHARED_DIR_SDDL, secure_dir, set_security,
+    MARKER_SDDL, PRIVATE_DIR_SDDL, ROOT_DIR_SDDL, SHARED_DIR_SDDL, reset_contents, secure_dir,
+    set_security,
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -26,8 +27,9 @@ pub fn install_dir() -> Result<PathBuf> {
     Ok(crate::win32::program_files()?.join("K3 Up"))
 }
 
-/// Creates or secures the data directory and its folders, then writes the marker. Safe to
-/// repeat, and repeating it replaces a marker written with older permissions.
+/// Creates or secures the data directory and its folders and what they already hold, then
+/// writes the marker. Safe to repeat, and repeating it replaces a marker written with older
+/// permissions.
 pub fn prepare(data: &Path) -> Result<()> {
     let layout = Layout::new(data);
     secure_dir(data, ROOT_DIR_SDDL)?;
@@ -38,6 +40,7 @@ pub fn prepare(data: &Path) -> Result<()> {
         (layout.events_dir(), SHARED_DIR_SDDL),
     ] {
         secure_dir(&folder, sddl)?;
+        reset_contents(&folder)?;
     }
     files::write_atomic(&layout.marker(), b"", |path| {
         set_security(path, MARKER_SDDL)
@@ -53,10 +56,20 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
     }
     let own = LoginAgent::new(PathBuf::new(), crate::platform::login_data_dir());
     super::refuse_user_agent(own.registration(), own.is_running())?;
+    let _lock = lock_if_prepared(data)?;
     let mut lines = install_programs(&settings.prefix)?;
     prepare(data)?;
     lines.push(format!("Services mode is on for {}", data.display()));
     Ok(lines)
+}
+
+/// The lock that commands changing services hold, once a protected folder exists to hold it.
+/// Before that, no command can change services in `data`.
+fn lock_if_prepared(data: &Path) -> Result<Option<files::Lock>> {
+    if !crate::win32::is_protected(&Layout::new(data).workloads()) {
+        return Ok(None);
+    }
+    super::backend::lock(data).map(Some)
 }
 
 /// Copies the programs into Program Files. Running services lock the host, so they are
@@ -130,7 +143,11 @@ fn copy_programs(source: &Path, target: &Path) -> Result<Vec<String>> {
         let from = source.join(program);
         if from.is_file() {
             let to = target.join(program);
-            std::fs::copy(&from, &to)
+            // A partly written host would break every workload, so the copy replaces the
+            // installed program in one step or not at all.
+            std::fs::read(&from)
+                .with_context(|| format!("Read {}", from.display()))
+                .and_then(|bytes| files::write_atomic(&to, &bytes, |_| Ok(())))
                 .with_context(|| format!("Copy {program} to {}", to.display()))?;
             lines.push(format!("Copied {program} to {}", target.display()));
         }
@@ -147,6 +164,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 pub fn disable(data: &Path) -> Result<String> {
     let settings = Settings::from_env()?;
+    let _lock = lock_if_prepared(data)?;
     let services = scm::list(&settings.prefix)?;
     if !services.is_empty() {
         let names: Vec<String> = services

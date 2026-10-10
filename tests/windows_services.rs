@@ -677,8 +677,8 @@ fn a_broken_definition_never_leaks_into_files_every_user_reads() {
 
 const USERS_READ: u32 = 0x1200a9;
 
-/// The marker's owner and access as SDDL, and the rights its DACL gives the Users group.
-fn marker_security(data: &Path) -> (String, u32) {
+/// A file's owner and access as SDDL, and the rights its DACL gives the Users group.
+fn security(path: &Path) -> (String, u32) {
     use windows_sys::Win32::{
         Foundation::{ERROR_SUCCESS, LocalFree},
         Security::{
@@ -692,7 +692,7 @@ fn marker_security(data: &Path) -> (String, u32) {
             PSECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, WinBuiltinUsersSid,
         },
     };
-    let path = k3up::win32::wide(data.join(files::MARKER).as_os_str());
+    let path = k3up::win32::wide(path.as_os_str());
     let wanted = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     // SAFETY: every out-pointer is valid for its call; the DACL points into the descriptor,
     // and the descriptor and the string are freed once read.
@@ -759,7 +759,7 @@ fn every_user_may_read_the_marker_and_only_administrators_change_it() {
     let Some(machine) = Machine::start() else {
         return;
     };
-    let (sddl, users) = marker_security(&machine.data);
+    let (sddl, users) = security(&machine.data.join(files::MARKER));
     let (owner, dacl) = sddl.split_once("D:").unwrap();
     assert_eq!(owner, "O:BA", "{sddl}");
     let (flags, aces) = dacl.split_once('(').unwrap();
@@ -784,9 +784,81 @@ fn every_user_may_read_the_marker_and_only_administrators_change_it() {
         k3up::win32::set_owner_to_administrators,
     )
     .unwrap();
-    assert_eq!(marker_security(&machine.data).1, 0);
+    let marker = machine.data.join(files::MARKER);
+    assert_eq!(security(&marker).1, 0);
     setup::prepare(&machine.data).unwrap();
-    assert_eq!(marker_security(&machine.data).1, USERS_READ);
+    assert_eq!(security(&marker).1, USERS_READ);
+}
+
+fn icacls(path: &Path, arguments: &[&str]) {
+    let output = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn files_left_in_the_folders_lose_their_own_permissions() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let log = machine.data.join("logs").join("planted.log");
+    let history = machine.data.join("events").join("planted.jsonl");
+    for file in [&log, &history] {
+        std::fs::write(file, b"planted\n").unwrap();
+        icacls(file, &["/inheritance:r", "/grant", "*S-1-5-32-545:F"]);
+        assert_eq!(security(file).1 & 0x1f01ff, 0x1f01ff);
+    }
+    setup::prepare(&machine.data).unwrap();
+    let (sddl, users) = security(&log);
+    assert_eq!(users, 0, "{sddl}");
+    assert!(sddl.starts_with("O:BA"), "{sddl}");
+    let (sddl, users) = security(&history);
+    assert_eq!(users, USERS_READ, "{sddl}");
+
+    // Setting another account as owner needs the restore privilege, which icacls turns on.
+    icacls(&history, &["/setowner", "*S-1-5-32-545"]);
+    let error = format!("{:#}", setup::prepare(&machine.data).unwrap_err());
+    assert!(
+        error.contains("planted.jsonl belongs to another account"),
+        "{error}"
+    );
+    let appended = files::append_event(&history, "planted", "refused");
+    assert!(
+        format!("{:#}", appended.unwrap_err()).contains("belongs to another account"),
+        "the host must not append to a file another account owns"
+    );
+}
+
+#[test]
+fn stopping_a_failed_workload_records_the_stop() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let mut broken = machine.workload("broken", "exit");
+    broken.restart = Restart::Never;
+    assert!(machine.put(broken).ok);
+    let _ = machine.send(Command::Start {
+        name: "broken".into(),
+    });
+    let failed = machine.until("broken", |status| status.state == State::Failed);
+    assert!(!failed.desired_running);
+    machine.ok(Command::Stop {
+        name: "broken".into(),
+    });
+    let stopped = machine.get("broken");
+    assert_eq!(stopped.state, State::Stopped, "{stopped:?}");
+    assert_eq!(stopped.reason, "Stopped by request");
+    assert!(!stopped.desired_running);
+    assert_eq!(stopped.pid, None);
+    let listed = machine.ok(Command::List).workloads;
+    assert_eq!(listed[0].state, State::Stopped);
 }
 
 /// Runs `read` on this thread as this account with its administrator rights turned off, as a
@@ -1021,4 +1093,51 @@ fn a_failed_apply_leaves_every_workload_as_it_was() {
         let file = machine.data.join("workloads").join(format!("{name}.toml"));
         assert!(!file.exists(), "{name}");
     }
+}
+
+#[test]
+fn concurrent_applies_leave_one_consistent_workload() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let shared = |group: &str| {
+        let mut workload = machine.workload("shared", "pulse");
+        workload.group = group.into();
+        workload.description = group.into();
+        workload
+    };
+    std::thread::scope(|scope| {
+        for group in ["one", "two", "three"] {
+            let workload = shared(group);
+            let machine = &machine;
+            scope.spawn(move || {
+                for _ in 0..4 {
+                    let response = machine.send(Command::Apply {
+                        manifest: Manifest {
+                            version: 1,
+                            workloads: vec![workload.clone()],
+                        },
+                        dry_run: false,
+                    });
+                    assert!(response.ok, "{}", response.message);
+                }
+            });
+        }
+    });
+    let saved = files::read_definition(&machine.data.join("workloads").join("shared.toml"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved, shared(&saved.group));
+    let service = scm::query(&machine.service("shared")).unwrap().unwrap();
+    assert_eq!(
+        service.display_name,
+        format!("K3 Up: {}/shared", saved.group)
+    );
+    let description = machine.sc("qdescription", "shared");
+    assert!(
+        description.lines().any(|line| {
+            line.trim_start().starts_with("DESCRIPTION") && line.trim_end().ends_with(&saved.group)
+        }),
+        "{description}"
+    );
 }

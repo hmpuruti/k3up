@@ -12,22 +12,23 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree},
     Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION,
         Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
             GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
             SetNamedSecurityInfoW,
         },
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetSecurityDescriptorDacl,
-        GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE, IsWellKnownSid,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation,
-        TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE, InitializeAcl,
+        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+        TokenElevation, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        GetFileInformationByHandle,
+        GetFileInformationByHandle, READ_CONTROL,
     },
     System::{
         Com::CoTaskMemFree,
@@ -192,11 +193,12 @@ pub fn refuse_reparse_point(path: &Path) -> Result<()> {
 }
 
 /// Refuses an existing file that a write as an administrator or SYSTEM could be redirected
-/// through: a reparse point, or a file with another hard link.
+/// through, a reparse point or a file with another hard link, and a file another account
+/// owns, since that account could read what is written or change it.
 pub fn refuse_redirected_file(path: &Path) -> Result<()> {
     refuse_reparse_point(path)?;
     let file = match std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
+        .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
     {
@@ -204,10 +206,11 @@ pub fn refuse_redirected_file(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).with_context(|| format!("Open {}", path.display())),
     };
+    let handle = file.as_raw_handle() as HANDLE;
     // SAFETY: the handle is open for the duration of the call; the structure is plain data.
     let links = unsafe {
         let mut information: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
-        if GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) == 0 {
+        if GetFileInformationByHandle(handle, &mut information) == 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("Read {}", path.display()));
         }
@@ -218,6 +221,137 @@ pub fn refuse_redirected_file(path: &Path) -> Result<()> {
             "{} has another hard link; services mode refuses to write to it",
             path.display()
         );
+    }
+    if !trusted_owner(handle).with_context(|| format!("Read the owner of {}", path.display()))? {
+        bail!(
+            "{} belongs to another account; services mode refuses to write to it",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn trusted_owner(handle: HANDLE) -> Result<bool> {
+    let mut owner: PSID = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: the caller keeps the handle open for the call; out-pointers are valid.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32).into());
+    }
+    // A file this account owns is no threat to this account's own writes.
+    // SAFETY: owner points into descriptor, which stays allocated until LocalFree below.
+    let trusted = unsafe {
+        if system_or_administrators(owner) {
+            Ok(true)
+        } else {
+            current_user_is(owner)
+        }
+    };
+    // SAFETY: allocated by GetSecurityInfo.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    trusted
+}
+
+/// Brings what an earlier, less protected folder may hold under the folder's own access:
+/// every entry inside gets Administrators as owner and only the permissions it inherits.
+/// Refuses, naming them all, entries that are links, have another hard link or belong to
+/// another account, since resetting them would follow the link or hide what they held.
+pub fn reset_contents(dir: &Path) -> Result<()> {
+    let mut entries = vec![];
+    collect_entries(dir, &mut entries)?;
+    let refused: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            let checked = if entry.is_dir() && !is_reparse_point(entry).unwrap_or(true) {
+                owned_by_system_or_administrators(entry).and_then(|trusted| {
+                    anyhow::ensure!(trusted, "belongs to another account");
+                    Ok(())
+                })
+            } else {
+                refuse_redirected_file(entry)
+            };
+            checked.err().map(|error| format!("  {error:#}"))
+        })
+        .collect();
+    if !refused.is_empty() {
+        bail!(
+            "Remove these from {} and try again:\n{}",
+            dir.display(),
+            refused.join("\n")
+        );
+    }
+    for entry in &entries {
+        inherit_only(entry)?;
+    }
+    Ok(())
+}
+
+/// Makes Administrators the owner and drops every explicit grant, so only what the parent
+/// passes down applies.
+fn inherit_only(path: &Path) -> Result<()> {
+    let attributes = SecurityAttributes::from_sddl("O:BA")?;
+    let path_wide = wide(path.as_os_str());
+    // u32 elements keep the ACL header aligned.
+    let mut empty = [0u32; size_of::<ACL>().div_ceil(4)];
+    let mut owner: PSID = ptr::null_mut();
+    let mut defaulted = 0;
+    // SAFETY: the descriptor is valid while attributes lives and the owner points into it;
+    // the ACL buffer is large enough for an ACL with no entries.
+    let status = unsafe {
+        if GetSecurityDescriptorOwner(attributes.descriptor(), &mut owner, &mut defaulted) == 0
+            || InitializeAcl(
+                empty.as_mut_ptr().cast(),
+                size_of::<ACL>() as u32,
+                ACL_REVISION,
+            ) == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("Build an empty ACL");
+        }
+        SetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            ptr::null_mut(),
+            empty.as_ptr().cast(),
+            ptr::null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .with_context(|| format!("Reset the permissions of {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Every entry under `dir`, parents before their contents. Links are listed but not followed.
+fn collect_entries(dir: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
+    let listing = std::fs::read_dir(dir).with_context(|| format!("Read {}", dir.display()))?;
+    for entry in listing {
+        let path = entry
+            .with_context(|| format!("Read {}", dir.display()))?
+            .path();
+        let descend = !is_reparse_point(&path)? && path.is_dir();
+        entries.push(path.clone());
+        if descend {
+            collect_entries(&path, entries)?;
+        }
     }
     Ok(())
 }
