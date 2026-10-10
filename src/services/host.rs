@@ -54,8 +54,7 @@ pub fn explain_exit(code: Option<u32>) -> String {
         Some(EXIT_FAILED) => "the workload failed".into(),
         Some(EXIT_DEFINITION) => "its definition could not be loaded".into(),
         Some(EXIT_UNTRUSTED) => {
-            "its data folders must belong to SYSTEM or Administrators, so the host refused to run"
-                .into()
+            "its data folders are not protected, so the host refused to run".into()
         }
         Some(code) => format!("the host exited with code {code}"),
         None => "the host stopped without giving a reason".into(),
@@ -110,12 +109,16 @@ impl Host {
     fn run(&mut self, stop: &Receiver<()>) -> ServiceExitCode {
         let spec = match self.load() {
             Ok(spec) => spec,
-            Err((code, error)) => {
+            Err(refusal) => {
+                self.log_line(&format!("Refusing to run: {:#}", refusal.detail));
                 // Writing into folders another account controls could overwrite any file.
-                if trusted(&self.layout.states()) && trusted(&self.layout.events_dir()) {
-                    self.record(State::Failed, format!("Refusing to run: {error:#}"));
+                if is_protected(&self.layout.states()) && is_protected(&self.layout.events_dir()) {
+                    self.record(
+                        State::Failed,
+                        format!("Refusing to run: {}", refusal.reason),
+                    );
                 }
-                return ServiceExitCode::ServiceSpecific(code);
+                return ServiceExitCode::ServiceSpecific(refusal.code);
             }
         };
         self.report(
@@ -130,9 +133,17 @@ impl Host {
     }
 
     /// Reads the definition, but only from folders that no other account could have written.
-    fn load(&self) -> Result<Workload, (u32, anyhow::Error)> {
+    /// The reason is shown to every user, so it never quotes the definition.
+    fn load(&self) -> Result<Workload, Refusal> {
         let definition = self.layout.definition(&self.name);
-        let folders = [
+        if !definition.is_file() {
+            return Err(Refusal::new(
+                EXIT_DEFINITION,
+                "the definition is missing",
+                anyhow!("{} does not exist", definition.display()),
+            ));
+        }
+        let paths = [
             self.layout.root().to_path_buf(),
             self.layout.workloads(),
             self.layout.logs(),
@@ -140,29 +151,35 @@ impl Host {
             self.layout.events_dir(),
             definition.clone(),
         ];
-        for path in &folders {
-            match crate::win32::owned_by_system_or_administrators(path) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err((
-                        EXIT_UNTRUSTED,
-                        anyhow!("{} must belong to SYSTEM or Administrators", path.display()),
-                    ));
-                }
-                Err(error) => return Err((EXIT_DEFINITION, error)),
-            }
+        if let Some(path) = paths.iter().find(|path| !is_protected(path)) {
+            return Err(Refusal::new(
+                EXIT_UNTRUSTED,
+                format!("{} is not protected", path.display()),
+                anyhow!(
+                    "{} must belong to SYSTEM or Administrators, must not be a link, and only they may change it",
+                    path.display()
+                ),
+            ));
         }
-        let spec = files::read_definition(&definition)
+        files::read_definition(&definition)
             .and_then(|spec| spec.context("Definition missing"))
             .and_then(|spec| check(spec, &self.name))
-            .map_err(|error| (EXIT_DEFINITION, error))?;
-        Ok(spec)
+            .map_err(|error| {
+                Refusal::new(
+                    EXIT_DEFINITION,
+                    "the definition could not be read or is not valid",
+                    error,
+                )
+            })
     }
 
     fn supervise(&mut self, spec: &Workload, stop: &Receiver<()>) -> Ending {
         loop {
             let now = Utc::now();
-            let ended = match supervisor::launch(spec, &self.layout.log(&self.name), now) {
+            let log = self.layout.log(&self.name);
+            let launched =
+                files::refuse_redirected(&log).and_then(|()| supervisor::launch(spec, &log, now));
+            let ended = match launched {
                 Ok(process) => {
                     self.state.started_at = Some(now);
                     self.state.pid = Some(process.id());
@@ -172,11 +189,15 @@ impl Host {
                         None => return Ending::Requested,
                     }
                 }
-                Err(error) => Ended {
-                    code: 1,
-                    reason: format!("Launch failed: {error:#}"),
-                    success: false,
-                },
+                Err(error) => {
+                    // The error can quote the command line, which only administrators may read.
+                    self.log_line(&format!("Launch failed: {error:#}"));
+                    Ended {
+                        code: 1,
+                        reason: "Launch failed; the log has the reason".into(),
+                        success: false,
+                    }
+                }
             };
             self.state.pid = None;
             self.state.last_exit = Some(ended.code);
@@ -228,9 +249,10 @@ impl Host {
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    self.log_line(&format!("Lost track of the process: {error:#}"));
                     return Some(Ended {
                         code: 1,
-                        reason: format!("Lost track of the process: {error:#}"),
+                        reason: "Lost track of the process; the log has the reason".into(),
                         success: false,
                     });
                 }
@@ -248,8 +270,12 @@ impl Host {
             }
             if rotated.elapsed() >= ROTATE_EVERY {
                 rotated = Instant::now();
-                if let Err(error) = supervisor::rotate_log(&log) {
-                    self.note(&format!("Log rotation failed: {error:#}"));
+                let rotated_log = files::refuse_redirected(&log)
+                    .and_then(|()| files::refuse_redirected(&log.with_extension("log.1")))
+                    .and_then(|()| supervisor::rotate_log(&log));
+                if let Err(error) = rotated_log {
+                    self.log_line(&format!("Log rotation failed: {error:#}"));
+                    self.note("Log rotation failed");
                 }
             }
         }
@@ -296,6 +322,22 @@ impl Host {
         let _ = files::write_state(&self.layout.state(&self.name), &self.state);
     }
 
+    /// Details for administrators only, in the workload's log.
+    fn log_line(&self, text: &str) {
+        use std::io::Write;
+        let log = self.layout.log(&self.name);
+        if !is_protected(&self.layout.logs()) || files::refuse_redirected(&log).is_err() {
+            return;
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
+            let _ = writeln!(file, "[{}] k3up-host: {text}", Utc::now().to_rfc3339());
+        }
+    }
+
     fn note(&self, message: &str) {
         let _ = files::append_event(&self.layout.events(&self.name), &self.name, message);
     }
@@ -331,6 +373,22 @@ fn check(spec: Workload, name: &str) -> Result<Workload> {
     Ok(spec)
 }
 
-fn trusted(path: &Path) -> bool {
-    crate::win32::owned_by_system_or_administrators(path).unwrap_or(false)
+fn is_protected(path: &Path) -> bool {
+    crate::win32::is_protected(path)
+}
+
+struct Refusal {
+    code: u32,
+    reason: String,
+    detail: anyhow::Error,
+}
+
+impl Refusal {
+    fn new(code: u32, reason: impl Into<String>, detail: anyhow::Error) -> Self {
+        Self {
+            code,
+            reason: reason.into(),
+            detail,
+        }
+    }
 }

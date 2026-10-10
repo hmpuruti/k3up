@@ -579,7 +579,7 @@ Files in `%ProgramData%\K3 Up`:
 | `state\NAME.json` | State, process, retries, last exit and reason | Administrators change, users read |
 | `events\NAME.jsonl` | Activity history | Administrators change, users read |
 
-Changing workloads needs an elevated terminal; without one, `k3up` says so. Any user can run `k3up list` and `k3up services status` to see names, folders and states, but not definitions, which may hold secrets in their environment variables. The host refuses to run a definition unless its folders and file belong to SYSTEM or Administrators.
+Changing workloads needs an elevated terminal; without one, `k3up` says so. Any user can run `k3up list` and `k3up services status` to see names, folders and states, but not definitions, which may hold secrets in their environment variables. K3 Up uses services mode only when the data directory and its marker belong to SYSTEM or Administrators, are not links, and no other account may change them. Otherwise `k3up` falls back to the per-user directory, or refuses a `--data-dir` that points there. The host applies the same check to its folders and the definition before it runs anything, and state and history files never quote a definition: the details of a refusal or a failed launch go to the workload's log, which only administrators read.
 
 Not supported in services mode yet: schedules, dependencies, TCP readiness checks and per-workload accounts. A definition that uses one is refused with a message that names it. `stats` and `health` show current usage but no history, and there is no agent, so the `agent` commands refuse to run.
 

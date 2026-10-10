@@ -23,7 +23,7 @@ impl Client {
         let data = std::fs::canonicalize(&self.data_dir)
             .context("Agent data directory does not exist. Start k3up-agent first")?;
         #[cfg(windows)]
-        if crate::services::active(&data) {
+        if crate::services::check(&self.data_dir)? {
             let backend = crate::services::Backend::open(&data)?;
             return Ok(backend
                 .handle(command)

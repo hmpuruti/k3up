@@ -76,8 +76,14 @@ pub fn write_atomic(
     bytes: &[u8],
     prepare: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
+    refuse_redirected_parent(path)?;
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    let written = std::fs::File::create(&temporary)
+    // A fresh file, so a link planted under the temporary name cannot redirect the write.
+    let _ = std::fs::remove_file(&temporary);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
         .and_then(|mut file| {
             file.write_all(bytes)?;
             file.sync_all()
@@ -89,6 +95,34 @@ pub fn write_atomic(
         let _ = std::fs::remove_file(&temporary);
     }
     written
+}
+
+/// Refuses a file that a write could be redirected through: a link, or on Windows a file with
+/// another hard link. Run before appending to a file as an administrator or SYSTEM.
+pub fn refuse_redirected(path: &Path) -> Result<()> {
+    refuse_redirected_parent(path)?;
+    #[cfg(windows)]
+    {
+        crate::win32::refuse_redirected_file(path)
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("{} is a link to another location", path.display())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn refuse_redirected_parent(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if let Some(parent) = path.parent() {
+        crate::win32::refuse_reparse_point(parent)?;
+    }
+    let _ = path;
+    Ok(())
 }
 
 /// A reader or a virus scanner can hold the target open for a moment on Windows.
@@ -183,6 +217,7 @@ pub fn append_event(path: &Path, name: &str, message: &str) -> Result<()> {
         kept.push('\n');
         return write_atomic(path, kept.as_bytes(), |_| Ok(()));
     }
+    refuse_redirected(path)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

@@ -6,7 +6,7 @@
 use k3up::{
     model::{Kind, Restart, RestartBackoff, RestartLimit, Schedule, State, Status, Workload},
     protocol::{Command, Response},
-    services::{Backend, Settings, scm, setup},
+    services::{Backend, Settings, files, scm, setup},
 };
 use std::{
     collections::BTreeMap,
@@ -539,4 +539,127 @@ fn the_command_line_talks_to_services_in_process() {
     machine.cli_response(&["stop", "cli"]);
     machine.cli_response(&["remove", "cli"]);
     assert!(machine.cli_response(&["list"]).workloads.is_empty());
+}
+
+fn elevated() -> bool {
+    Machine::start().is_some()
+}
+
+fn junction(link: &std::path::Path, target: &std::path::Path) {
+    let status = std::process::Command::new("cmd.exe")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn a_marker_in_a_folder_users_may_change_is_refused() {
+    if !elevated() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let open = dir.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    let granted = std::process::Command::new("icacls.exe")
+        .arg(&open)
+        .args(["/grant", "*S-1-5-32-545:(OI)(CI)M"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(granted.success());
+    std::fs::write(open.join(files::MARKER), b"").unwrap();
+
+    let error = k3up::services::check(&open).unwrap_err().to_string();
+    assert!(
+        error.ends_with(
+            "is not protected; services mode refuses it. Remove it and run `k3up services enable` from an elevated terminal"
+        ),
+        "{error}"
+    );
+    assert!(!k3up::services::active(&open));
+    let output = std::process::Command::new(CLI)
+        .arg("--data-dir")
+        .arg(&open)
+        .args(["--json", "list"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let response: Response = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        response.message.contains("services mode refuses it"),
+        "{}",
+        response.message
+    );
+}
+
+#[test]
+fn junctions_in_the_data_directory_are_refused() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    setup::prepare(&target).unwrap();
+    let link = dir.path().join("link");
+    junction(&link, &target);
+    let error = format!("{:#}", setup::prepare(&link).unwrap_err());
+    assert!(error.contains("is a link to another location"), "{error}");
+    assert!(k3up::services::check(&link).is_err());
+
+    let workloads = machine.data.join("workloads");
+    std::fs::remove_dir(&workloads).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    k3up::win32::create_dir_with(&elsewhere, k3up::win32::PRIVATE_DIR_SDDL).unwrap();
+    junction(&workloads, &elsewhere);
+    let refused = machine.put(machine.workload("redirected", "pulse"));
+    assert!(!refused.ok);
+    assert!(
+        refused
+            .message
+            .contains("services mode refuses to write definitions there"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    assert!(!scm::exists(&machine.service("redirected")).unwrap());
+    let error = format!("{:#}", setup::prepare(&machine.data).unwrap_err());
+    assert!(error.contains("is a link to another location"), "{error}");
+}
+
+#[test]
+fn a_broken_definition_never_leaks_into_files_every_user_reads() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(machine.put(machine.workload("leaky", "pulse")).ok);
+    let broken = "name = \"leaky\"\n[environment]\nK3UP_SECRET = \"hunter2-do-not-leak\" oops\n";
+    files::write_atomic(
+        &machine.data.join("workloads").join("leaky.toml"),
+        broken.as_bytes(),
+        k3up::win32::set_owner_to_administrators,
+    )
+    .unwrap();
+    scm::start(&machine.service("leaky")).unwrap();
+    let state = scm::wait(&machine.service("leaky"), WAIT, |state| {
+        state == k3up::services::status::Scm::Stopped
+    })
+    .unwrap();
+    assert_eq!(state, Some(k3up::services::status::Scm::Stopped));
+    assert_eq!(
+        scm::specific_exit_code(&machine.service("leaky")).unwrap(),
+        Some(k3up::services::host::EXIT_DEFINITION)
+    );
+    let state = std::fs::read_to_string(machine.data.join("state").join("leaky.json")).unwrap();
+    let events = std::fs::read_to_string(machine.data.join("events").join("leaky.jsonl")).unwrap();
+    assert!(
+        state.contains("Refusing to run: the definition could not be read or is not valid"),
+        "{state}"
+    );
+    assert!(!state.contains("hunter2"), "{state}");
+    assert!(!events.contains("hunter2"), "{events}");
+    assert!(machine.log("leaky").contains("k3up-host: Refusing to run"));
 }

@@ -332,6 +332,13 @@ impl Backend {
     fn save(&self, change: Change) -> Result<()> {
         let workload = &change.workload;
         let name = &workload.name;
+        let folder = self.layout.workloads();
+        if !crate::win32::is_protected(&folder) {
+            bail!(
+                "{} is not protected; services mode refuses to write definitions there. Run `k3up services enable` from an elevated terminal",
+                folder.display()
+            );
+        }
         let path = self.layout.definition(name);
         write_definition(&path, workload)?;
         let service = self.service_name(name);

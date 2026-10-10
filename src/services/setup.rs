@@ -1,7 +1,7 @@
 //! Turning services mode on and off for a data directory.
 use super::{
     backend::{Backend, Settings},
-    files::Layout,
+    files::{self, Layout},
     scm,
     status::Scm,
 };
@@ -18,10 +18,7 @@ const PROGRAMS: [&str; 3] = ["k3up-host.exe", "k3up.exe", "k3up-desktop.exe"];
 const CENTRAL_AGENT: &str = "K3Up";
 
 pub fn install_dir() -> Result<PathBuf> {
-    Ok(
-        PathBuf::from(std::env::var_os("ProgramFiles").context("ProgramFiles is not set")?)
-            .join("K3 Up"),
-    )
+    Ok(crate::win32::program_files()?.join("K3 Up"))
 }
 
 /// Creates or secures the data directory and its folders, then writes the marker. Safe to
@@ -37,8 +34,11 @@ pub fn prepare(data: &Path) -> Result<()> {
     ] {
         secure_dir(&folder, sddl)?;
     }
-    std::fs::write(layout.marker(), b"")
-        .with_context(|| format!("Write {}", layout.marker().display()))
+    files::write_atomic(
+        &layout.marker(),
+        b"",
+        crate::win32::set_owner_to_administrators,
+    )
 }
 
 pub fn enable(data: &Path) -> Result<Vec<String>> {
@@ -152,7 +152,7 @@ pub struct Summary {
 }
 
 pub fn summary(data: &Path) -> Result<Summary> {
-    let enabled = super::active(data);
+    let enabled = super::check(data)?;
     let settings = Settings::from_env()?;
     let mut counts = BTreeMap::new();
     if enabled {

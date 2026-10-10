@@ -1,28 +1,44 @@
 use anyhow::{Context, Result, bail};
 use std::{
-    ffi::OsStr,
-    os::windows::{ffi::OsStrExt, io::AsRawHandle},
-    path::Path,
+    ffi::{OsStr, OsString},
+    os::windows::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    },
+    path::{Path, PathBuf},
     ptr,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree},
     Security::{
-        ACL,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
         Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
             GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
             SetNamedSecurityInfoW,
         },
-        DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-        TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
-        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE, IsWellKnownSid,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation,
+        TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     },
-    Storage::FileSystem::CreateDirectoryW,
-    System::Threading::{GetCurrentProcess, OpenProcessToken},
+    Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        GetFileInformationByHandle,
+    },
+    System::{
+        Com::CoTaskMemFree,
+        Threading::{GetCurrentProcess, OpenProcessToken},
+    },
+    UI::Shell::{FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath},
 };
+
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 6;
 
 /// SYSTEM, Administrators and the pipe's owner only. The default pipe DACL also grants
 /// Everyone read access, which is enough to occupy the single listening instance.
@@ -108,6 +124,7 @@ pub fn create_dir_with(path: &Path, sddl: &str) -> Result<()> {
 /// by an account other than SYSTEM or Administrators is refused, because that account could
 /// have planted files the service host would trust.
 pub fn secure_dir(path: &Path, sddl: &str) -> Result<()> {
+    refuse_reparse_point(path)?;
     if !path.exists() {
         return create_dir_with(path, sddl);
     }
@@ -148,6 +165,162 @@ pub fn secure_dir(path: &Path, sddl: &str) -> Result<()> {
             .with_context(|| format!("Protect {}", path.display()));
     }
     Ok(())
+}
+
+/// Whether `path` is a junction, symbolic link or other reparse point. Path-based security
+/// calls follow them, so one planted inside the data directory would redirect them elsewhere.
+pub fn is_reparse_point(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("Read {}", path.display())),
+    }
+}
+
+pub fn refuse_reparse_point(path: &Path) -> Result<()> {
+    if is_reparse_point(path)? {
+        bail!(
+            "{} is a link to another location; services mode refuses it",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuses an existing file that a write as an administrator or SYSTEM could be redirected
+/// through: a reparse point, or a file with another hard link.
+pub fn refuse_redirected_file(path: &Path) -> Result<()> {
+    refuse_reparse_point(path)?;
+    let file = match std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("Open {}", path.display())),
+    };
+    // SAFETY: the handle is open for the duration of the call; the structure is plain data.
+    let links = unsafe {
+        let mut information: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Read {}", path.display()));
+        }
+        information.nNumberOfLinks
+    };
+    if links > 1 {
+        bail!(
+            "{} has another hard link; services mode refuses to write to it",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether only SYSTEM and Administrators control `path`: it is not a reparse point, one of
+/// them owns it, and no one else may write to, delete or change the permissions of it.
+pub fn is_protected(path: &Path) -> bool {
+    if !matches!(is_reparse_point(path), Ok(false)) {
+        return false;
+    }
+    let path_wide = wide(path.as_os_str());
+    let mut owner: PSID = ptr::null_mut();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: the path is NUL-terminated; out-pointers are valid for the call.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return false;
+    }
+    // SAFETY: owner and dacl point into descriptor, which stays allocated until LocalFree.
+    let protected = unsafe { system_or_administrators(owner) && only_trusted_may_change(dacl) };
+    // SAFETY: allocated by GetNamedSecurityInfoW.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    protected
+}
+
+/// Whether a data directory may be trusted as a services mode directory: the directory and
+/// its marker are protected.
+pub fn is_trusted_machine_dir(path: &Path) -> bool {
+    is_protected(path) && is_protected(&path.join(crate::services::files::MARKER))
+}
+
+/// # Safety
+/// `dacl` must be null or point to a valid ACL.
+unsafe fn only_trusted_may_change(dacl: *const ACL) -> bool {
+    // A missing DACL grants everyone full control.
+    if dacl.is_null() {
+        return false;
+    }
+    unsafe {
+        for index in 0..(*dacl).AceCount {
+            let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+            if GetAce(dacl, index as u32, &mut ace) == 0 {
+                return false;
+            }
+            let header = &*(ace as *const ACE_HEADER);
+            if header.AceFlags as u32 & INHERIT_ONLY_ACE != 0 {
+                continue;
+            }
+            match header.AceType {
+                ACCESS_DENIED_ACE_TYPE | ACCESS_DENIED_OBJECT_ACE_TYPE => {}
+                ACCESS_ALLOWED_ACE_TYPE => {
+                    let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                    let sid = &allowed.SidStart as *const u32 as PSID;
+                    if crate::services::grants_change(allowed.Mask)
+                        && !system_or_administrators(sid)
+                    {
+                        return false;
+                    }
+                }
+                // Conditional and object grants are never written by K3 Up; refuse them.
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+pub fn program_data() -> Result<PathBuf> {
+    known_folder(&FOLDERID_ProgramData)
+}
+
+pub fn program_files() -> Result<PathBuf> {
+    known_folder(&FOLDERID_ProgramFiles)
+}
+
+/// Asks the shell rather than reading environment variables, which the caller controls.
+fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf> {
+    let mut text: windows_sys::core::PWSTR = ptr::null_mut();
+    // SAFETY: id is a valid GUID; the returned string is freed with CoTaskMemFree below.
+    unsafe {
+        let result = SHGetKnownFolderPath(id, 0, ptr::null_mut(), &mut text);
+        let path = (result >= 0 && !text.is_null()).then(|| {
+            let mut length = 0;
+            while *text.add(length) != 0 {
+                length += 1;
+            }
+            PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(
+                text, length,
+            )))
+        });
+        CoTaskMemFree(text as *const core::ffi::c_void);
+        path.with_context(|| format!("Locate a system folder (error {result:#x})"))
+    }
 }
 
 /// Whether a file or directory belongs to SYSTEM or Administrators, the only owners the

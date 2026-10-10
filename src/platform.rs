@@ -23,7 +23,8 @@ pub fn default_data_dir() -> PathBuf {
 /// The data directory shared by every user, which services mode uses.
 #[cfg(windows)]
 pub fn machine_data_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into()))
+    crate::win32::program_data()
+        .unwrap_or_else(|_| r"C:\ProgramData".into())
         .join("K3 Up")
 }
 
