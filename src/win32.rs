@@ -12,7 +12,7 @@ use std::{
     sync::OnceLock,
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree},
+    Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE, LocalFree},
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
         Authorization::{
@@ -33,6 +33,10 @@ use windows_sys::Win32::{
     },
     System::{
         Com::CoTaskMemFree,
+        Registry::{
+            HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW,
+            RegGetValueW, RegSetKeyValueW,
+        },
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
     UI::Shell::{FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath},
@@ -523,6 +527,101 @@ fn pin_unlinked(path: &Path) -> Result<Pinned> {
         );
     }
     Ok(pinned)
+}
+
+/// The registry hives K3 Up writes to.
+#[derive(Debug, Clone, Copy)]
+pub enum Hive {
+    /// This user's settings, such as the login item.
+    CurrentUser,
+    /// Settings for the whole machine, which only administrators may change.
+    LocalMachine,
+}
+
+impl Hive {
+    fn handle(self) -> HKEY {
+        match self {
+            Hive::CurrentUser => HKEY_CURRENT_USER,
+            Hive::LocalMachine => HKEY_LOCAL_MACHINE,
+        }
+    }
+}
+
+/// A string value, or `None` when the key or the value is missing or not a string.
+pub fn registry_string(hive: Hive, key: &str, value: &str) -> Option<String> {
+    let key = wide(key.as_ref());
+    let value = wide(value.as_ref());
+    let mut bytes = 0u32;
+    // SAFETY: NUL-terminated names; a null buffer asks only for the size.
+    let status = unsafe {
+        RegGetValueW(
+            hive.handle(),
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+    // SAFETY: the buffer is at least `bytes` long, as reported by the first call.
+    let status = unsafe {
+        RegGetValueW(
+            hive.handle(),
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let length = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..length]))
+}
+
+/// Writes a string value, creating the key if needed.
+pub fn set_registry_string(hive: Hive, key: &str, value: &str, data: &str) -> Result<()> {
+    let key = wide(key.as_ref());
+    let value = wide(value.as_ref());
+    let data = wide(data.as_ref());
+    // SAFETY: all buffers are NUL-terminated and outlive the call.
+    let status = unsafe {
+        RegSetKeyValueW(
+            hive.handle(),
+            key.as_ptr(),
+            value.as_ptr(),
+            REG_SZ,
+            data.as_ptr().cast(),
+            (data.len() * 2) as u32,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32).into());
+    }
+    Ok(())
+}
+
+/// Deletes a value. A missing key or value is not an error.
+pub fn delete_registry_value(hive: Hive, key: &str, value: &str) -> Result<()> {
+    let key = wide(key.as_ref());
+    let value = wide(value.as_ref());
+    // SAFETY: NUL-terminated names that outlive the call.
+    let status = unsafe { RegDeleteKeyValueW(hive.handle(), key.as_ptr(), value.as_ptr()) };
+    if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
+        return Err(std::io::Error::from_raw_os_error(status as i32).into());
+    }
+    Ok(())
 }
 
 /// Whether this process runs with administrator rights.

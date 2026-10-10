@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 pub fn default_data_dir() -> PathBuf {
     #[cfg(windows)]
     if std::env::var_os("K3UP_DATA_DIR").is_none() {
-        let machine = machine_data_dir();
+        let registered = crate::services::registered();
+        // A directory set up before services mode was recorded in the registry has only its
+        // marker.
+        let machine = registered.unwrap_or_else(machine_data_dir);
         if crate::services::active(&machine) {
             return machine;
         }

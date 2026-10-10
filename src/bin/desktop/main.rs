@@ -46,7 +46,8 @@ fn main() -> iced::Result {
     let options = Options::parse();
     let managed = options.data_dir.is_none();
     let data = options.data_dir.unwrap_or_else(platform::default_data_dir);
-    let agent = desktop_agent(bundled_agent(), &data, services::active(&data));
+    let services_mode = services::machine_mode_on() || services::active(&data);
+    let agent = desktop_agent(bundled_agent(), &data, services_mode);
     if options.start_agent || options.register_agent {
         if let Some(login) = agent {
             // A reinstall must not undo a login item the user turned off.

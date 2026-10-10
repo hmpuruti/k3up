@@ -11,7 +11,7 @@ pub fn data_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     }
     #[cfg(windows)]
     {
-        Ok(k3up::platform::machine_data_dir())
+        Ok(k3up::services::registered().unwrap_or_else(k3up::platform::machine_data_dir))
     }
     #[cfg(not(windows))]
     {

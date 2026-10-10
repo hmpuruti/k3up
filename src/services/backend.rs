@@ -199,11 +199,16 @@ impl Backend {
         format!("{}{name}", self.settings.prefix)
     }
 
-    fn registration<'a>(&'a self, service: &'a str) -> scm::Registration<'a> {
+    fn registration<'a>(
+        &'a self,
+        service: &'a str,
+        instance: Option<&'a str>,
+    ) -> scm::Registration<'a> {
         scm::Registration {
             service,
             host: &self.settings.host,
             data: self.layout.root(),
+            instance,
         }
     }
 
@@ -363,8 +368,13 @@ impl Backend {
                 },
             );
         }
-        self.start_new(&steps)?;
-        Ok(Response::success(message))
+        let failed = self.start_new(&steps);
+        Ok(Response::success(
+            std::iter::once(message)
+                .chain(failed)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ))
     }
 
     /// Checks what can be checked before the first change, and records what each change
@@ -390,10 +400,16 @@ impl Backend {
                 } else {
                     None
                 };
+                // A workload keeps its instance; one that is new gets its own.
+                let instance = match &file {
+                    Some(bytes) => files::instance_in(bytes),
+                    None => Some(files::new_instance()),
+                };
                 Ok(Step {
                     change,
                     file,
                     service,
+                    instance,
                     written: false,
                     created: false,
                 })
@@ -413,10 +429,11 @@ impl Backend {
 
     fn save(&self, step: &mut Step) -> Result<()> {
         let workload = &step.change.workload;
-        write_definition(&self.layout.definition(&workload.name), workload)?;
+        let instance = step.instance.as_deref();
+        write_definition(&self.layout.definition(&workload.name), workload, instance)?;
         step.written = true;
         let service = self.service_name(&workload.name);
-        let registration = self.registration(&service);
+        let registration = self.registration(&service, instance);
         if step.service.is_some() {
             return scm::reconfigure(workload, &registration);
         }
@@ -458,32 +475,35 @@ impl Backend {
             Some(bytes) => {
                 files::write_atomic(&path, bytes, crate::win32::set_owner_to_administrators)
             }
-            None => match std::fs::remove_file(&path) {
-                Err(error) if error.kind() != ErrorKind::NotFound => {
-                    Err(error).with_context(|| format!("Delete {}", path.display()))
-                }
-                _ => Ok(()),
-            },
+            None => remove_if_present(&path),
         }
     }
 
-    /// New definitions can opt into starting right away, as they do with the agent.
-    fn start_new(&self, steps: &[Step]) -> Result<()> {
-        let failures: Vec<String> = steps
+    /// New definitions can opt into starting right away, as they do with the agent. As there,
+    /// the definitions are saved by then, so a start that fails is the workload's state, not a
+    /// failed apply; `k3up start NAME` tries again. Returns a line for each that failed.
+    fn start_new(&self, steps: &[Step]) -> Vec<String> {
+        steps
             .iter()
-            .map(|step| &step.change)
-            .filter(|change| change.previous.is_none() && status::starts_at_boot(&change.workload))
-            .filter_map(|change| {
-                let name = &change.workload.name;
-                let error = scm::start(&self.service_name(name)).err()?;
-                Some(format!("Created {name}, but it did not start: {error:#}"))
+            .filter(|step| {
+                step.change.previous.is_none() && status::starts_at_boot(&step.change.workload)
             })
-            .collect();
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(anyhow!(failures.join("\n")))
-        }
+            .filter_map(|step| {
+                let name = &step.change.workload.name;
+                let error = scm::start(&self.service_name(name)).err()?;
+                let reason = format!("Failed to start: {error:#}");
+                let failed = files::HostState {
+                    state: State::Failed,
+                    reason: reason.clone(),
+                    updated_at: Utc::now(),
+                    instance: step.instance.clone(),
+                    ..Default::default()
+                };
+                let _ = files::write_state(&self.layout.state(name), &failed);
+                self.event(name, &reason);
+                Some(format!("{name} failed to start: {error:#}"))
+            })
+            .collect()
     }
 
     fn remove(&self, name: &str) -> Result<Response> {
@@ -500,17 +520,16 @@ impl Backend {
         {
             bail!("Stop '{name}' before removing it");
         }
+        // Any user may hold the state file open, so it goes first: if it cannot, nothing has
+        // changed and the removal can be tried again.
+        let state = self.layout.state(name);
+        if let Err(error) = remove_if_present(&state) {
+            return Err(error.context(format!("{} is in use; try again", state.display())));
+        }
         if found.is_some() {
             scm::delete(&service)?;
         }
-        for file in [path, self.layout.state(name)] {
-            match std::fs::remove_file(&file) {
-                Err(error) if error.kind() != ErrorKind::NotFound => {
-                    return Err(error).with_context(|| format!("Delete {}", file.display()));
-                }
-                _ => {}
-            }
-        }
+        remove_if_present(&path)?;
         self.event(name, "Definition removed; log retained");
         Ok(Response::success(format!("Removed {name}")))
     }
@@ -532,7 +551,9 @@ impl Backend {
         };
         status::ensure_supported(&workload)?;
         if !exists {
-            scm::create(&workload, &self.registration(&service))?;
+            let instance = files::read_definition_and_instance(&self.layout.definition(name))?
+                .and_then(|(_, instance)| instance);
+            scm::create(&workload, &self.registration(&service, instance.as_deref()))?;
             self.event(name, "Windows service created again from the definition");
         }
         let requested = Utc::now();
@@ -584,10 +605,14 @@ impl Backend {
     /// state behind; the request to stop replaces it.
     fn record_stop(&self, name: &str) -> Result<()> {
         let path = self.layout.state(name);
-        let mut state = files::read_state(&path).unwrap_or_default();
+        let instance = scm::query(&self.service_name(name))?.and_then(|found| found.instance);
+        let mut state = files::read_state(&path)
+            .filter(|state| state.instance == instance)
+            .unwrap_or_default();
         if state.state == State::Stopped {
             return Ok(());
         }
+        state.instance = instance;
         state.state = State::Stopped;
         state.pid = None;
         state.reason = STOPPED.into();
@@ -638,6 +663,7 @@ struct Step {
     change: Change,
     file: Option<Vec<u8>>,
     service: Option<scm::Snapshot>,
+    instance: Option<String>,
     written: bool,
     created: bool,
 }
@@ -664,9 +690,18 @@ fn refuse_unprotected(folder: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != ErrorKind::NotFound => {
+            Err(error).with_context(|| format!("Delete {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Owned by Administrators, which the host requires before it trusts a definition.
-fn write_definition(path: &Path, workload: &Workload) -> Result<()> {
-    let text = files::definition_text(workload)?;
+fn write_definition(path: &Path, workload: &Workload, instance: Option<&str>) -> Result<()> {
+    let text = files::definition_text(workload, instance)?;
     files::write_atomic(
         path,
         text.as_bytes(),

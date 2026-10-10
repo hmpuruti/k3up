@@ -135,6 +135,65 @@ pub fn refuse_user_agent(registration: Registration, running: bool) -> Result<()
     )
 }
 
+/// Where `services enable` records, for the whole machine, the one data directory services
+/// mode uses. Service names are machine-wide, so a second directory would fight over them.
+pub const REGISTRY_KEY: &str = r"SOFTWARE\K3 Up";
+pub const REGISTRY_VALUE: &str = "ServicesData";
+
+/// The data directory services mode is on for, as recorded for the whole machine.
+pub fn registered() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        crate::win32::registry_string(
+            crate::win32::Hive::LocalMachine,
+            REGISTRY_KEY,
+            REGISTRY_VALUE,
+        )
+        .filter(|path| !path.is_empty())
+        .map(Into::into)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Whether services mode is on anywhere on this machine: recorded in the registry, or, for a
+/// directory set up before that record existed, marked in the default machine directory.
+pub fn machine_mode_on() -> bool {
+    #[cfg(windows)]
+    {
+        registered().is_some() || active(&crate::platform::machine_data_dir())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Refuses services mode for `requested` while it is on for another directory.
+pub fn check_registration(registered: Option<&Path>, requested: &Path) -> Result<()> {
+    match registered {
+        Some(registered) if !same_path(registered, requested) => anyhow::bail!(
+            "Services mode already uses {}. Run `k3up services disable` there first.",
+            registered.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Windows paths ignore case and a trailing separator.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let plain = |path: &Path| {
+        std::path::absolute(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
+    plain(a) == plain(b)
+}
+
 /// Whether `data` is in services mode and protected.
 pub fn active(data: &Path) -> bool {
     matches!(check(data), Ok(true))
@@ -143,6 +202,7 @@ pub fn active(data: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn read_and_execute_rights_are_not_changes() {
@@ -239,6 +299,34 @@ mod tests {
         assert!(!keeps_children_in_place(&[Ace::Unknown {
             inherit_only: false
         }]));
+    }
+
+    #[test]
+    fn services_mode_keeps_to_one_data_directory() {
+        let base = std::env::temp_dir();
+        let first = base.join("K3 Up");
+        check_registration(None, &first).unwrap();
+        check_registration(Some(&first), &first).unwrap();
+        let same = PathBuf::from(format!(
+            "{}{}",
+            first.to_string_lossy().to_uppercase(),
+            std::path::MAIN_SEPARATOR
+        ));
+        check_registration(Some(&first), &same).unwrap();
+        let error = check_registration(Some(&first), &base.join("Other"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "Services mode already uses {}. Run `k3up services disable` there first.",
+                first.display()
+            )
+        );
+        if cfg!(not(windows)) {
+            assert!(!machine_mode_on());
+            assert_eq!(registered(), None);
+        }
     }
 
     #[test]

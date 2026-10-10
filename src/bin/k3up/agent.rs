@@ -93,14 +93,7 @@ fn check_install(managed: bool, services_mode: bool, data: &Path) -> Result<()> 
 }
 
 fn services_mode() -> bool {
-    #[cfg(windows)]
-    {
-        k3up::services::active(&platform::machine_data_dir())
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    k3up::services::machine_mode_on()
 }
 
 pub fn install(client: &Client) -> Result<Response> {
@@ -134,6 +127,9 @@ pub fn uninstall(client: &Client, timeout: u64) -> Result<Response> {
 }
 
 pub fn start(client: &Client) -> Result<Response> {
+    if managed(client) {
+        check_install(true, services_mode(), &client.data_dir)?;
+    }
     let login = login(client)?;
     if login.is_running() {
         let info = wait_until_answering(client)?;

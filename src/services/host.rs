@@ -39,12 +39,14 @@ const POLL: Duration = Duration::from_millis(250);
 const ROTATE_EVERY: Duration = Duration::from_secs(10);
 const PENDING_LIMIT: usize = 100;
 
-static TARGET: OnceLock<(PathBuf, String)> = OnceLock::new();
+static TARGET: OnceLock<(PathBuf, String, Option<String>)> = OnceLock::new();
 define_windows_service!(ffi_main, service_main);
 
-pub fn run(data: PathBuf, workload: String) -> Result<()> {
+/// `instance` is the definition's instance, recorded in every report so that one left by an
+/// earlier workload of the same name is told apart.
+pub fn run(data: PathBuf, workload: String, instance: Option<String>) -> Result<()> {
     TARGET
-        .set((data, workload))
+        .set((data, workload, instance))
         .map_err(|_| anyhow!("Host already initialized"))?;
     service_dispatcher::start("K3Up", ffi_main)
         .context("k3up-host runs only when the Windows service manager starts it")
@@ -63,7 +65,7 @@ pub fn explain_exit(code: Option<u32>) -> String {
 }
 
 fn service_main(arguments: Vec<OsString>) {
-    let Some((data, workload)) = TARGET.get() else {
+    let Some((data, workload, instance)) = TARGET.get() else {
         return;
     };
     // The service manager passes the service's own name first.
@@ -86,7 +88,10 @@ fn service_main(arguments: Vec<OsString>) {
         layout: Layout::new(data),
         name: workload.clone(),
         handle,
-        state: HostState::default(),
+        state: HostState {
+            instance: instance.clone(),
+            ..HostState::default()
+        },
         checkpoint: 0,
         pending: vec![],
     };

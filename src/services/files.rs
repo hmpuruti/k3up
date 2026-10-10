@@ -11,6 +11,7 @@ use std::{
 };
 
 pub const MARKER: &str = "services-mode";
+const INSTANCE: &str = "instance";
 /// The most of a state, definition or event file that is read.
 const READ_LIMIT: u64 = 1024 * 1024;
 /// How long recording an event waits for another writer before giving up.
@@ -83,6 +84,9 @@ pub struct HostState {
     pub last_exit: Option<i32>,
     pub reason: String,
     pub updated_at: DateTime<Utc>,
+    /// The instance of the definition the report is about. A report whose instance differs
+    /// from the service's was left by an earlier workload of the same name.
+    pub instance: Option<String>,
 }
 
 /// Replaces `path` in one step, so readers never see a partly written file. `prepare` runs on
@@ -158,8 +162,35 @@ fn rename(from: &Path, to: &Path) -> Result<()> {
     }
 }
 
-pub fn definition_text(workload: &Workload) -> Result<String> {
-    Ok(toml::to_string_pretty(workload)?)
+/// The definition file: the workload, after its `instance` when it has one. The key comes
+/// first because TOML keys after a table would belong to that table.
+pub fn definition_text(workload: &Workload, instance: Option<&str>) -> Result<String> {
+    let text = toml::to_string_pretty(workload)?;
+    Ok(match instance {
+        Some(instance) => format!("{INSTANCE} = {:?}\n{text}", instance),
+        None => text,
+    })
+}
+
+/// A new identity for a workload created under a name, so a state file left behind by an
+/// earlier workload of that name is never taken for its own.
+pub fn new_instance() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    // RandomState is seeded randomly for each process.
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos()),
+    );
+    hasher.write_u32(std::process::id());
+    format!("{:016x}", hasher.finish())
+}
+
+/// The instance recorded in a definition file's text, if any.
+pub fn instance_in(text: &[u8]) -> Option<String> {
+    let table: toml::Table = toml::from_str(std::str::from_utf8(text).ok()?).ok()?;
+    table.get(INSTANCE)?.as_str().map(str::to_string)
 }
 
 /// Reads a whole file, refusing one larger than `READ_LIMIT`, so a huge or corrupt file
@@ -202,6 +233,11 @@ fn read_tail(path: &Path) -> std::io::Result<(String, bool)> {
 /// `None` when there is no definition. Unreadable definitions are errors, so callers can tell
 /// a missing definition from one they may not read.
 pub fn read_definition(path: &Path) -> Result<Option<Workload>> {
+    Ok(read_definition_and_instance(path)?.map(|(workload, _)| workload))
+}
+
+/// The definition and its instance, which definitions written before instances existed lack.
+pub fn read_definition_and_instance(path: &Path) -> Result<Option<(Workload, Option<String>)>> {
     let text = match read_bounded(path) {
         Ok(text) => text,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -213,11 +249,20 @@ pub fn read_definition(path: &Path) -> Result<Option<Workload>> {
 /// Reads a definition from a file already opened, so the checks made on that handle apply.
 pub fn definition_from(file: File, path: &Path) -> Result<Workload> {
     let text = read_bounded_from(file).with_context(|| format!("Read {}", path.display()))?;
-    parse_definition(&text, path)
+    parse_definition(&text, path).map(|(workload, _)| workload)
 }
 
-fn parse_definition(text: &str, path: &Path) -> Result<Workload> {
-    toml::from_str(text).with_context(|| format!("Invalid definition {}", path.display()))
+fn parse_definition(text: &str, path: &Path) -> Result<(Workload, Option<String>)> {
+    let parsed = || -> Result<(Workload, Option<String>)> {
+        let mut table: toml::Table = toml::from_str(text)?;
+        let instance = match table.remove(INSTANCE) {
+            Some(toml::Value::String(instance)) => Some(instance),
+            Some(_) => anyhow::bail!("{INSTANCE} must be a string"),
+            None => None,
+        };
+        Ok((toml::Value::Table(table).try_into()?, instance))
+    };
+    parsed().with_context(|| format!("Invalid definition {}", path.display()))
 }
 
 /// The names of the files in `dir` with the given extension, sorted. A missing folder is empty.
@@ -512,7 +557,11 @@ mod tests {
                 let layout = layout.clone();
                 std::thread::spawn(move || {
                     for index in 0..50 {
-                        append_event(&layout, &format!("w{writer}"), &index.to_string()).unwrap();
+                        // The host keeps an event it could not write in time and tries
+                        // again; so does this writer.
+                        while append_event(&layout, &format!("w{writer}"), &index.to_string())
+                            .is_err()
+                        {}
                     }
                 })
             })
@@ -672,8 +721,21 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(read_definition(&layout.definition("web")).unwrap(), None);
-        let text = definition_text(&workload).unwrap();
+        let text = definition_text(&workload, None).unwrap();
         write_atomic(&layout.definition("web"), text.as_bytes(), |_| Ok(())).unwrap();
+        assert_eq!(
+            read_definition_and_instance(&layout.definition("web")).unwrap(),
+            Some((workload.clone(), None))
+        );
+        let instance = new_instance();
+        assert_ne!(instance, new_instance());
+        let text = definition_text(&workload, Some(&instance)).unwrap();
+        assert_eq!(instance_in(text.as_bytes()), Some(instance.clone()));
+        write_atomic(&layout.definition("web"), text.as_bytes(), |_| Ok(())).unwrap();
+        assert_eq!(
+            read_definition_and_instance(&layout.definition("web")).unwrap(),
+            Some((workload.clone(), Some(instance)))
+        );
         assert_eq!(
             read_definition(&layout.definition("web")).unwrap(),
             Some(workload)

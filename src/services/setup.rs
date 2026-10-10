@@ -64,6 +64,7 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
             data.display()
         );
     }
+    super::check_registration(super::registered().as_deref(), data)?;
     let _lock = lock_if_prepared(data)?;
     let target = install_dir()?;
     let sources = program_sources(&target)?;
@@ -85,10 +86,25 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
         },
         || {
             prepare(data)?;
+            register(data)?;
             Ok(vec![format!("Services mode is on for {}", data.display())])
         },
     )
     .context("Turning services mode on did not finish")
+}
+
+/// Records `data` for the whole machine as the one services mode directory. Only `enable`
+/// and `disable` touch this record; the tests, which use their own service name prefix and
+/// data directories, call `prepare` instead and leave it alone.
+fn register(data: &Path) -> Result<()> {
+    let data = std::path::absolute(data)?;
+    crate::win32::set_registry_string(
+        crate::win32::Hive::LocalMachine,
+        super::REGISTRY_KEY,
+        super::REGISTRY_VALUE,
+        &data.to_string_lossy(),
+    )
+    .context("Record the services mode data directory in the registry")
 }
 
 /// The lock that commands changing services hold, once a protected folder exists to hold it.
@@ -205,6 +221,15 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 pub fn disable(data: &Path) -> Result<String> {
     let settings = Settings::from_env()?;
+    if let Some(registered) = super::registered() {
+        super::check_registration(Some(data), &registered).map_err(|_| {
+            anyhow!(
+                "Services mode uses {}. Turn it off there with --data-dir \"{}\"",
+                registered.display(),
+                registered.display()
+            )
+        })?;
+    }
     let _lock = lock_if_prepared(data)?;
     let services = scm::list(&settings.prefix)?;
     if !services.is_empty() {
@@ -224,6 +249,12 @@ pub fn disable(data: &Path) -> Result<String> {
         }
         _ => {}
     }
+    crate::win32::delete_registry_value(
+        crate::win32::Hive::LocalMachine,
+        super::REGISTRY_KEY,
+        super::REGISTRY_VALUE,
+    )
+    .context("Remove the services mode record from the registry")?;
     Ok(format!(
         "Services mode is off. Definitions, logs and history are kept in {}",
         data.display()

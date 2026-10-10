@@ -44,10 +44,11 @@ fn fixture() {
 }
 
 /// A temporary folder whose ancestors only administrators may move, as services mode requires:
-/// inside ProgramData rather than a user profile.
+/// inside ProgramData rather than a user profile. Users may read it, as they may read
+/// ProgramData, so that they can check those ancestors too.
 fn protected_temp_dir() -> tempfile::TempDir {
     let base = k3up::win32::program_data().unwrap().join("K3UpTests");
-    if let Err(error) = k3up::win32::create_dir_with(&base, k3up::win32::PRIVATE_DIR_SDDL) {
+    if let Err(error) = k3up::win32::create_dir_with(&base, k3up::win32::SHARED_DIR_SDDL) {
         assert!(base.is_dir(), "{error:#}");
     }
     let dir = tempfile::tempdir_in(&base).unwrap();
@@ -1282,4 +1283,123 @@ fn a_data_directory_below_a_folder_users_control_is_refused() {
         error.ends_with("is not protected; services mode refuses it. Remove it and run `k3up services enable` from an elevated terminal"),
         "{error}"
     );
+}
+
+#[test]
+fn machine_settings_round_trip_through_the_registry() {
+    use k3up::win32::{Hive, delete_registry_value, registry_string, set_registry_string};
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    // Its own key, so the record `services enable` keeps is never touched.
+    let key = format!(r"SOFTWARE\K3 Up Test\{}", machine.prefix);
+    let value = k3up::services::REGISTRY_VALUE;
+    assert_eq!(registry_string(Hive::LocalMachine, &key, value), None);
+    let data = machine.data.to_string_lossy().into_owned();
+    set_registry_string(Hive::LocalMachine, &key, value, &data).unwrap();
+    assert_eq!(registry_string(Hive::LocalMachine, &key, value), Some(data));
+    delete_registry_value(Hive::LocalMachine, &key, value).unwrap();
+    delete_registry_value(Hive::LocalMachine, &key, value).unwrap();
+    assert_eq!(registry_string(Hive::LocalMachine, &key, value), None);
+    let _ = std::process::Command::new("reg.exe")
+        .args(["delete", &format!(r"HKLM\{key}"), "/f"])
+        .output();
+}
+
+#[test]
+fn a_new_service_that_fails_to_start_is_still_applied() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let broken = Backend::with(
+        &machine.data,
+        Settings {
+            prefix: machine.prefix.clone(),
+            host: machine.data.join("missing-host.exe"),
+        },
+    );
+    let mut boot = machine.workload("boothost", "pulse");
+    boot.start_at_boot = true;
+    let manifest = Manifest {
+        version: 1,
+        workloads: vec![boot],
+    };
+    let apply = || {
+        broken
+            .handle(Command::Apply {
+                manifest: manifest.clone(),
+                dry_run: false,
+            })
+            .unwrap()
+    };
+    let applied = apply();
+    assert!(applied.ok, "{}", applied.message);
+    assert!(
+        applied
+            .message
+            .starts_with("Create boothost\nboothost failed to start: "),
+        "{}",
+        applied.message
+    );
+    let status = machine.get("boothost");
+    assert_eq!(status.state, State::Failed, "{status:?}");
+    assert!(status.reason.starts_with("Failed to start: "), "{status:?}");
+    assert_eq!(apply().message, "No changes");
+}
+
+#[test]
+fn a_busy_state_file_keeps_the_workload_until_remove_can_finish() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let mut busy = machine.workload("busy", "exit");
+    busy.restart = Restart::Never;
+    assert!(machine.put(busy).ok);
+    let _ = machine.send(Command::Start {
+        name: "busy".into(),
+    });
+    machine.until("busy", |status| status.state == State::Failed);
+    let state = machine.data.join("state").join("busy.json");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&state)
+        .unwrap();
+    let refused = machine.send(Command::Remove {
+        name: "busy".into(),
+    });
+    assert!(!refused.ok);
+    assert!(
+        refused
+            .message
+            .starts_with(&format!("{} is in use; try again", state.display())),
+        "{}",
+        refused.message
+    );
+    assert!(scm::exists(&machine.service("busy")).unwrap());
+    assert!(machine.data.join("workloads").join("busy.toml").exists());
+
+    drop(held);
+    machine.ok(Command::Remove {
+        name: "busy".into(),
+    });
+    assert!(!scm::exists(&machine.service("busy")).unwrap());
+    assert!(!state.exists());
+
+    // A new workload of the same name never shows a report left by the old one.
+    std::fs::write(
+        &state,
+        serde_json::to_vec(&files::HostState {
+            state: State::Failed,
+            reason: "left behind".into(),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(machine.put(machine.workload("busy", "pulse")).ok);
+    let fresh = machine.get("busy");
+    assert_eq!(fresh.state, State::Stopped, "{fresh:?}");
+    assert_ne!(fresh.reason, "left behind");
 }

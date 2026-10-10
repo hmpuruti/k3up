@@ -1,5 +1,5 @@
 //! The Windows service manager calls that services mode needs.
-use super::status::{Scm, Service, description, display_name, starts_at_boot};
+use super::status::{Scm, Service, description, display_name, instance_of, starts_at_boot};
 use crate::model::Workload;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -41,6 +41,8 @@ pub struct Registration<'a> {
     pub service: &'a str,
     pub host: &'a Path,
     pub data: &'a Path,
+    /// Passed to the host, which records it in its reports.
+    pub instance: Option<&'a str>,
 }
 
 fn os_error(error: &windows_service::Error) -> Option<u32> {
@@ -99,6 +101,7 @@ pub fn query(service: &str) -> Result<Option<Service>> {
         display_name: config.display_name.to_string_lossy().into_owned(),
         scm: scm_state(status.current_state),
         host_pid: status.process_id.filter(|pid| *pid != 0),
+        instance: instance_of(&config.executable_path.to_string_lossy()),
     }))
 }
 
@@ -194,10 +197,11 @@ pub fn list(prefix: &str) -> Result<Vec<Service>> {
                     _ => Scm::Running,
                 },
                 host_pid: Some(process.dwProcessId).filter(|pid| *pid != 0),
+                instance: None,
             });
         }
         if done {
-            return Ok(found);
+            return Ok(with_instances(found));
         }
         if error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
             return Err(error).context("List services");
@@ -206,6 +210,21 @@ pub fn list(prefix: &str) -> Result<Vec<Service>> {
             buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>()) + 1];
         }
     }
+}
+
+/// Listing gives no command lines, so each service is asked for its own. One that vanished
+/// meanwhile keeps no instance.
+fn with_instances(services: Vec<Service>) -> Vec<Service> {
+    services
+        .into_iter()
+        .map(|service| Service {
+            instance: query(&service.name)
+                .ok()
+                .flatten()
+                .and_then(|found| found.instance),
+            ..service
+        })
+        .collect()
 }
 
 /// # Safety
@@ -246,12 +265,19 @@ fn info(workload: &Workload, at: &Registration) -> ServiceInfo {
         },
         error_control: ServiceErrorControl::Normal,
         executable_path: at.host.to_path_buf(),
-        launch_arguments: vec![
+        launch_arguments: [
             "--data-dir".into(),
             plain(at.data).into_os_string(),
             "--workload".into(),
             OsString::from(&workload.name),
-        ],
+        ]
+        .into_iter()
+        .chain(
+            at.instance
+                .into_iter()
+                .flat_map(|instance| ["--instance".into(), OsString::from(instance)]),
+        )
+        .collect(),
         dependencies: vec![],
         account_name: None,
         account_password: None,

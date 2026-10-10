@@ -21,6 +21,16 @@ pub struct Service {
     pub display_name: String,
     pub scm: Scm,
     pub host_pid: Option<u32>,
+    /// The definition's instance, from the host's command line, which any user may read.
+    pub instance: Option<String>,
+}
+
+/// The value after `--instance` in a service's command line. Instances are hexadecimal, so
+/// they need no quoting.
+pub fn instance_of(command_line: &str) -> Option<String> {
+    let mut words = command_line.split_whitespace();
+    words.find(|word| *word == "--instance")?;
+    words.next().map(|word| word.trim_matches('"').to_string())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +100,8 @@ pub fn status(
     service: Option<&Service>,
     host: Option<HostState>,
 ) -> Status {
+    // A report from an earlier workload of the same name says nothing about this one.
+    let host = host.filter(|host| service.is_none_or(|service| service.instance == host.instance));
     let workload = match &definition {
         Definition::Present(workload) => (**workload).clone(),
         _ => Workload {
@@ -201,7 +213,53 @@ mod tests {
             display_name: display_name(&web()),
             scm,
             host_pid,
+            instance: None,
         }
+    }
+
+    #[test]
+    fn a_report_from_another_instance_is_ignored() {
+        let present = || Definition::Present(Box::new(web()));
+        let mut current = service(Scm::Stopped, None);
+        current.instance = Some("b2".into());
+        let mut stale = report(State::Failed, 9);
+        stale.instance = Some("a1".into());
+        let fresh = status("web", present(), Some(&current), Some(stale.clone()));
+        assert_eq!(fresh.state, State::Stopped);
+        assert_eq!(fresh.reason, "Stopped");
+        assert_eq!(fresh.restart_count, 0);
+
+        stale.instance = Some("b2".into());
+        let own = status("web", present(), Some(&current), Some(stale.clone()));
+        assert_eq!(own.state, State::Failed);
+
+        // Without instances on either side, as before they existed, the report applies.
+        current.instance = None;
+        stale.instance = None;
+        assert_eq!(
+            status("web", present(), Some(&current), Some(stale.clone())).state,
+            State::Failed
+        );
+        // A service without an instance never takes a report that has one.
+        stale.instance = Some("b2".into());
+        assert_eq!(
+            status("web", present(), Some(&current), Some(stale)).state,
+            State::Stopped
+        );
+    }
+
+    #[test]
+    fn the_instance_comes_from_the_command_line() {
+        assert_eq!(
+            instance_of(
+                r#""C:\Program Files\K3 Up\k3up-host.exe" --data-dir "C:\ProgramData\K3 Up" --workload web --instance 0a1b2c"#
+            ),
+            Some("0a1b2c".into())
+        );
+        assert_eq!(
+            instance_of(r#""C:\k3up-host.exe" --data-dir C:\data --workload web"#),
+            None
+        );
     }
 
     fn report(state: State, host_pid: u32) -> HostState {
