@@ -7,6 +7,10 @@ pub fn default_data_dir() -> PathBuf {
     }
     #[cfg(windows)]
     {
+        let machine = machine_data_dir();
+        if crate::services::active(&machine) {
+            return machine;
+        }
         PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_else(|| ".".into())).join("K3 Up")
     }
     #[cfg(not(windows))]
@@ -14,6 +18,13 @@ pub fn default_data_dir() -> PathBuf {
         PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
             .join(".local/share/k3up")
     }
+}
+
+/// The data directory shared by every user, which services mode uses.
+#[cfg(windows)]
+pub fn machine_data_dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into()))
+        .join("K3 Up")
 }
 
 pub fn prepare_dir(path: &Path) -> Result<PathBuf> {

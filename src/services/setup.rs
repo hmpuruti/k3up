@@ -1,0 +1,172 @@
+//! Turning services mode on and off for a data directory.
+use super::{
+    backend::{Backend, Settings},
+    files::Layout,
+    scm,
+    status::Scm,
+};
+use crate::win32::{PRIVATE_DIR_SDDL, ROOT_DIR_SDDL, SHARED_DIR_SDDL, secure_dir};
+use anyhow::{Context, Result, bail};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+/// Copied to Program Files from the folder of the running k3up.exe. The host is required.
+const PROGRAMS: [&str; 3] = ["k3up-host.exe", "k3up.exe", "k3up-desktop.exe"];
+const CENTRAL_AGENT: &str = "K3Up";
+
+pub fn install_dir() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(std::env::var_os("ProgramFiles").context("ProgramFiles is not set")?)
+            .join("K3 Up"),
+    )
+}
+
+/// Creates or secures the data directory and its folders, then writes the marker. Safe to
+/// repeat.
+pub fn prepare(data: &Path) -> Result<()> {
+    let layout = Layout::new(data);
+    secure_dir(data, ROOT_DIR_SDDL)?;
+    for (folder, sddl) in [
+        (layout.workloads(), PRIVATE_DIR_SDDL),
+        (layout.logs(), PRIVATE_DIR_SDDL),
+        (layout.states(), SHARED_DIR_SDDL),
+        (layout.events_dir(), SHARED_DIR_SDDL),
+    ] {
+        secure_dir(&folder, sddl)?;
+    }
+    std::fs::write(layout.marker(), b"")
+        .with_context(|| format!("Write {}", layout.marker().display()))
+}
+
+pub fn enable(data: &Path) -> Result<Vec<String>> {
+    let settings = Settings::from_env()?;
+    if scm::exists(CENTRAL_AGENT)? {
+        bail!(
+            "The K3 Up agent service is installed. Run `k3up agent uninstall-service` first, then enable services mode"
+        );
+    }
+    let mut lines = install_programs(&settings.prefix)?;
+    prepare(data)?;
+    lines.push(format!("Services mode is on for {}", data.display()));
+    Ok(lines)
+}
+
+/// Copies the programs into Program Files. Running services lock the host, so they are
+/// stopped for the copy and started again afterwards.
+fn install_programs(prefix: &str) -> Result<Vec<String>> {
+    let source = std::env::current_exe()?
+        .parent()
+        .context("Locate the folder of k3up.exe")?
+        .to_path_buf();
+    let target = install_dir()?;
+    if !source.join(PROGRAMS[0]).is_file() {
+        bail!("Place k3up-host.exe beside k3up.exe");
+    }
+    if same_dir(&source, &target) {
+        return Ok(vec![format!(
+            "Programs are already in {}",
+            target.display()
+        )]);
+    }
+    let running: Vec<String> = scm::list(prefix)?
+        .into_iter()
+        .filter(|service| matches!(service.scm, Scm::Running | Scm::Starting))
+        .map(|service| service.name)
+        .collect();
+    let mut lines = vec![];
+    for service in &running {
+        scm::stop(service, Duration::from_secs(90))?;
+        lines.push(format!("Stopped {service}"));
+    }
+    let copied = copy_programs(&source, &target);
+    for service in &running {
+        match scm::start(service) {
+            Ok(()) => lines.push(format!("Started {service}")),
+            Err(error) => lines.push(format!("Could not start {service}: {error:#}")),
+        }
+    }
+    lines.extend(copied?);
+    Ok(lines)
+}
+
+fn copy_programs(source: &Path, target: &Path) -> Result<Vec<String>> {
+    if !target.exists() {
+        // Inherits the Program Files ACL, which lets only administrators write.
+        std::fs::create_dir(target).with_context(|| format!("Create {}", target.display()))?;
+    }
+    let mut lines = vec![];
+    for program in PROGRAMS {
+        let from = source.join(program);
+        if from.is_file() {
+            let to = target.join(program);
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("Copy {program} to {}", to.display()))?;
+            lines.push(format!("Copied {program} to {}", target.display()));
+        }
+    }
+    Ok(lines)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+pub fn disable(data: &Path) -> Result<String> {
+    let settings = Settings::from_env()?;
+    let services = scm::list(&settings.prefix)?;
+    if !services.is_empty() {
+        let names: Vec<String> = services
+            .iter()
+            .map(|service| format!("  {}", service.name))
+            .collect();
+        bail!(
+            "Remove these workloads first, with `k3up remove NAME --stop`:\n{}",
+            names.join("\n")
+        );
+    }
+    let marker = Layout::new(data).marker();
+    match std::fs::remove_file(&marker) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| format!("Delete {}", marker.display()));
+        }
+        _ => {}
+    }
+    Ok(format!(
+        "Services mode is off. Definitions, logs and history are kept in {}",
+        data.display()
+    ))
+}
+
+pub struct Summary {
+    pub enabled: bool,
+    pub data: PathBuf,
+    pub host: PathBuf,
+    pub host_present: bool,
+    pub counts: BTreeMap<String, usize>,
+}
+
+pub fn summary(data: &Path) -> Result<Summary> {
+    let enabled = super::active(data);
+    let settings = Settings::from_env()?;
+    let mut counts = BTreeMap::new();
+    if enabled {
+        let response =
+            Backend::with(data, settings.clone()).handle(crate::protocol::Command::List)?;
+        for status in response.workloads {
+            *counts.entry(status.state.to_string()).or_default() += 1;
+        }
+    }
+    Ok(Summary {
+        enabled,
+        data: data.to_path_buf(),
+        host_present: settings.host.is_file(),
+        host: settings.host,
+        counts,
+    })
+}

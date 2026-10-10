@@ -169,6 +169,18 @@ impl Drop for Monitor {
     }
 }
 
+/// One sample without a background sampler, for callers with no agent: two measurements a
+/// moment apart give current rates. There is no history and no agent usage.
+pub fn sample_once(data: PathBuf, roster: &[(String, u32)]) -> Metrics {
+    let mut sampler = Sampler::new(data);
+    sampler.sample(roster);
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(Duration::from_millis(250)));
+    let mut metrics = sampler.sample(roster);
+    metrics.agent = Usage::default();
+    metrics.history.clear();
+    metrics
+}
+
 struct Sampler {
     data: PathBuf,
     system: System,
@@ -612,6 +624,20 @@ mod tests {
         assert!(!data.starts_with(&volume_key(r"C:\Use")));
         let share = volume_key(r"\\?\UNC\server\share\k3up");
         assert!(share.starts_with(&volume_key(r"\\server\share\")));
+    }
+
+    #[test]
+    fn one_off_samples_have_no_history_or_agent() {
+        let data = tempfile::tempdir().unwrap();
+        let metrics = sample_once(
+            data.path().to_path_buf(),
+            &[("self".into(), std::process::id())],
+        );
+        assert!(metrics.history.is_empty());
+        assert_eq!(metrics.agent, Usage::default());
+        assert_eq!(metrics.workloads[0].pids[0], std::process::id());
+        assert!(metrics.workloads[0].usage.memory > 0);
+        assert!(metrics.machine.memory_total > 0);
     }
 
     #[test]
