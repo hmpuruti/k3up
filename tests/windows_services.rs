@@ -12,7 +12,6 @@ use k3up::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicU32, Ordering},
@@ -782,59 +781,28 @@ fn every_user_may_read_the_marker_and_only_administrators_change_it() {
     assert_eq!(marker_security(&machine.data).1, USERS_READ);
 }
 
-/// Runs k3up as this account with its administrator rights turned off, as a standard user
-/// would run it. Returns whether it succeeded, then its output and its errors.
-fn cli_as_standard_user(machine: &Machine, arguments: &[&str]) -> (bool, String, String) {
-    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+/// Runs `read` on this thread as this account with its administrator rights turned off, as a
+/// standard user would. Impersonating keeps the window station of a CI service session out of
+/// the way, which a separate process could not open with the Administrators group disabled.
+fn as_standard_user<T>(read: impl FnOnce() -> T) -> T {
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},
+        Foundation::{CloseHandle, HANDLE},
         Security::{
             CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
-            SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-            TOKEN_QUERY, WinBuiltinAdministratorsSid,
+            ImpersonateLoggedOnUser, RevertToSelf, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+            TOKEN_DUPLICATE, TOKEN_QUERY, WinBuiltinAdministratorsSid,
         },
-        System::Threading::{
-            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
-            GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-            STARTUPINFOW, WaitForSingleObject,
-        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
-    let dir = tempfile::tempdir().unwrap();
-    let stdout = std::fs::File::create(dir.path().join("stdout")).unwrap();
-    let stderr = std::fs::File::create(dir.path().join("stderr")).unwrap();
-    let mut line = format!("\"{CLI}\" --data-dir \"{}\" --json", machine.data.display());
-    for argument in arguments {
-        line.push_str(&format!(" \"{argument}\""));
-    }
-    let mut line: Vec<u16> = OsStr::new(&line).encode_wide().chain(Some(0)).collect();
-    let overrides = [
-        ("K3UP_SERVICE_PREFIX", machine.prefix.as_str()),
-        ("K3UP_HOST", HOST),
-    ];
-    let inherited = std::env::vars_os().filter(|(key, _)| {
-        !overrides
-            .iter()
-            .any(|(name, _)| key.eq_ignore_ascii_case(name))
-    });
-    let added = overrides.map(|(key, value)| (OsString::from(key), OsString::from(value)));
-    let mut environment = vec![];
-    for (key, value) in inherited.chain(added) {
-        environment.extend(key.encode_wide());
-        environment.push(u16::from(b'='));
-        environment.extend(value.encode_wide());
-        environment.push(0);
-    }
-    environment.push(0);
-    let mut code = 1;
-    // SAFETY: every pointer refers to a live, initialized buffer for its call, and each handle
-    // is closed once the process has ended.
+    let mut token: HANDLE = ptr::null_mut();
+    let mut restricted: HANDLE = ptr::null_mut();
+    // SAFETY: every pointer refers to a live, initialized buffer for its call.
     unsafe {
-        let mut token: HANDLE = ptr::null_mut();
         assert_ne!(
             OpenProcessToken(
                 GetCurrentProcess(),
-                TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
-                &mut token,
+                TOKEN_DUPLICATE | TOKEN_QUERY,
+                &mut token
             ),
             0
         );
@@ -853,7 +821,6 @@ fn cli_as_standard_user(machine: &Machine, arguments: &[&str]) -> (bool, String,
             Sid: sid.as_mut_ptr().cast(),
             Attributes: 0,
         };
-        let mut restricted: HANDLE = ptr::null_mut();
         assert_ne!(
             CreateRestrictedToken(
                 token,
@@ -870,48 +837,21 @@ fn cli_as_standard_user(machine: &Machine, arguments: &[&str]) -> (bool, String,
             "{}",
             std::io::Error::last_os_error()
         );
-        for file in [&stdout, &stderr] {
-            let handle = file.as_raw_handle() as HANDLE;
-            assert_ne!(
-                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT),
-                0
-            );
-        }
-        let startup = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdOutput: stdout.as_raw_handle() as HANDLE,
-            hStdError: stderr.as_raw_handle() as HANDLE,
-            ..Default::default()
-        };
-        let mut process = PROCESS_INFORMATION::default();
         assert_ne!(
-            CreateProcessAsUserW(
-                restricted,
-                ptr::null(),
-                line.as_mut_ptr(),
-                ptr::null(),
-                ptr::null(),
-                1,
-                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                environment.as_ptr().cast(),
-                ptr::null(),
-                &startup,
-                &mut process,
-            ),
+            ImpersonateLoggedOnUser(restricted),
             0,
             "{}",
             std::io::Error::last_os_error()
         );
-        WaitForSingleObject(process.hProcess, 120_000);
-        GetExitCodeProcess(process.hProcess, &mut code);
-        for handle in [process.hThread, process.hProcess, restricted, token] {
-            CloseHandle(handle);
-        }
     }
-    drop((stdout, stderr));
-    let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
-    (code == 0, read("stdout"), read("stderr"))
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read));
+    // SAFETY: ends the impersonation started above and closes the handles opened above.
+    unsafe {
+        RevertToSelf();
+        CloseHandle(restricted);
+        CloseHandle(token);
+    }
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 #[test]
@@ -928,42 +868,60 @@ fn a_standard_user_sees_states_but_not_definitions_or_logs() {
     machine.until("reader", |status| status.state == State::Running);
     machine.until_logged("reader", "tick");
 
-    let response = |arguments: &[&str]| {
-        let (success, stdout, stderr) = cli_as_standard_user(&machine, arguments);
-        let response: Response = serde_json::from_str(&stdout)
-            .unwrap_or_else(|error| panic!("{arguments:?}: {error}: {stdout} {stderr}"));
-        (success, response)
-    };
-    let (success, listed) = response(&["list"]);
-    assert!(success, "{}", listed.message);
+    let (detected, summary, listed, status, events, export, logs) = as_standard_user(|| {
+        (
+            k3up::services::check(&machine.data).map_err(|error| format!("{error:#}")),
+            setup::summary(&machine.data).map(|summary| summary.enabled),
+            machine.send(Command::List),
+            machine.send(Command::Get {
+                name: "reader".into(),
+            }),
+            machine.send(Command::Events {
+                name: Some("reader".into()),
+                after: None,
+            }),
+            machine.send(Command::Export),
+            machine.send(Command::Logs {
+                name: "reader".into(),
+                lines: 20,
+                after: None,
+            }),
+        )
+    });
+    assert_eq!(detected, Ok(true));
+    assert!(summary.unwrap());
+
+    assert!(listed.ok, "{}", listed.message);
     assert_eq!(listed.workloads.len(), 1, "{:?}", listed.workloads);
     assert_eq!(listed.workloads[0].state, State::Running);
     assert_eq!(listed.workloads[0].workload.group, "shared");
     assert!(listed.workloads[0].workload.executable.is_empty());
 
-    let (success, status) = response(&["status", "reader"]);
-    assert!(success, "{}", status.message);
+    assert!(status.ok, "{}", status.message);
     assert_eq!(status.workloads[0].state, State::Running);
     assert!(status.workloads[0].pid.is_some());
+    assert!(status.workloads[0].workload.executable.is_empty());
 
-    let (success, events) = response(&["events", "reader"]);
-    assert!(success, "{}", events.message);
+    assert!(events.ok, "{}", events.message);
     assert!(!events.events.is_empty());
 
-    let (success, summary, stderr) = cli_as_standard_user(&machine, &["services", "status"]);
-    assert!(success, "{summary} {stderr}");
-    let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
-    assert_eq!(summary["enabled"], true);
-    assert_eq!(summary["workloads"]["running"], 1);
-
-    for arguments in [&["export"][..], &["logs", "reader"]] {
-        let (success, refused) = response(arguments);
-        assert!(!success);
+    for refused in [export, logs] {
+        assert!(!refused.ok);
         assert!(
             refused.message.starts_with("Access denied"),
-            "{arguments:?}: {}",
+            "{}",
             refused.message
         );
+    }
+}
+
+/// A kernel driver service, which the service manager lists apart from programs, so services
+/// mode does not see it until it tries to create a service with the same name.
+struct Driver(String);
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        let _ = scm::delete(&self.0);
     }
 }
 
@@ -981,16 +939,10 @@ fn a_failed_apply_leaves_every_workload_as_it_was() {
     let config = machine.sc("qc", "tx-old");
     let description = machine.sc("qdescription", "tx-old");
 
-    // Display names are unique, so this service makes creating tx-clash fail.
-    let foreign = machine.service("foreign");
+    let clash = Driver(machine.service("tx-clash"));
     let created = std::process::Command::new("sc.exe")
-        .args([
-            "create",
-            &foreign,
-            "binPath=",
-            r"C:\Windows\System32\cmd.exe",
-        ])
-        .args(["DisplayName=", "K3 Up: tx-clash"])
+        .args(["create", &clash.0, "type=", "kernel"])
+        .args(["binPath=", r"C:\Windows\System32\drivers\k3up-test.sys"])
         .output()
         .unwrap();
     assert!(
@@ -998,6 +950,7 @@ fn a_failed_apply_leaves_every_workload_as_it_was() {
         "{}",
         String::from_utf8_lossy(&created.stdout)
     );
+    let driver = machine.sc("qc", "tx-clash");
 
     old.group = "after".into();
     old.description = "After".into();
@@ -1014,23 +967,23 @@ fn a_failed_apply_leaves_every_workload_as_it_was() {
         },
         dry_run: false,
     });
-    assert!(!failed.ok);
+    assert!(!failed.ok, "{}", failed.message);
     assert!(
-        failed
-            .message
-            .starts_with("Saving failed and every change was undone: Create service"),
+        failed.message.starts_with(&format!(
+            "Saving failed and every change was undone: Create service {}",
+            clash.0
+        )),
         "{}",
         failed.message
     );
-    assert!(failed.message.contains("tx-clash"), "{}", failed.message);
 
     assert_eq!(std::fs::read(&definition).unwrap(), saved);
     assert_eq!(machine.sc("qc", "tx-old"), config);
     assert_eq!(machine.sc("qdescription", "tx-old"), description);
+    assert!(!scm::exists(&machine.service("tx-new")).unwrap());
+    assert_eq!(machine.sc("qc", "tx-clash"), driver);
     for name in ["tx-new", "tx-clash"] {
-        assert!(!scm::exists(&machine.service(name)).unwrap(), "{name}");
         let file = machine.data.join("workloads").join(format!("{name}.toml"));
         assert!(!file.exists(), "{name}");
     }
-    assert!(scm::exists(&foreign).unwrap());
 }
