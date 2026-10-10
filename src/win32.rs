@@ -1,4 +1,4 @@
-use crate::services::{Ace, Principal};
+use crate::services::{Ace, Principal, files::Access};
 use anyhow::{Context, Result, bail};
 use std::{
     ffi::{OsStr, OsString},
@@ -63,6 +63,13 @@ pub const ROOT_DIR_SDDL: &str = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x
 /// rights recognise services mode. The root's grant to users is not inherited, so it is set
 /// here explicitly.
 pub const MARKER_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)";
+/// The install folder and each installed program: users and app packages may run them, as in
+/// Program Files. Set explicitly, because inheriting Program Files' CREATOR OWNER entry would
+/// grant the account that created them, rather than Administrators, full control.
+pub const INSTALL_DIR_SDDL: &str =
+    "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;0x1200a9;;;AC)";
+pub const PROGRAM_SDDL: &str =
+    "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)(A;;0x1200a9;;;AC)";
 
 pub fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
@@ -187,18 +194,21 @@ pub fn refuse_reparse_point(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuses an existing file that a write as an administrator or SYSTEM could be redirected
-/// through, a reparse point or a file with another hard link, and a file another account
-/// owns, since that account could read what is written or change it.
-pub fn refuse_redirected_file(path: &Path) -> Result<()> {
+/// Refuses an existing file that services mode may not write to or trust, as
+/// `check_trusted_file` explains.
+pub fn refuse_redirected_file(path: &Path, access: Access) -> Result<()> {
     match Pinned::open(path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL) {
-        Ok(pinned) => check_writable(&pinned),
+        Ok(pinned) => check_trusted_file(&pinned, access),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("Open {}", path.display())),
     }
 }
 
-fn check_writable(pinned: &Pinned) -> Result<()> {
+/// A file services mode writes to as SYSTEM or an administrator, or trusts what it reads from:
+/// not a link and with no other hard link, which would redirect the write; owned by SYSTEM,
+/// Administrators or TrustedInstaller; and no one else may change it. A private file, such as
+/// a log, must not be readable by anyone else either.
+fn check_trusted_file(pinned: &Pinned, access: Access) -> Result<()> {
     let path = pinned.path().display();
     if pinned.is_link()? {
         bail!("{path} is a link to another location; services mode refuses it");
@@ -206,8 +216,15 @@ fn check_writable(pinned: &Pinned) -> Result<()> {
     if pinned.links()? > 1 {
         bail!("{path} has another hard link; services mode refuses to write to it");
     }
-    if !pinned.security()?.owner_is_trusted_or_self()? {
+    let security = pinned.security()?;
+    if !security.owner_is_trusted() {
         bail!("{path} belongs to another account; services mode refuses to write to it");
+    }
+    if !security.protected() {
+        bail!("{path} can be changed by other accounts; services mode refuses it");
+    }
+    if access == Access::Private && security.others_may_read() {
+        bail!("{path} can be read by other accounts; services mode refuses to write to it");
     }
     Ok(())
 }
@@ -215,7 +232,7 @@ fn check_writable(pinned: &Pinned) -> Result<()> {
 /// Opens a file for appending, creating it if missing, and refuses it as
 /// `refuse_redirected_file` does. The checks read the handle that is then written to, so the
 /// path cannot be swapped for a link in between.
-pub fn open_append(path: &Path) -> Result<std::fs::File> {
+pub fn open_append(path: &Path, access: Access) -> Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -223,9 +240,41 @@ pub fn open_append(path: &Path) -> Result<std::fs::File> {
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .with_context(|| format!("Open {}", path.display()))?;
+    check_open_file(file, path, access)
+}
+
+/// Refuses a file already opened, without following a link, as `refuse_redirected_file`
+/// does, reading the handle that the caller then uses.
+pub fn check_open_file(file: std::fs::File, path: &Path, access: Access) -> Result<std::fs::File> {
     let pinned = Pinned::from_file(file, path);
-    check_writable(&pinned)?;
+    check_trusted_file(&pinned, access)?;
     Ok(pinned.into_file())
+}
+
+/// Opens a file to read what services mode trusts from it, such as a workload's state, and
+/// refuses it as `refuse_redirected_file` does, through the handle that is read.
+pub fn open_trusted(path: &Path, access: Access) -> Result<std::fs::File> {
+    let pinned = Pinned::open(path, FILE_GENERIC_READ, SHARE_ALL)
+        .with_context(|| format!("Open {}", path.display()))?;
+    check_trusted_file(&pinned, access)?;
+    Ok(pinned.into_file())
+}
+
+/// An entry an earlier, less protected folder held, before its permissions are reset: not a
+/// link, no other hard link, and owned by SYSTEM, Administrators or TrustedInstaller. Its
+/// DACL is what the reset replaces.
+fn check_resettable(pinned: &Pinned) -> Result<()> {
+    let path = pinned.path().display();
+    if pinned.is_link()? {
+        bail!("{path} is a link to another location; services mode refuses it");
+    }
+    if !pinned.is_dir()? && pinned.links()? > 1 {
+        bail!("{path} has another hard link; services mode refuses to write to it");
+    }
+    if !pinned.security()?.owner_is_trusted() {
+        bail!("{path} belongs to another account; services mode refuses to write to it");
+    }
+    Ok(())
 }
 
 /// Brings what an earlier, less protected folder may hold under the folder's own access:
@@ -289,7 +338,7 @@ fn collect_entries(
             refused.push(format!("  {} moved while it was checked", path.display()));
             continue;
         }
-        if let Err(error) = check_writable(&pinned) {
+        if let Err(error) = check_resettable(&pinned) {
             refused.push(format!("  {error:#}"));
             continue;
         }

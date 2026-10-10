@@ -61,10 +61,16 @@ pub enum Ace {
 /// a child, delete, change permissions, take ownership, and generic all.
 const MOVE_RIGHTS: u32 = 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000;
 
-/// Whether no untrusted account may rename, delete or re-permission a folder above the data
-/// directory, or what it holds, given that its owner is trusted. Creating new entries is
-/// fine: nobody can rename or delete an entry they do not own and were not granted.
-pub fn keeps_children_in_place(aces: &[Ace]) -> bool {
+/// Rights that let an account read a file's contents: read data, and the generic read and
+/// all rights.
+const READ_RIGHTS: u32 = 0x1 | 0x8000_0000 | 0x1000_0000;
+
+/// The one rule every check below applies: an entry that applies to the object itself
+/// (not inherit-only) and grants any of `rights` must name SYSTEM, Administrators or
+/// TrustedInstaller. That includes CREATOR OWNER: on the object itself it stands for no one,
+/// and an entry for it is only expected as an inherit-only template for new children.
+/// Entries K3 Up cannot read, such as conditional ones, are refused unless inherit-only.
+fn only_trusted_granted(aces: &[Ace], rights: u32) -> bool {
     aces.iter().all(|ace| match *ace {
         Ace::Deny
         | Ace::Allow {
@@ -74,25 +80,25 @@ pub fn keeps_children_in_place(aces: &[Ace]) -> bool {
         Ace::Unknown { .. } => false,
         Ace::Allow {
             principal, mask, ..
-        } => principal != Principal::Other || mask & MOVE_RIGHTS == 0,
+        } => principal == Principal::Trusted || mask & rights == 0,
     })
 }
 
-/// Whether only trusted principals may change an object with these entries, given that its
-/// owner is trusted, which also covers CREATOR OWNER. Inherit-only entries are skipped: they
-/// reach new children only, and whoever creates one needs a grant that already counts here.
+/// Whether no untrusted account may rename, delete or re-permission a folder above the data
+/// directory, or what it holds. Creating new entries is fine: nobody can rename or delete an
+/// entry they do not own and were not granted.
+pub fn keeps_children_in_place(aces: &[Ace]) -> bool {
+    only_trusted_granted(aces, MOVE_RIGHTS)
+}
+
+/// Whether only trusted principals may write to, delete or re-permission an object.
 pub fn only_trusted_may_change(aces: &[Ace]) -> bool {
-    aces.iter().all(|ace| match *ace {
-        Ace::Deny
-        | Ace::Allow {
-            inherit_only: true, ..
-        }
-        | Ace::Unknown { inherit_only: true } => true,
-        Ace::Unknown { .. } => false,
-        Ace::Allow {
-            principal, mask, ..
-        } => principal != Principal::Other || !grants_change(mask),
-    })
+    only_trusted_granted(aces, CHANGE_RIGHTS)
+}
+
+/// Whether only trusted principals may read an object's contents, for private files.
+pub fn only_trusted_may_read(aces: &[Ace]) -> bool {
+    only_trusted_granted(aces, READ_RIGHTS)
 }
 
 /// Whether `data` is in services mode. A marker in a folder that someone other than SYSTEM
@@ -230,12 +236,6 @@ mod tests {
             Ace::Deny,
         ];
         assert!(only_trusted_may_change(&program_files));
-        // CREATOR OWNER stands for the owner, which the caller requires to be trusted.
-        assert!(only_trusted_may_change(&[allow(
-            Principal::CreatorOwner,
-            0x1f01ff,
-            false
-        )]));
         // Full control for Users on new children only does not let them change this object.
         assert!(only_trusted_may_change(&[allow(
             Principal::Other,
@@ -245,6 +245,8 @@ mod tests {
         for refused in [
             allow(Principal::Other, 0x1301bf, false),
             allow(Principal::Other, 0x4_0000, false),
+            // On the object itself CREATOR OWNER is accepted only as an inherit-only template.
+            allow(Principal::CreatorOwner, 0x1f01ff, false),
             Ace::Unknown {
                 inherit_only: false,
             },
@@ -254,6 +256,34 @@ mod tests {
         assert!(only_trusted_may_change(&[Ace::Unknown {
             inherit_only: true
         }]));
+        assert!(only_trusted_may_change(&[allow(
+            Principal::CreatorOwner,
+            0x1200a9,
+            false
+        )]));
+    }
+
+    #[test]
+    fn private_files_may_be_read_only_by_trusted_principals() {
+        let allow = |principal, mask, inherit_only| Ace::Allow {
+            principal,
+            mask,
+            inherit_only,
+        };
+        let private = [
+            allow(Principal::Trusted, 0x1f01ff, false),
+            allow(Principal::Other, 0x80, false),
+            allow(Principal::Other, 0x1200a9, true),
+        ];
+        assert!(only_trusted_may_read(&private));
+        for refused in [
+            allow(Principal::Other, 0x1200a9, false),
+            allow(Principal::Other, 0x8000_0000, false),
+            allow(Principal::Other, 0x1000_0000, false),
+            allow(Principal::CreatorOwner, 0x1, false),
+        ] {
+            assert!(!only_trusted_may_read(&[refused]), "{refused:?}");
+        }
     }
 
     #[test]
@@ -286,10 +316,12 @@ mod tests {
             0x8_0000,
             0x1000_0000,
         ] {
-            assert!(
-                !keeps_children_in_place(&[allow(Principal::Other, mask, false)]),
-                "{mask:#x}"
-            );
+            for principal in [Principal::Other, Principal::CreatorOwner] {
+                assert!(
+                    !keeps_children_in_place(&[allow(principal, mask, false)]),
+                    "{principal:?} {mask:#x}"
+                );
+            }
             assert!(keeps_children_in_place(&[allow(
                 Principal::Trusted,
                 mask,

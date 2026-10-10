@@ -257,8 +257,7 @@ impl Control for Services<'_> {
 
 fn copy_programs(sources: Vec<(&str, File)>, target: &Path) -> Result<Vec<String>> {
     if !target.exists() {
-        // Inherits the Program Files ACL, which lets only administrators write.
-        std::fs::create_dir(target).with_context(|| format!("Create {}", target.display()))?;
+        crate::win32::create_dir_with(target, crate::win32::INSTALL_DIR_SDDL)?;
     }
     let mut lines = vec![];
     for (program, mut file) in sources {
@@ -268,7 +267,11 @@ fn copy_programs(sources: Vec<(&str, File)>, target: &Path) -> Result<Vec<String
         // installed program in one step or not at all.
         file.read_to_end(&mut bytes)
             .map_err(anyhow::Error::from)
-            .and_then(|_| files::write_atomic(&to, &bytes, |_| Ok(())))
+            .and_then(|_| {
+                files::write_atomic(&to, &bytes, |path| {
+                    set_security(path, crate::win32::PROGRAM_SDDL)
+                })
+            })
             .with_context(|| format!("Copy {program} to {}", to.display()))?;
         lines.push(format!("Copied {program} to {}", target.display()));
     }

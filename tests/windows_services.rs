@@ -825,6 +825,7 @@ fn files_left_in_the_folders_lose_their_own_permissions() {
     let history = machine.data.join("events").join("planted.jsonl");
     for file in [&log, &history] {
         std::fs::write(file, b"planted\n").unwrap();
+        icacls(file, &["/setowner", "*S-1-5-32-544"]);
         icacls(file, &["/inheritance:r", "/grant", "*S-1-5-32-545:F"]);
         assert_eq!(security(file).1 & 0x1f01ff, 0x1f01ff);
     }
@@ -846,6 +847,48 @@ fn files_left_in_the_folders_lose_their_own_permissions() {
     assert!(
         format!("{:#}", appended.unwrap_err()).contains("belongs to another account"),
         "the host must not append to a file another account owns"
+    );
+}
+
+#[test]
+fn files_others_may_read_or_change_are_refused_even_when_administrators_own_them() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let log = machine.data.join("logs").join("readable.log");
+    std::fs::write(&log, b"").unwrap();
+    icacls(&log, &["/setowner", "*S-1-5-32-544"]);
+    files::open_append(&log, files::Access::Private).unwrap();
+    icacls(&log, &["/grant", "*S-1-5-32-545:R"]);
+    let error = format!(
+        "{:#}",
+        files::open_append(&log, files::Access::Private).unwrap_err()
+    );
+    assert!(
+        error.ends_with("can be read by other accounts; services mode refuses to write to it"),
+        "{error}"
+    );
+
+    let state = machine.data.join("state").join("forged.json");
+    files::write_state(
+        &state,
+        &files::HostState {
+            state: State::Running,
+            reason: "Process started".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(files::read_state(&state).is_some());
+    icacls(&state, &["/grant", "*S-1-5-32-545:W"]);
+    assert_eq!(files::read_state(&state), None);
+    let error = format!(
+        "{:#}",
+        files::refuse_redirected(&state, files::Access::Shared).unwrap_err()
+    );
+    assert!(
+        error.ends_with("can be changed by other accounts; services mode refuses it"),
+        "{error}"
     );
 }
 

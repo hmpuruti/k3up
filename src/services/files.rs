@@ -117,16 +117,28 @@ pub fn write_atomic(
     written
 }
 
+/// Who besides SYSTEM and Administrators may read a services mode file. Nobody may change one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Definitions, logs and lock files, which may hold secrets.
+    Private,
+    /// State and history, which every user may read.
+    Shared,
+}
+
 /// Refuses a file that a write could be redirected through: a link, or on Windows a file with
-/// another hard link. Run before appending to a file as an administrator or SYSTEM.
-pub fn refuse_redirected(path: &Path) -> Result<()> {
+/// another hard link, another owner than SYSTEM, Administrators or TrustedInstaller, or
+/// permissions that let someone else change it, or read it if it is private. Run before
+/// writing to a file as an administrator or SYSTEM.
+pub fn refuse_redirected(path: &Path, access: Access) -> Result<()> {
     refuse_redirected_parent(path)?;
     #[cfg(windows)]
     {
-        crate::win32::refuse_redirected_file(path)
+        crate::win32::refuse_redirected_file(path, access)
     }
     #[cfg(not(windows))]
     {
+        let _ = access;
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 anyhow::bail!("{} is a link to another location", path.display())
@@ -298,12 +310,21 @@ pub fn names(dir: &Path, extension: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// The host's last report, unless it is missing, unreadable, or in a file someone other than
+/// SYSTEM and Administrators could have written.
 pub fn read_state(path: &Path) -> Option<HostState> {
-    serde_json::from_str(&read_bounded(path).ok()?).ok()
+    #[cfg(windows)]
+    let file = crate::win32::open_trusted(path, Access::Shared).ok()?;
+    #[cfg(not(windows))]
+    let file = File::open(path).ok()?;
+    serde_json::from_str(&read_bounded_from(file).ok()?).ok()
 }
 
 pub fn write_state(path: &Path, state: &HostState) -> Result<()> {
-    write_atomic(path, &serde_json::to_vec_pretty(state)?, |_| Ok(()))
+    write_atomic(path, &serde_json::to_vec_pretty(state)?, |path| {
+        own(path);
+        Ok(())
+    })
 }
 
 /// Appends an event. Ids come from one sequence shared by every workload, kept where only
@@ -358,12 +379,22 @@ fn open_lock_file(path: &Path) -> Result<File> {
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error).with_context(|| format!("Create {}", path.display())),
     }
-    refuse_redirected(path)?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
+    refuse_redirected_parent(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(windows))]
+    refuse_redirected(path, Access::Private)?;
+    let file = options
         .open(path)
-        .with_context(|| format!("Open {}", path.display()))
+        .with_context(|| format!("Open {}", path.display()))?;
+    #[cfg(windows)]
+    let file = crate::win32::check_open_file(file, path, Access::Private)?;
+    Ok(file)
 }
 
 /// Takes the next id and saves it before the event is written, so a failed write skips an
@@ -422,7 +453,7 @@ fn write_event(path: &Path, line: &str) -> Result<()> {
             Ok(())
         });
     }
-    let mut file = open_append(path)?;
+    let mut file = open_append(path, Access::Shared)?;
     file.write_all(format!("{line}\n").as_bytes())?;
     Ok(())
 }
@@ -430,15 +461,15 @@ fn write_event(path: &Path, line: &str) -> Result<()> {
 /// Opens a file to append to, creating it when missing, and refuses one a write could be
 /// redirected through or that another account owns. On Windows the checks read the handle
 /// that is written to.
-pub fn open_append(path: &Path) -> Result<File> {
+pub fn open_append(path: &Path, access: Access) -> Result<File> {
     refuse_redirected_parent(path)?;
     #[cfg(windows)]
     {
-        crate::win32::open_append(path)
+        crate::win32::open_append(path, access)
     }
     #[cfg(not(windows))]
     {
-        refuse_redirected(path)?;
+        refuse_redirected(path, access)?;
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -507,17 +538,53 @@ pub fn read_events(layout: &Layout, name: Option<&str>, after: Option<i64>) -> R
 mod tests {
     use super::*;
 
-    fn layout(dir: &tempfile::TempDir) -> Layout {
+    /// The folders of a data directory. On Windows they get the permissions `prepare` gives
+    /// them, which the checks on every write require; that takes administrator rights, so
+    /// without them the test is skipped.
+    fn layout(dir: &tempfile::TempDir) -> Option<Layout> {
         let layout = Layout::new(dir.path());
-        std::fs::create_dir_all(layout.events_dir()).unwrap();
-        std::fs::create_dir_all(layout.workloads()).unwrap();
-        layout
+        let folders = [
+            (layout.workloads(), true),
+            (layout.logs(), true),
+            (layout.states(), false),
+            (layout.events_dir(), false),
+        ];
+        for (folder, private) in folders {
+            #[cfg(windows)]
+            {
+                let sddl = if private {
+                    crate::win32::PRIVATE_DIR_SDDL
+                } else {
+                    crate::win32::SHARED_DIR_SDDL
+                };
+                if crate::win32::create_dir_with(&folder, sddl).is_err() {
+                    eprintln!("skipped: not elevated");
+                    return None;
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = private;
+                std::fs::create_dir_all(folder).unwrap();
+            }
+        }
+        Some(layout)
+    }
+
+    fn write_owned(path: &Path, bytes: &[u8]) {
+        write_atomic(path, bytes, |path| {
+            own(path);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
     fn events_merge_newest_first_and_stay_bounded() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = layout(&dir);
+        let Some(layout) = layout(&dir) else {
+            return;
+        };
         append_event(&layout, "a", "first").unwrap();
         append_event(&layout, "b", "second").unwrap();
         append_event(&layout, "a", "third").unwrap();
@@ -558,7 +625,9 @@ mod tests {
     #[test]
     fn concurrent_writers_share_one_increasing_sequence() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = layout(&dir);
+        let Some(layout) = layout(&dir) else {
+            return;
+        };
         let writers: Vec<_> = (0..4)
             .map(|writer| {
                 let layout = layout.clone();
@@ -589,7 +658,9 @@ mod tests {
     #[test]
     fn a_lost_or_broken_sequence_continues_after_the_largest_id() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = layout(&dir);
+        let Some(layout) = layout(&dir) else {
+            return;
+        };
         let old = Event {
             id: 1_700_000_000_000_000,
             at: Utc::now(),
@@ -597,7 +668,7 @@ mod tests {
             message: "Written with a clock id".into(),
         };
         let line = format!("{}\n", serde_json::to_string(&old).unwrap());
-        std::fs::write(layout.events("a"), line).unwrap();
+        write_owned(&layout.events("a"), line.as_bytes());
         append_event(&layout, "b", "after the upgrade").unwrap();
         assert_eq!(ids(&layout, "b"), [old.id + 1]);
 
@@ -618,7 +689,9 @@ mod tests {
     #[test]
     fn a_held_sequence_makes_recording_give_up_instead_of_waiting() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = layout(&dir);
+        let Some(layout) = layout(&dir) else {
+            return;
+        };
         let held = lock(&layout.sequence(), Duration::ZERO).unwrap().unwrap();
         let started = Instant::now();
         let refused = append_event(&layout, "a", "blocked").unwrap_err();
@@ -636,7 +709,9 @@ mod tests {
     #[test]
     fn recording_an_event_changes_the_mark() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = layout(&dir);
+        let Some(layout) = layout(&dir) else {
+            return;
+        };
         let empty = events_mark(&layout);
         append_event(&layout, "a", "Log rotation failed").unwrap();
         let first = events_mark(&layout);
@@ -686,7 +761,10 @@ mod tests {
     #[test]
     fn a_second_holder_waits_and_then_gives_up() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".lock");
+        let Some(layout) = layout(&dir) else {
+            return;
+        };
+        let path = layout.changes_lock();
         let held = lock(&path, Duration::ZERO).unwrap().unwrap();
         let started = Instant::now();
         assert!(lock(&path, Duration::from_millis(300)).unwrap().is_none());
@@ -698,8 +776,9 @@ mod tests {
     #[test]
     fn huge_files_are_read_only_in_part() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = layout(&dir);
-        std::fs::create_dir_all(layout.states()).unwrap();
+        let Some(layout) = layout(&dir) else {
+            return;
+        };
         let huge = vec![b'x'; READ_LIMIT as usize + 1];
         std::fs::write(layout.state("web"), &huge).unwrap();
         std::fs::write(layout.definition("web"), &huge).unwrap();
@@ -720,7 +799,7 @@ mod tests {
         events.push(b'\n');
         events.extend(serde_json::to_vec(&event).unwrap());
         events.push(b'\n');
-        std::fs::write(layout.events("web"), &events).unwrap();
+        write_owned(&layout.events("web"), &events);
         let read = read_events(&layout, Some("web"), None).unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].message, "last");
@@ -747,9 +826,9 @@ mod tests {
     #[test]
     fn definitions_and_states_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::new(dir.path());
-        std::fs::create_dir_all(layout.workloads()).unwrap();
-        std::fs::create_dir_all(layout.states()).unwrap();
+        let Some(layout) = layout(&dir) else {
+            return;
+        };
         let workload = Workload {
             name: "web".into(),
             group: "a/b".into(),

@@ -2,7 +2,7 @@
 //! one and the changes made to it apply to the same object even if its path is swapped for a
 //! link in between.
 use super::{
-    Principal, SecurityAttributes, aces, current_user_is, principal, system_or_administrators,
+    Principal, SecurityAttributes, aces, principal, system_or_administrators,
     trusted_owner_and_dacl,
 };
 use anyhow::{Context, Result};
@@ -203,16 +203,11 @@ impl Security {
         unsafe { system_or_administrators(self.owner) }
     }
 
-    /// SYSTEM, Administrators or this process's own account. A file this account owns is no
-    /// threat to this account's own writes.
-    pub(super) fn owner_is_trusted_or_self(&self) -> Result<bool> {
+    /// SYSTEM, Administrators or TrustedInstaller. Never the account running this process:
+    /// an administrator's own account is not one every administrator controls.
+    pub(super) fn owner_is_trusted(&self) -> bool {
         // SAFETY: the owner points into the descriptor, which lives as long as self.
-        unsafe {
-            if principal(self.owner) == Principal::Trusted {
-                return Ok(true);
-            }
-            current_user_is(self.owner)
-        }
+        unsafe { principal(self.owner) == Principal::Trusted }
     }
 
     /// Owned by SYSTEM, Administrators or TrustedInstaller, and no one else may change it.
@@ -221,8 +216,17 @@ impl Security {
         unsafe { trusted_owner_and_dacl(self.owner, self.dacl) }
     }
 
-    /// Whether the DACL lets an account other than SYSTEM, Administrators, TrustedInstaller
-    /// or the owner write to, delete or re-permission the object.
+    /// Whether the DACL lets an account other than SYSTEM, Administrators and TrustedInstaller
+    /// read the object's contents.
+    pub(super) fn others_may_read(&self) -> bool {
+        // SAFETY: the DACL points into the descriptor, which lives as long as self.
+        unsafe {
+            !aces(self.dacl).is_some_and(|aces| crate::services::only_trusted_may_read(&aces))
+        }
+    }
+
+    /// Whether the DACL lets an account other than SYSTEM, Administrators and TrustedInstaller
+    /// write to, delete or re-permission the object.
     pub(super) fn others_may_change(&self) -> bool {
         // SAFETY: the DACL points into the descriptor, which lives as long as self.
         unsafe {

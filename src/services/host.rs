@@ -196,8 +196,8 @@ impl Host {
         loop {
             let now = Utc::now();
             let log = self.layout.log(&self.name);
-            let launched =
-                files::open_append(&log).and_then(|file| supervisor::launch_into(spec, file, now));
+            let launched = files::open_append(&log, files::Access::Private)
+                .and_then(|file| supervisor::launch_into(spec, file, now));
             let ended = match launched {
                 Ok(process) => {
                     self.state.started_at = Some(now);
@@ -289,8 +289,13 @@ impl Host {
             }
             if rotated.elapsed() >= ROTATE_EVERY {
                 rotated = Instant::now();
-                let rotated_log = files::refuse_redirected(&log)
-                    .and_then(|()| files::refuse_redirected(&log.with_extension("log.1")))
+                let rotated_log = files::refuse_redirected(&log, files::Access::Private)
+                    .and_then(|()| {
+                        files::refuse_redirected(
+                            &log.with_extension("log.1"),
+                            files::Access::Private,
+                        )
+                    })
                     .and_then(|()| supervisor::rotate_log(&log));
                 if let Err(error) = rotated_log {
                     self.log_line(&format!("Log rotation failed: {error:#}"));
@@ -348,7 +353,7 @@ impl Host {
         if !is_protected(&self.layout.logs()) {
             return;
         }
-        if let Ok(mut file) = files::open_append(&log) {
+        if let Ok(mut file) = files::open_append(&log, files::Access::Private) {
             let _ = writeln!(file, "[{}] k3up-host: {text}", Utc::now().to_rfc3339());
         }
     }
