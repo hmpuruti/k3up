@@ -24,8 +24,8 @@ use app::App;
 use clap::Parser;
 use iced::{Size, window};
 use k3up::{
-    autostart::{LoginAgent, bundled_agent},
-    platform,
+    autostart::{bundled_agent, desktop_agent},
+    platform, services,
 };
 use std::path::PathBuf;
 
@@ -46,9 +46,10 @@ fn main() -> iced::Result {
     let options = Options::parse();
     let managed = options.data_dir.is_none();
     let data = options.data_dir.unwrap_or_else(platform::default_data_dir);
+    let services_mode = services::machine_mode_on() || services::active(&data);
+    let agent = desktop_agent(bundled_agent(), &data, services_mode);
     if options.start_agent || options.register_agent {
-        if let Some(agent) = bundled_agent() {
-            let login = LoginAgent::new(agent, data);
+        if let Some(login) = agent {
             // A reinstall must not undo a login item the user turned off.
             if options.register_agent
                 && !login.opted_out()
@@ -63,9 +64,7 @@ fn main() -> iced::Result {
         return Ok(());
     }
     // Only the default agent is set up automatically; an explicit --data-dir is left alone.
-    let login = bundled_agent()
-        .filter(|_| managed)
-        .map(|agent| LoginAgent::new(agent, data.clone()));
+    let login = agent.filter(|_| managed);
     let icon = window::icon::from_file_data(
         include_bytes!("../../../assets/branding/k3-up-app-icon.png"),
         None,

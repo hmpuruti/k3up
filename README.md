@@ -42,7 +42,7 @@ K3 Up is written in Rust. It has no browser runtime, no .NET, no listening netwo
 - Define workloads in the app, with CLI flags, or in a versioned TOML manifest you can validate, preview and apply as one transaction.
 - Organise a large fleet into folders such as `watchtower/entra`, and list, start, stop, restart or export a folder at a time.
 - Export workloads as native systemd services and timers on Linux.
-- Run the agent as a Windows service, with each workload's processes contained in a Job Object.
+- On Windows, run each workload as its own Windows service, listed in services.msc, with its processes contained in a Job Object.
 
 ## Platforms
 
@@ -50,7 +50,7 @@ K3 Up is written in Rust. It has no browser runtime, no .NET, no listening netwo
 |---|---|---|---|
 | macOS | Yes | Yes | launchd agent |
 | Linux | Yes | Yes (X11 or Wayland) | systemd user service |
-| Windows | Yes, per user or as a machine service | Yes | Run entry, or the Windows service |
+| Windows | Yes, per user, or one Windows service per workload | Yes | Run entry, or Windows services |
 
 macOS is the most tested platform. The Linux and Windows versions are newer and have seen less real-world use, so please report what you find.
 
@@ -61,7 +61,7 @@ Prebuilt downloads are attached to each release on the GitHub Releases page:
 | System | Download | Contents |
 |---|---|---|
 | Windows (x64) | `k3up-setup-x86_64.exe` | Installer |
-| Windows (x64) | `k3up-windows-x86_64.zip` | `k3up.exe`, `k3up-agent.exe`, `k3up-desktop.exe`, for portable use |
+| Windows (x64) | `k3up-windows-x86_64.zip` | `k3up.exe`, `k3up-agent.exe`, `k3up-host.exe`, `k3up-desktop.exe`, for portable use |
 | macOS (Apple silicon) | `k3up-macos-arm64.zip` | `K3 Up.app`, with the agent and CLI inside |
 | Linux (x86-64) | `k3up-linux-x86_64.tar.gz` | `k3up`, `k3up-agent`, `k3up-desktop` |
 
@@ -163,7 +163,7 @@ k3up agent status
 
 - **Linux:** the login item is a systemd user service, which normally runs only while you are logged in. To keep the agent running without a login session, an administrator enables lingering once: `sudo loginctl enable-linger $USER`.
 - **macOS:** the login item is a launchd agent in `~/Library/LaunchAgents`, which runs while you are logged in. The first `agent install` shows a "Background Items Added" notice.
-- **Windows:** `agent install` writes a Run entry for your account and starts the agent. For a service that runs for every user without a login, use `agent install-service` from an elevated terminal instead, see [Windows](#windows).
+- **Windows:** `agent install` writes a Run entry for your account and starts the agent. To run workloads for every user without a login, turn on services mode from an elevated terminal instead, see [Windows](#windows).
 
 `agent uninstall` reverses the install and keeps your data.
 
@@ -235,7 +235,15 @@ Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`
 | `agent start` | Start the agent now without registering it. |
 | `agent stop` | Stop the agent and every workload, and wait for it to exit. |
 | `agent status` | Reachability, version, process, uptime, data directory, executable, login item and workload counts. Exits with 1 when unreachable. |
-| `agent install-service`, `agent uninstall-service` | The Windows machine service, see [Windows](#windows). |
+| `agent install-service`, `agent uninstall-service` | Hidden. The central Windows agent service, replaced by services mode. |
+
+**Services (Windows)**
+
+| Command | What it does |
+|---|---|
+| `services enable` | Turn on services mode: copy the programs to Program Files, create `%ProgramData%\K3 Up` and mark it. Elevated terminal. Safe to repeat. |
+| `services disable` | Turn services mode off. Refuses while any workload service exists. Data is kept. |
+| `services status` | Whether services mode is on, where the host is, and workloads by state. |
 
 **Other**
 
@@ -250,7 +258,7 @@ Workload flags, shared by `create` and `edit`: `--cwd DIR`, `--description TEXT`
 
 ### Changes outside the data directory
 
-Four commands change the system: `agent install` and `agent uninstall` add or remove a login item, and `agent install-service` and `agent uninstall-service` add or remove the Windows service. The login item only serves the default data directory, so `agent install` and `agent uninstall` refuse any other. Every other command only reads and writes the data directory.
+These commands change the system: `agent install` and `agent uninstall` add or remove a login item, and on Windows `services enable` and `services disable` install the programs in Program Files and turn services mode on or off. In services mode, `create`, `edit`, `apply` and `remove` create, change and delete Windows services, and need an elevated terminal. The hidden `agent install-service` and `agent uninstall-service` add or remove the older central Windows service. The login item only serves the default data directory, so `agent install` and `agent uninstall` refuse any other. Every other command only reads and writes the data directory.
 
 To try K3 Up without changing the system, use a scratch directory and start the agent directly:
 
@@ -537,19 +545,57 @@ systemctl --user status k3up-example-worker.service
 
 ### Windows
 
-The installer and the desktop app run the agent under your own account. To run it instead as a machine-wide service, place `k3up.exe` and `k3up-agent.exe` in the same folder and run this from an elevated terminal:
+The installer and the desktop app run the agent under your own account. Services mode runs each workload as its own Windows service instead, like NSSM or WinSW: workloads start at boot, run without anyone logged in, and keep running with no K3 Up process other than their own host. The `k3up` command line manages them.
+
+To turn it on, extract `k3up-windows-x86_64.zip` into `C:\Program Files\K3 Up`, then from an elevated terminal run:
 
 ```powershell
-.\k3up.exe agent install-service
-sc.exe start K3Up
-.\k3up.exe --data-dir "$env:ProgramData\K3 Up" list
+& "C:\Program Files\K3 Up\k3up.exe" services enable
+k3up create web --exe C:\srv\web\web.exe --group shop --start-at-boot --start
+sc.exe query K3Up_web
 ```
 
-Installation copies the agent to `%ProgramFiles%\K3 Up` and keeps data in `%ProgramData%\K3 Up`. Both folders are created with access limited to SYSTEM and Administrators. If any step fails, the installer removes what it created. `.\k3up.exe agent uninstall-service` stops and removes the service; the folders are left in place for you to review.
+A later release will let the installer set this up. Every service runs `k3up-host.exe` as LocalSystem, so `services enable` refuses to install programs from a folder, or a program, that users who aren't administrators can change, such as the installer's `%LOCALAPPDATA%\Programs\K3 Up`.
 
-The machine service runs as LocalSystem, and so do its workloads. Clients need an elevated terminal to reach it.
+Run from another protected folder, `services enable` copies `k3up.exe`, `k3up-host.exe` and `k3up-desktop.exe`, when present, to `%ProgramFiles%\K3 Up`, stopping and restarting running workload services around the copy. Each program replaces the installed copy in one step, so a failed copy leaves the old one in place. It then creates `%ProgramData%\K3 Up`, or the `--data-dir` given, secures it, marks it as the data directory and records it in `HKLM\SOFTWARE\K3 Up` as `ServicesData`, which `k3up` then uses by default. Only after that does it start again the services it stopped, also when a step failed; if one does not stop or start, `services enable` names it and exits with code 1. Service names are the same for the whole machine, so services mode uses one data directory: `services enable` for another one is refused until `services disable` turns it off. It also refuses while the older agent service from `agent install-service` is installed; run `k3up agent uninstall-service` first. `services disable` turns the mode off once every workload service is removed, removes the registry record and keeps the data.
 
-Each workload runs in a Job Object, so its processes end if the agent stops unexpectedly. Windows has no universal way to ask an arbitrary program to shut down gracefully. A stop therefore waits for the stop timeout and then ends the Job Object.
+`services enable` also refuses while your own agent starts at login or is running, because its workloads would run beside the services. Move them across first:
+
+```powershell
+k3up export --output workloads.toml
+k3up agent uninstall
+k3up services enable
+k3up apply workloads.toml
+```
+
+It can only see the agent of the account that runs it. Other accounts on the machine must run `k3up agent uninstall` themselves. Once services mode is on, `k3up` uses `%ProgramData%\K3 Up` by default, so reach your own agent with `--data-dir "%LOCALAPPDATA%\K3 Up"`, for example `k3up agent uninstall --data-dir "%LOCALAPPDATA%\K3 Up"`. `agent install` refuses while services mode is on.
+
+What appears in services.msc:
+
+| | |
+|---|---|
+| Service name | `K3Up_NAME` |
+| Display name | `K3 Up: FOLDER/NAME`, or `K3 Up: NAME` without a folder, so K3 Up services sort together by folder |
+| Description | The workload's description, or "K3 Up workload" |
+| Startup type | Automatic (Delayed Start) for a service with `start_at_boot`, otherwise Manual. Jobs are always Manual. |
+| Account | LocalSystem |
+| Recovery | Restart the host after 5 s, 5 s and 30 s, reset after a day. This applies only if the host itself crashes. |
+
+Each service runs `k3up-host.exe`, which supervises one workload with the same rules as the agent: restart policy, backoff, restart limits, success exit codes, run timeouts and log rotation. When the workload gives up for good, for example after `restart limit reached`, the service stops with an error code and stays stopped. A job runs once and then stops the service. Stopping a service waits for the workload's stop timeout and then ends its Job Object.
+
+Files in `%ProgramData%\K3 Up`:
+
+| Path | Contents | Access |
+|---|---|---|
+| `workloads\NAME.toml` | Definitions | SYSTEM and Administrators |
+| `logs\NAME.log` | Output, rotated at 5 MB | SYSTEM and Administrators |
+| `state\NAME.json` | State, process, retries, last exit and reason | Administrators change, users read |
+| `events\NAME.jsonl` | Activity history | Administrators change, users read |
+| `services-mode` | Marks the folder as the services mode data directory | Administrators change, users read |
+
+Changing workloads needs an elevated terminal; without one, `k3up` says so. As with the agent, `apply` saves all of its workloads or none. When one fails, K3 Up restores the definitions and services it already changed, and the message says whether the restore worked. Starting a new service with `start_at_boot` comes after that: a start that fails leaves the workload `failed` with the reason, `apply` still succeeds and lists it, and `k3up start NAME` tries again. `remove` deletes the workload's state first, and if a reader holds that file it stops with "is in use; try again" and changes nothing. Each new definition gets an `instance` id, which its service passes to the host, so a state file left by an earlier workload of the same name is never shown as the new one's. Commands that change workloads take turns: one waits up to 60 seconds for another to finish, then fails with "Another k3up command is changing services; try again". `services enable` also gives files already in the log, state and history folders the folder's permissions, and refuses links and files another account owns. It never does that for definitions: if users who aren't administrators could have changed one, or the `workloads` folder, it lists them and stops, so you can review them, delete them and apply the workloads again from a trusted manifest. It also refuses an existing `%ProgramFiles%\K3 Up` that such users could change; delete it and extract the release zip again. Definitions are limited to 1 MB. Any user can run `k3up list` and `k3up services status` to see names, folders and states, but not definitions, which may hold secrets in their environment variables. K3 Up uses services mode only when the data directory and its marker belong to SYSTEM or Administrators, are not links, and no other account may change them, and when no folder above the data directory is a link or can be moved or re-permissioned by an account other than SYSTEM, Administrators and TrustedInstaller. `C:\ProgramData\K3 Up` passes; a folder in a user profile does not. Otherwise `k3up` falls back to the per-user directory, or refuses a `--data-dir` that points there. The host applies the same check to its folders and the definition before it runs anything, and state and history files never quote a definition: the details of a refusal or a failed launch go to the workload's log, which only administrators read.
+
+Not supported in services mode yet: schedules, dependencies, TCP readiness checks and per-workload accounts. A definition that uses one is refused with a message that names it. `stats` and `health` show current usage but no history, and there is no agent, so the `agent` commands refuse to run and the desktop app neither registers nor starts one.
 
 ## Security
 
@@ -565,6 +611,7 @@ Workload definitions, including environment variables, are stored in plain text 
 
 - Requests are handled one at a time, so a slow stop delays other requests until it finishes.
 - There is no secret storage, per-workload user accounts, resource limits or ongoing health checks.
+- Services mode on Windows does not run schedules, dependencies or TCP readiness checks yet.
 - There are no signed installers or in-place upgrades yet.
 - The desktop app manages agents on the local machine only.
 
@@ -581,9 +628,12 @@ Workload definitions, including environment variables, are stored in plain text 
 | `src/platform.rs` | Process containment and platform endpoints |
 | `src/autostart.rs` | Starting the agent at login |
 | `src/systemd.rs` | Native systemd unit generation |
-| `src/windows_host.rs`, `src/win32.rs` | Windows service hosting and security |
+| `src/supervisor.rs` | Per-workload rules shared by the agent and the Windows service host: exits and retries, launching, logs |
+| `src/services/` | Services mode: state files, the service host, the back end that answers commands from Windows services, and `services enable` |
+| `src/windows_host.rs`, `src/win32.rs` | The older central Windows agent service, and Windows security |
 | `src/health.rs` | Health thresholds shared by the command line and the app |
 | `src/bin/agent.rs` | The `k3up-agent` program |
+| `src/bin/host.rs` | The `k3up-host` program, which runs one workload as a Windows service |
 | `src/bin/k3up/` | The `k3up` command line, one module per command group |
 | `src/bin/desktop/` | The desktop app |
 
@@ -595,7 +645,7 @@ cargo clippy --locked --all-targets --features desktop -- -D warnings
 cargo test --locked --features desktop
 ```
 
-The tests launch real child processes to exercise starts, stops, restarts, dependencies, schedules, crash recovery and the CLI against a running agent.
+The tests launch real child processes to exercise starts, stops, restarts, dependencies, schedules, crash recovery and the CLI against a running agent. On Windows, `tests/windows_services.rs` creates real services when run from an elevated terminal, and skips itself otherwise.
 
 `examples/demo_worker.rs` is a harmless program for trying things out:
 

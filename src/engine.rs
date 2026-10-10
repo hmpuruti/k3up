@@ -3,24 +3,21 @@ use crate::{
     platform::ManagedProcess,
     protocol::{Command, Response},
     store::{Record, Store},
+    supervisor::{self, Ended, Exit},
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
-    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
-const LOG_LIMIT: u64 = 5 * 1024 * 1024;
 const LOG_CHECK: Duration = Duration::seconds(10);
 /// Polling interval while something is mid-transition, such as a TCP readiness check.
 const BUSY: std::time::Duration = std::time::Duration::from_millis(250);
 /// Longest sleep when nothing is due. Unix wakes earlier on child exit. Kept short because
 /// timers stop while the machine sleeps, so a deadline can be this late after resume.
 const IDLE: std::time::Duration = std::time::Duration::from_secs(15);
-const LOG_WINDOW: u64 = 128 * 1024;
 
 struct Runtime {
     status: Status,
@@ -202,7 +199,7 @@ impl Engine {
                     at(started + Duration::seconds(limit as i64));
                 }
                 if status.restart_count > 0 {
-                    at(started + Duration::seconds(60));
+                    at(started + Duration::seconds(supervisor::STABLE_SECS));
                 }
             }
             // Windows has no child-exit signal here, so exits are found by polling.
@@ -431,45 +428,7 @@ impl Engine {
     }
 
     fn read_log(&self, name: &str, lines: usize, after: Option<u64>) -> Result<(String, u64)> {
-        let Ok(mut file) = std::fs::File::open(self.log_path(name)) else {
-            return Ok((String::new(), 0));
-        };
-        let length = file.metadata()?.len();
-        let oldest = length.saturating_sub(LOG_WINDOW);
-        // An offset past the end means the log was rotated; its new content starts at zero.
-        let requested = after.map(|offset| if offset > length { 0 } else { offset });
-        let start = requested.unwrap_or(oldest).max(oldest);
-        file.seek(SeekFrom::Start(start))?;
-        let mut bytes = Vec::new();
-        file.take(length - start).read_to_end(&mut bytes)?;
-        // Hold back a trailing, partially written UTF-8 character until the rest arrives.
-        let complete = match std::str::from_utf8(&bytes) {
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            _ => bytes.len(),
-        };
-        let text = String::from_utf8_lossy(&bytes[..complete]);
-        let offset = start + complete as u64;
-        let text = match requested {
-            Some(requested) if start > requested => {
-                format!("[{} bytes skipped]\n{text}", start - requested)
-            }
-            Some(_) => text.into_owned(),
-            None => {
-                let text = if start > 0 {
-                    text.split_once('\n').map_or("", |(_, rest)| rest)
-                } else {
-                    &text
-                };
-                let mut tail = text
-                    .lines()
-                    .rev()
-                    .take(lines.clamp(1, 2000))
-                    .collect::<Vec<_>>();
-                tail.reverse();
-                tail.join("\n")
-            }
-        };
-        Ok((text, offset))
+        supervisor::read_log(&self.log_path(name), lines, after)
     }
 
     fn apply(&mut self, manifest: Manifest, dry_run: bool) -> Result<Response> {
@@ -672,16 +631,7 @@ impl Engine {
             return Ok(());
         }
         let spec = self.entries[name].status.workload.clone();
-        let launched = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.log_path(name))
-            .context("Open log file")
-            .and_then(|mut log| {
-                writeln!(log, "\n[{}] Starting {name}", now.to_rfc3339())?;
-                ManagedProcess::spawn(&spec, log)
-            });
-        match launched {
+        match supervisor::launch(&spec, &self.log_path(name), now) {
             Ok(process) => {
                 self.remember(name, process.id());
                 let waits = spec.readiness_tcp.is_some();
@@ -719,45 +669,31 @@ impl Engine {
         let entry = self.entries.get_mut(name).unwrap();
         entry.status.pid = None;
         entry.status.last_exit = Some(code);
-        let reason = if success && code != 0 {
-            format!("{reason}, counted as success")
-        } else {
-            reason
+        let ended = Ended {
+            code,
+            reason,
+            success,
         };
-        let spec = &entry.status.workload;
-        // Jobs finish once; retrying scheduled jobs requires an explicit future execution.
-        let retry = entry.status.desired_running
-            && spec.kind == Kind::Service
-            && (spec.restart == Restart::Always
-                || (spec.restart == Restart::OnFailure && !success));
-
-        let message = if retry && spec.max_restarts.allows(entry.status.restart_count) {
-            let delay = retry_delay(
-                spec.restart_backoff,
-                spec.restart_delay_secs,
-                entry.status.restart_count,
-            );
-            let attempt = entry.status.restart_count.saturating_add(1);
-            entry.status.restart_count = attempt;
-            entry.retry_at = Some(Utc::now() + Duration::seconds(delay as i64));
-            entry.status.state = State::Backoff;
-            match spec.max_restarts {
-                RestartLimit::Count(limit) => {
-                    format!("{reason}; retry {attempt}/{limit} in {delay}s")
-                }
-                RestartLimit::Unlimited => format!("{reason}; retry {attempt} in {delay}s"),
+        let message = match supervisor::on_exit(
+            &entry.status.workload,
+            entry.status.restart_count,
+            entry.status.desired_running,
+            ended,
+        ) {
+            Exit::Retry {
+                attempt,
+                delay_secs,
+                message,
+            } => {
+                entry.status.restart_count = attempt;
+                entry.retry_at = Some(Utc::now() + Duration::seconds(delay_secs as i64));
+                entry.status.state = State::Backoff;
+                message
             }
-        } else {
-            entry.status.state = if success {
-                State::Completed
-            } else {
-                State::Failed
-            };
-            entry.status.desired_running = false;
-            if retry {
-                format!("{reason}; restart limit reached")
-            } else {
-                reason
+            Exit::Final { state, message } => {
+                entry.status.state = state;
+                entry.status.desired_running = false;
+                message
             }
         };
         self.persist(name)?;
@@ -793,12 +729,11 @@ impl Engine {
             if let Some(process) = entry.process.as_mut() {
                 if let Some(code) = process.poll()? {
                     exit = Some((code, format!("Process exited with code {code}")));
-                } else if entry.status.workload.run_timeout_secs.is_some_and(|limit| {
-                    entry
-                        .status
-                        .started_at
-                        .is_some_and(|start| (now - start).num_seconds() >= limit as i64)
-                }) {
+                } else if supervisor::timed_out(
+                    &entry.status.workload,
+                    entry.status.started_at,
+                    now,
+                ) {
                     exit = Some((124, "Run timeout exceeded".into()));
                 }
             }
@@ -833,10 +768,7 @@ impl Engine {
         }
         if self.entries[name].status.state == State::Running
             && self.entries[name].status.restart_count > 0
-            && self.entries[name]
-                .status
-                .started_at
-                .is_some_and(|start| (now - start).num_seconds() >= 60)
+            && supervisor::stable(self.entries[name].status.started_at, now)
         {
             self.entries.get_mut(name).unwrap().status.restart_count = 0;
             self.changed();
@@ -873,18 +805,7 @@ impl Engine {
     }
 
     fn rotate_log(&self, name: &str) -> Result<()> {
-        let path = self.log_path(name);
-        if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > LOG_LIMIT) {
-            return Ok(());
-        }
-        // Copy/truncate keeps existing append handles valid; retention is best effort under heavy output.
-        let mut source = std::fs::File::open(&path)?;
-        let length = source.metadata()?.len();
-        source.seek(SeekFrom::Start(length.saturating_sub(LOG_LIMIT)))?;
-        let mut archive = std::fs::File::create(path.with_extension("log.1"))?;
-        std::io::copy(&mut source.take(LOG_LIMIT), &mut archive)?;
-        OpenOptions::new().write(true).open(&path)?.set_len(0)?;
-        Ok(())
+        supervisor::rotate_log(&self.log_path(name))
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {

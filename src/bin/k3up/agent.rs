@@ -15,8 +15,12 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Whether the client's data directory is the one the login item manages.
 fn managed(client: &Client) -> bool {
-    let default = platform::default_data_dir();
-    std::path::absolute(&client.data_dir).ok() == std::path::absolute(&default).ok()
+    same_dir(&client.data_dir, &platform::login_data_dir())
+}
+
+/// Compares paths as given, since either may not exist yet.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    std::path::absolute(a).ok() == std::path::absolute(b).ok()
 }
 
 fn login(client: &Client) -> Result<LoginAgent> {
@@ -71,13 +75,29 @@ fn wait_until_stopped(login: &LoginAgent, timeout: u64, request: Result<()>) -> 
     Ok(())
 }
 
-pub fn install(client: &Client) -> Result<Response> {
-    if !managed(client) {
+/// Refuses a new login item while services mode runs the workloads instead: the agent would
+/// run its own workloads beside the services.
+fn check_install(managed: bool, services_mode: bool, data: &Path) -> Result<()> {
+    if !managed {
         bail!(
             "The login item always manages the default data directory. Use `k3up agent start --data-dir {}` to run an agent for another one",
-            client.data_dir.display()
+            data.display()
         );
     }
+    if services_mode {
+        bail!(
+            "Services mode is on, so workloads run as Windows services. Run them there with `k3up apply`, not under your own agent"
+        );
+    }
+    Ok(())
+}
+
+fn services_mode() -> bool {
+    k3up::services::machine_mode_on()
+}
+
+pub fn install(client: &Client) -> Result<Response> {
+    check_install(managed(client), services_mode(), &client.data_dir)?;
     let login = login(client)?;
     login.register()?;
     login.start()?;
@@ -107,6 +127,9 @@ pub fn uninstall(client: &Client, timeout: u64) -> Result<Response> {
 }
 
 pub fn start(client: &Client) -> Result<Response> {
+    if managed(client) {
+        check_install(true, services_mode(), &client.data_dir)?;
+    }
     let login = login(client)?;
     if login.is_running() {
         let info = wait_until_answering(client)?;
@@ -254,5 +277,28 @@ pub fn uninstall_service() -> Result<Response> {
     #[cfg(not(windows))]
     {
         bail!("The machine service is Windows only")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_login_item_stays_with_the_users_own_directory_in_services_mode() {
+        let own = std::env::temp_dir().join("k3up-own");
+        let machine = std::env::temp_dir().join("k3up-machine");
+        assert!(same_dir(&own, &own));
+        assert!(!same_dir(&machine, &own));
+
+        check_install(true, false, &own).unwrap();
+        let other = check_install(false, false, &machine).unwrap_err();
+        assert!(
+            other
+                .to_string()
+                .starts_with("The login item always manages")
+        );
+        let beside = check_install(true, true, &own).unwrap_err();
+        assert!(beside.to_string().starts_with("Services mode is on"));
     }
 }

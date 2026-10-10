@@ -169,6 +169,18 @@ impl Drop for Monitor {
     }
 }
 
+/// One sample without a background sampler, for callers with no agent: two measurements a
+/// moment apart give current rates. There is no history and no agent usage.
+pub fn sample_once(data: PathBuf, roster: &[(String, u32)]) -> Metrics {
+    let mut sampler = Sampler::new(data);
+    sampler.sample(roster);
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(Duration::from_millis(250)));
+    let mut metrics = sampler.sample(roster);
+    metrics.agent = Usage::default();
+    metrics.history.clear();
+    metrics
+}
+
 struct Sampler {
     data: PathBuf,
     system: System,
@@ -524,10 +536,15 @@ fn log_bytes(data: &Path, name: &str) -> u64 {
     file_size(&logs.join(format!("{name}.log"))) + file_size(&logs.join(format!("{name}.log.1")))
 }
 
+/// The files in the data directory and its `logs` folder, and in services mode also those in
+/// the definition, state and event folders. Each folder counts at most `DATA_FILES` entries,
+/// so a folder flooded with files cannot stall sampling.
 fn data_bytes(data: &Path) -> u64 {
-    let size = |directory: &Path| {
+    const DATA_FILES: usize = 10_000;
+    let size = |directory: &Path| -> u64 {
         std::fs::read_dir(directory).map_or(0, |entries| {
             entries
+                .take(DATA_FILES)
                 .flatten()
                 .filter_map(|entry| entry.metadata().ok())
                 .filter(|metadata| metadata.is_file())
@@ -535,7 +552,12 @@ fn data_bytes(data: &Path) -> u64 {
                 .sum()
         })
     };
-    size(data) + size(&data.join("logs"))
+    let mut folders = vec![data.to_path_buf(), data.join("logs")];
+    if data.join(crate::services::files::MARKER).exists() {
+        let layout = crate::services::files::Layout::new(data);
+        folders.extend([layout.workloads(), layout.states(), layout.events_dir()]);
+    }
+    folders.iter().map(|folder| size(folder)).sum()
 }
 
 /// Samples a single process, such as the desktop app itself.
@@ -590,6 +612,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn data_usage_counts_every_folder_of_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = [
+            ("agent.db", 1),
+            ("logs/web.log", 10),
+            ("workloads/web.toml", 100),
+            ("workloads/.sequence", 1000),
+            ("state/web.json", 10_000),
+            ("events/web.jsonl", 100_000),
+        ];
+        for (path, length) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![b'x'; length]).unwrap();
+        }
+        assert_eq!(data_bytes(root), 11);
+        std::fs::write(root.join(crate::services::files::MARKER), b"").unwrap();
+        assert_eq!(data_bytes(root), 111_111);
+    }
+
+    #[test]
     fn tree_walks_descendants_once() {
         let children = HashMap::from([
             (Pid::from_u32(1), vec![Pid::from_u32(2), Pid::from_u32(3)]),
@@ -612,6 +656,20 @@ mod tests {
         assert!(!data.starts_with(&volume_key(r"C:\Use")));
         let share = volume_key(r"\\?\UNC\server\share\k3up");
         assert!(share.starts_with(&volume_key(r"\\server\share\")));
+    }
+
+    #[test]
+    fn one_off_samples_have_no_history_or_agent() {
+        let data = tempfile::tempdir().unwrap();
+        let metrics = sample_once(
+            data.path().to_path_buf(),
+            &[("self".into(), std::process::id())],
+        );
+        assert!(metrics.history.is_empty());
+        assert_eq!(metrics.agent, Usage::default());
+        assert_eq!(metrics.workloads[0].pids[0], std::process::id());
+        assert!(metrics.workloads[0].usage.memory > 0);
+        assert!(metrics.machine.memory_total > 0);
     }
 
     #[test]

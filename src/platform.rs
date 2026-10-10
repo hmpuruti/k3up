@@ -2,6 +2,22 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 pub fn default_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    if std::env::var_os("K3UP_DATA_DIR").is_none() {
+        let registered = crate::services::registered();
+        // A directory set up before services mode was recorded in the registry has only its
+        // marker.
+        let machine = registered.unwrap_or_else(machine_data_dir);
+        if crate::services::active(&machine) {
+            return machine;
+        }
+    }
+    login_data_dir()
+}
+
+/// The data directory of this account's own agent, which the login item manages. It differs
+/// from the default only once services mode is on.
+pub fn login_data_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("K3UP_DATA_DIR") {
         return path.into();
     }
@@ -14,6 +30,14 @@ pub fn default_data_dir() -> PathBuf {
         PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
             .join(".local/share/k3up")
     }
+}
+
+/// The data directory shared by every user, which services mode uses.
+#[cfg(windows)]
+pub fn machine_data_dir() -> PathBuf {
+    crate::win32::program_data()
+        .unwrap_or_else(|_| r"C:\ProgramData".into())
+        .join("K3 Up")
 }
 
 pub fn prepare_dir(path: &Path) -> Result<PathBuf> {

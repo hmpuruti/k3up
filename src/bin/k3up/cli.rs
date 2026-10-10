@@ -33,13 +33,18 @@ Data directory
   Set K3UP_DATA_DIR, or pass --data-dir to every command, to use another one. The login
   item always manages the default directory.
 
+Services mode (Windows)
+  After `k3up services enable`, each workload runs as its own Windows service, listed in
+  services.msc, with no agent. The data directory is then %ProgramData%\\K3 Up. The same
+  workload commands manage the services; changing them needs an elevated terminal.
+
 Command groups
   Workloads   create, edit, show, list, status, start, stop, restart, remove, logs,
               events, schedule, groups
   Manifests   validate, apply, export, template
   Health      stats, health
-  Agent       agent install, uninstall, start, stop, status, install-service,
-              uninstall-service
+  Agent       agent install, uninstall, start, stop, status
+  Services    services enable, disable, status (Windows)
   Other       completions, systemd-export, systemd-install
 
 Output and exit codes
@@ -48,8 +53,10 @@ Output and exit codes
   line was invalid. `k3up <command> --help` explains each command and shows examples.
 
 Changes outside the data directory
-  agent install, agent uninstall, install-service and uninstall-service change the system:
-  a login item, a Windows service. Every other command only touches the data directory.
+  agent install and agent uninstall change a login item. services enable and services
+  disable change Program Files and turn services mode on or off. In services mode, create,
+  edit, apply and remove create, change and delete Windows services. Every other command
+  only touches the data directory.
   To try K3 Up without changing the system, use a scratch directory and `agent start`:
     K3UP_DATA_DIR=/tmp/k3try k3up agent start";
 
@@ -595,6 +602,9 @@ Examples:
     /// Install, start, stop and inspect the agent
     #[command(display_order = 40, subcommand)]
     Agent(AgentCommand),
+    /// Run each workload as its own Windows service (Windows)
+    #[command(display_order = 41, subcommand)]
+    Services(ServicesCommand),
     /// Print a shell completion script
     #[command(
         display_order = 50,
@@ -731,8 +741,9 @@ Examples:
   k3up agent status --json | jq .reachable"
     )]
     Status,
-    /// Install the agent as a Windows machine service
+    /// Install the agent as a Windows machine service. Replaced by services mode
     #[command(
+        hide = true,
         long_about = "\
 Install the agent as a Windows service running as LocalSystem, for every user on the
 machine. Copies k3up-agent.exe from beside k3up.exe into Program Files and keeps its data in
@@ -747,6 +758,7 @@ Examples:
     InstallService,
     /// Stop and remove the Windows machine service
     #[command(
+        hide = true,
         long_about = "\
 Stop the Windows service and remove its registration. The Program Files and ProgramData
 folders are left in place for review.",
@@ -755,6 +767,54 @@ Examples:
   k3up agent uninstall-service"
     )]
     UninstallService,
+}
+
+#[derive(Subcommand)]
+pub enum ServicesCommand {
+    /// Turn on services mode, so each workload runs as its own Windows service
+    #[command(
+        long_about = "\
+Turn on services mode for the machine. Each workload then runs as its own Windows service,
+named K3Up_NAME and shown in services.msc as `K3 Up: FOLDER/NAME`, with no agent. Run it
+from an elevated terminal.
+
+It copies k3up.exe and k3up-host.exe, and k3up-desktop.exe when present, from the folder of
+the running k3up.exe to %ProgramFiles%\\K3 Up. Running K3 Up services are stopped for the
+copy and started again. It then creates %ProgramData%\\K3 Up with its workloads, logs,
+state and events folders and marks it as the data directory. Running it again updates the
+programs and repairs the folder permissions.
+
+It refuses while the agent service from `agent install-service` is installed.",
+        after_long_help = "\
+Examples:
+  k3up services enable
+  k3up create web --exe C:\\srv\\web.exe --start-at-boot --start
+  sc.exe query K3Up_web"
+    )]
+    Enable,
+    /// Turn off services mode; definitions and logs are kept
+    #[command(
+        long_about = "\
+Turn off services mode by removing its marker from the data directory. Refuses while any K3
+Up workload service exists, and lists them; remove them first. Definitions, logs and history
+stay in the data directory. Run it from an elevated terminal.",
+        after_long_help = "\
+Examples:
+  k3up remove web --stop
+  k3up services disable"
+    )]
+    Disable,
+    /// Whether services mode is on, where the host is, and workloads by state
+    #[command(
+        long_about = "\
+Show whether services mode is on for the data directory, where k3up-host.exe is expected,
+and how many workloads are in each state. Any user may run it.",
+        after_long_help = "\
+Examples:
+  k3up services status
+  k3up services status --json"
+    )]
+    Status,
 }
 
 #[derive(Subcommand)]

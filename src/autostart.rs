@@ -41,6 +41,20 @@ pub enum Registration {
     OtherDirectory,
 }
 
+/// The login agent the desktop app may register and start for `data`. A services mode
+/// directory has none: an agent there could not lock the protected folder, and registering it
+/// would replace the user's own login item.
+pub fn desktop_agent(
+    agent: Option<PathBuf>,
+    data: &std::path::Path,
+    services_mode: bool,
+) -> Option<LoginAgent> {
+    if services_mode {
+        return None;
+    }
+    Some(LoginAgent::new(agent?, data.to_path_buf()))
+}
+
 /// Starts the agent for the current user at login and on demand.
 ///
 /// macOS uses a launchd LaunchAgent and Linux a systemd user service; both restart the agent
@@ -293,49 +307,7 @@ impl LoginAgent {
     }
 
     fn registered_entry(&self) -> Option<String> {
-        use windows_sys::Win32::{
-            Foundation::ERROR_SUCCESS,
-            System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW},
-        };
-        let key = crate::win32::wide(RUN_KEY.as_ref());
-        let value = crate::win32::wide(RUN_VALUE.as_ref());
-        let mut bytes = 0u32;
-        // SAFETY: NUL-terminated names; a null buffer asks only for the size.
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                value.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut bytes,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return None;
-        }
-        let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
-        // SAFETY: the buffer is at least `bytes` long, as reported by the first call.
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                value.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                buffer.as_mut_ptr().cast(),
-                &mut bytes,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return None;
-        }
-        let length = buffer
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(buffer.len());
-        Some(String::from_utf16_lossy(&buffer[..length]))
+        crate::win32::registry_string(crate::win32::Hive::CurrentUser, RUN_KEY, RUN_VALUE)
     }
 
     /// Matches `run_entry`, which records the data directory as given.
@@ -345,45 +317,18 @@ impl LoginAgent {
     }
 
     fn install(&self) -> Result<()> {
-        use windows_sys::Win32::{
-            Foundation::ERROR_SUCCESS,
-            System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW},
-        };
-        let key = crate::win32::wide(RUN_KEY.as_ref());
-        let value = crate::win32::wide(RUN_VALUE.as_ref());
-        let data = crate::win32::wide(self.run_entry()?.as_ref());
-        // SAFETY: all buffers are NUL-terminated and outlive the call.
-        let status = unsafe {
-            RegSetKeyValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                value.as_ptr(),
-                REG_SZ,
-                data.as_ptr().cast(),
-                (data.len() * 2) as u32,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(std::io::Error::from_raw_os_error(status as i32))
-                .context("Write login entry");
-        }
-        Ok(())
+        crate::win32::set_registry_string(
+            crate::win32::Hive::CurrentUser,
+            RUN_KEY,
+            RUN_VALUE,
+            &self.run_entry()?,
+        )
+        .context("Write login entry")
     }
 
     fn uninstall(&self) -> Result<()> {
-        use windows_sys::Win32::{
-            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
-            System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyValueW},
-        };
-        let key = crate::win32::wide(RUN_KEY.as_ref());
-        let value = crate::win32::wide(RUN_VALUE.as_ref());
-        // SAFETY: NUL-terminated names that outlive the call.
-        let status = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) };
-        if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
-            return Err(std::io::Error::from_raw_os_error(status as i32))
-                .context("Remove login entry");
-        }
-        Ok(())
+        crate::win32::delete_registry_value(crate::win32::Hive::CurrentUser, RUN_KEY, RUN_VALUE)
+            .context("Remove login entry")
     }
 
     fn start_supervised(&self) -> Result<()> {
@@ -526,6 +471,16 @@ mod tests {
         let marker = |data: &str| format!("--data-dir {}", crate::systemd::quoted(data));
         assert!(unit.contains(&marker("/srv/k3up")));
         assert!(!unit.contains(&marker("/srv/k3")));
+    }
+
+    #[test]
+    fn the_desktop_manages_no_agent_in_services_mode() {
+        let agent = PathBuf::from("/opt/k3up/k3up-agent");
+        let data = Path::new("/srv/k3up");
+        let login = desktop_agent(Some(agent.clone()), data, false).unwrap();
+        assert_eq!(login.data_dir(), data);
+        assert!(desktop_agent(Some(agent), data, true).is_none());
+        assert!(desktop_agent(None, data, false).is_none());
     }
 
     #[test]
