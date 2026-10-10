@@ -92,8 +92,9 @@ pub fn status(data: &Path) -> Result<Outcome> {
 pub fn refuse_agent(data: &Path) -> Result<()> {
     if k3up::services::active(data) {
         bail!(
-            "{} is in services mode: each workload is its own Windows service and there is no agent. See `k3up services status`",
-            data.display()
+            "{} is in services mode: each workload is its own Windows service and there is no agent. See `k3up services status`. To reach your own agent, add --data-dir \"{}\"",
+            data.display(),
+            k3up::platform::login_data_dir().display()
         );
     }
     Ok(())

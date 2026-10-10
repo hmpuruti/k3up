@@ -1,5 +1,5 @@
 //! The Windows service manager calls that services mode needs.
-use super::status::{Scm, Service, description, display_name};
+use super::status::{Scm, Service, description, display_name, starts_at_boot};
 use crate::model::Workload;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -239,7 +239,7 @@ fn info(workload: &Workload, at: &Registration) -> ServiceInfo {
         name: at.service.into(),
         display_name: display_name(workload).into(),
         service_type: ServiceType::OWN_PROCESS,
-        start_type: if workload.start_at_boot {
+        start_type: if starts_at_boot(workload) {
             ServiceStartType::AutoStart
         } else {
             ServiceStartType::OnDemand
@@ -260,7 +260,7 @@ fn info(workload: &Workload, at: &Registration) -> ServiceInfo {
 
 fn configure(handle: &windows_service::service::Service, workload: &Workload) -> Result<()> {
     handle.set_description(description(workload))?;
-    handle.set_delayed_auto_start(workload.start_at_boot)?;
+    handle.set_delayed_auto_start(starts_at_boot(workload))?;
     // These only act when the host itself crashes. A workload that gave up for good reports
     // a clean stop with an error code, which must not bring it back.
     handle.update_failure_actions(ServiceFailureActions {

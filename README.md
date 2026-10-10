@@ -557,6 +557,17 @@ sc.exe query K3Up_web
 
 `services enable` copies `k3up.exe`, `k3up-host.exe` and `k3up-desktop.exe`, when present, to `%ProgramFiles%\K3 Up`, stopping and restarting running workload services around the copy. Every service it stopped is started again even when the copy fails, and if one does not stop or start, `services enable` names it and exits with code 1. It then creates `%ProgramData%\K3 Up` and marks it as the data directory, which `k3up` then uses by default. It refuses while the older agent service from `agent install-service` is installed; run `k3up agent uninstall-service` first. `services disable` turns the mode off once every workload service is removed, and keeps the data.
 
+`services enable` also refuses while your own agent starts at login or is running, because its workloads would run beside the services. Move them across first:
+
+```powershell
+k3up export --output workloads.toml
+k3up agent uninstall
+k3up services enable
+k3up apply workloads.toml
+```
+
+It can only see the agent of the account that runs it. Other accounts on the machine must run `k3up agent uninstall` themselves. Once services mode is on, `k3up` uses `%ProgramData%\K3 Up` by default, so reach your own agent with `--data-dir "%LOCALAPPDATA%\K3 Up"`, for example `k3up agent uninstall --data-dir "%LOCALAPPDATA%\K3 Up"`. `agent install` refuses while services mode is on.
+
 What appears in services.msc:
 
 | | |
@@ -564,7 +575,7 @@ What appears in services.msc:
 | Service name | `K3Up_NAME` |
 | Display name | `K3 Up: FOLDER/NAME`, or `K3 Up: NAME` without a folder, so K3 Up services sort together by folder |
 | Description | The workload's description, or "K3 Up workload" |
-| Startup type | Automatic (Delayed Start) with `start_at_boot`, otherwise Manual |
+| Startup type | Automatic (Delayed Start) for a service with `start_at_boot`, otherwise Manual. Jobs are always Manual. |
 | Account | LocalSystem |
 | Recovery | Restart the host after 5 s, 5 s and 30 s, reset after a day. This applies only if the host itself crashes. |
 

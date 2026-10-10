@@ -446,6 +446,14 @@ fn start_at_boot_means_automatic_delayed_start() {
     let manual = machine.workload("manual", "pulse");
     assert!(machine.put(manual).ok);
     assert!(machine.sc("qc", "manual").contains("DEMAND_START"));
+
+    let mut job = machine.workload("bootjob", "exit");
+    job.kind = Kind::Job;
+    job.start_at_boot = true;
+    assert!(machine.put(job).ok);
+    let config = machine.sc("qc", "bootjob");
+    assert!(config.contains("DEMAND_START"), "{config}");
+    assert_eq!(machine.get("bootjob").state, State::Stopped);
 }
 
 #[test]
@@ -913,6 +921,33 @@ fn a_standard_user_sees_states_but_not_definitions_or_logs() {
             refused.message
         );
     }
+
+    let unknown = as_standard_user(|| unknown_name_requests(&machine));
+    let elevated = unknown_name_requests(&machine);
+    for response in unknown.into_iter().chain(elevated) {
+        assert!(!response.ok);
+        assert_eq!(response.message, "Unknown workload 'nobody'");
+    }
+}
+
+/// Every request that names one workload, for a name that has no definition or service.
+fn unknown_name_requests(machine: &Machine) -> Vec<Response> {
+    let name = || "nobody".to_string();
+    [
+        Command::Get { name: name() },
+        Command::Logs {
+            name: name(),
+            lines: 20,
+            after: None,
+        },
+        Command::Start { name: name() },
+        Command::Stop { name: name() },
+        Command::Restart { name: name() },
+        Command::Remove { name: name() },
+    ]
+    .into_iter()
+    .map(|command| machine.send(command))
+    .collect()
 }
 
 /// A kernel driver service, which the service manager lists apart from programs, so services

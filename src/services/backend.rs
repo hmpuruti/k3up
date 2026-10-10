@@ -6,7 +6,7 @@ use super::{
     status::{self, Definition, Scm, Service},
 };
 use crate::{
-    model::{Kind, Manifest, State, Status, Workload},
+    model::{Manifest, State, Status, Workload},
     protocol::{Command, Response},
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -248,7 +248,7 @@ impl Backend {
         check_name(name)?;
         let service = scm::query(&self.service_name(name))?;
         let definition = self.definition(name)?;
-        if service.is_none() && definition == Definition::Missing {
+        if !status::known(&definition, service.is_some()) {
             bail!("Unknown workload '{name}'");
         }
         Ok(status::status(
@@ -451,12 +451,7 @@ impl Backend {
         let failures: Vec<String> = steps
             .iter()
             .map(|step| &step.change)
-            .filter(|change| {
-                let workload = &change.workload;
-                change.previous.is_none()
-                    && workload.start_at_boot
-                    && workload.kind == Kind::Service
-            })
+            .filter(|change| change.previous.is_none() && status::starts_at_boot(&change.workload))
             .filter_map(|change| {
                 let name = &change.workload.name;
                 let error = scm::start(&self.service_name(name)).err()?;
@@ -474,10 +469,10 @@ impl Backend {
         check_name(name)?;
         let service = self.service_name(name);
         let found = scm::query(&service)?;
-        let path = self.layout.definition(name);
-        if found.is_none() && files::read_definition(&path)?.is_none() {
+        if !status::known(&self.definition(name)?, found.is_some()) {
             bail!("Unknown workload '{name}'");
         }
+        let path = self.layout.definition(name);
         if found
             .as_ref()
             .is_some_and(|found| found.scm != Scm::Stopped)
@@ -502,15 +497,20 @@ impl Backend {
     fn start(&self, name: &str) -> Result<()> {
         check_name(name)?;
         let service = self.service_name(name);
-        let workload = match files::read_definition(&self.layout.definition(name))? {
-            Some(workload) => workload,
-            None if scm::exists(&service)? => {
+        let exists = scm::exists(&service)?;
+        let definition = self.definition(name)?;
+        if !status::known(&definition, exists) {
+            bail!("Unknown workload '{name}'");
+        }
+        let workload = match definition {
+            Definition::Present(workload) => workload,
+            Definition::Missing => {
                 bail!("Definition missing; `k3up remove {name}` deletes its service")
             }
-            None => bail!("Unknown workload '{name}'"),
+            Definition::Hidden => bail!(ELEVATE),
         };
         status::ensure_supported(&workload)?;
-        if !scm::exists(&service)? {
+        if !exists {
             scm::create(&workload, &self.registration(&service))?;
             self.event(name, "Windows service created again from the definition");
         }
@@ -544,9 +544,12 @@ impl Backend {
     fn stop(&self, name: &str) -> Result<()> {
         check_name(name)?;
         let service = self.service_name(name);
-        let timeout = match self.definition(name)? {
+        let definition = self.definition(name)?;
+        if !status::known(&definition, scm::exists(&service)?) {
+            bail!("Unknown workload '{name}'");
+        }
+        let timeout = match definition {
             Definition::Present(workload) => workload.stop_timeout_secs,
-            Definition::Missing if !scm::exists(&service)? => bail!("Unknown workload '{name}'"),
             _ => 30,
         };
         scm::stop(&service, Duration::from_secs(timeout + 30))

@@ -1,7 +1,7 @@
 //! Turns what the service manager, the definition and the host's state file say about a
 //! workload into the `Status` every client already understands.
 use super::files::HostState;
-use crate::model::{State, Status, Workload};
+use crate::model::{Kind, State, Status, Workload};
 use anyhow::{Result, bail};
 
 const DISPLAY_PREFIX: &str = "K3 Up: ";
@@ -55,6 +55,19 @@ pub fn group_from_display(display_name: &str, name: &str) -> String {
         .and_then(|path| path.strip_suffix('/'))
         .unwrap_or_default()
         .to_string()
+}
+
+/// Whether the service starts with Windows. As with the agent, `start_at_boot` applies to
+/// services only; a job runs only when started.
+pub fn starts_at_boot(workload: &Workload) -> bool {
+    workload.start_at_boot && workload.kind == Kind::Service
+}
+
+/// Whether a name refers to a workload. A definition the caller may not read counts only when
+/// its service exists, since users without administrator rights cannot tell a hidden
+/// definition from a missing one.
+pub fn known(definition: &Definition, service_exists: bool) -> bool {
+    service_exists || matches!(definition, Definition::Present(_))
 }
 
 /// The one place that lists what services mode cannot run yet.
@@ -214,6 +227,27 @@ mod tests {
         assert_eq!(display_name(&workload), "K3 Up: web");
         assert_eq!(group_from_display("K3 Up: web", "web"), "");
         assert_eq!(description(&workload), "Shop");
+    }
+
+    #[test]
+    fn only_services_start_at_boot() {
+        let mut workload = web();
+        assert!(!starts_at_boot(&workload));
+        workload.start_at_boot = true;
+        assert!(starts_at_boot(&workload));
+        workload.kind = Kind::Job;
+        assert!(!starts_at_boot(&workload));
+    }
+
+    #[test]
+    fn a_hidden_definition_without_a_service_is_unknown() {
+        let present = Definition::Present(Box::new(web()));
+        assert!(known(&present, false));
+        assert!(known(&present, true));
+        assert!(known(&Definition::Hidden, true));
+        assert!(known(&Definition::Missing, true));
+        assert!(!known(&Definition::Hidden, false));
+        assert!(!known(&Definition::Missing, false));
     }
 
     #[test]

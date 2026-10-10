@@ -7,6 +7,7 @@ use super::{
     scm,
     status::Scm,
 };
+use crate::autostart::LoginAgent;
 use crate::win32::{
     MARKER_SDDL, PRIVATE_DIR_SDDL, ROOT_DIR_SDDL, SHARED_DIR_SDDL, secure_dir, set_security,
 };
@@ -50,6 +51,8 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
             "The K3 Up agent service is installed. Run `k3up agent uninstall-service` first, then enable services mode"
         );
     }
+    let own = LoginAgent::new(PathBuf::new(), crate::platform::login_data_dir());
+    super::refuse_user_agent(own.registration(), own.is_running())?;
     let mut lines = install_programs(&settings.prefix)?;
     prepare(data)?;
     lines.push(format!("Services mode is on for {}", data.display()));

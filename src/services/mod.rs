@@ -17,6 +17,7 @@ pub mod setup;
 #[cfg(windows)]
 pub use backend::{Backend, DEFAULT_PREFIX, Settings};
 
+use crate::autostart::Registration;
 use anyhow::Result;
 use std::path::Path;
 
@@ -55,6 +56,21 @@ pub fn check(data: &Path) -> Result<bool> {
     }
 }
 
+/// Refuses to turn services mode on while this account's own agent is set to start at login
+/// or is running. Its workloads would keep running beside the new services, and once the
+/// default data directory moves to the machine's, the agent commands no longer reach it.
+pub fn refuse_user_agent(registration: Registration, running: bool) -> Result<()> {
+    let state = match (registration != Registration::None, running) {
+        (false, false) => return Ok(()),
+        (true, true) => "starts at login and is running",
+        (true, false) => "starts at login",
+        (false, true) => "is running",
+    };
+    anyhow::bail!(
+        "Your own K3 Up agent {state}, so its workloads would run beside the services. Move them first:\n  k3up export --output workloads.toml\n  k3up agent uninstall\n  k3up services enable\n  k3up apply workloads.toml"
+    )
+}
+
 /// Whether `data` is in services mode and protected.
 pub fn active(data: &Path) -> bool {
     matches!(check(data), Ok(true))
@@ -71,6 +87,32 @@ mod tests {
         // FILE_ALL_ACCESS, Modify, write data, delete, WRITE_DAC, GENERIC_WRITE.
         for mask in [0x1f01ff, 0x1301bf, 0x2, 0x1_0000, 0x4_0000, 0x4000_0000] {
             assert!(grants_change(mask), "{mask:#x}");
+        }
+    }
+
+    #[test]
+    fn services_mode_waits_for_the_users_own_agent() {
+        refuse_user_agent(Registration::None, false).unwrap();
+        for (registration, running, state) in [
+            (Registration::ThisDirectory, false, "starts at login"),
+            (Registration::OtherDirectory, false, "starts at login"),
+            (Registration::None, true, "is running"),
+            (
+                Registration::ThisDirectory,
+                true,
+                "starts at login and is running",
+            ),
+        ] {
+            let message = refuse_user_agent(registration, running)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.starts_with(&format!("Your own K3 Up agent {state}, ")),
+                "{message}"
+            );
+            assert!(
+                message.contains("k3up export --output workloads.toml\n  k3up agent uninstall")
+            );
         }
     }
 
