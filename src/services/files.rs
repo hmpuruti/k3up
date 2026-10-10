@@ -11,8 +11,10 @@ use std::{
 };
 
 pub const MARKER: &str = "services-mode";
-/// The last event id handed out, in the events folder.
-const SEQUENCE: &str = "sequence";
+/// The most of a state, definition or event file that is read.
+const READ_LIMIT: u64 = 1024 * 1024;
+/// How long recording an event waits for another writer before giving up.
+const EVENT_WAIT: Duration = Duration::from_secs(2);
 const EVENTS_LIMIT: usize = 2000;
 const EVENTS_KEPT: usize = 1000;
 const EVENTS_PAGE: usize = 200;
@@ -56,6 +58,15 @@ impl Layout {
     }
     pub fn events(&self, name: &str) -> PathBuf {
         self.events_dir().join(format!("{name}.jsonl"))
+    }
+    /// The last event id handed out. In the administrators' folder, so no other account can
+    /// hold its lock and stall the hosts.
+    pub fn sequence(&self) -> PathBuf {
+        self.workloads().join(".sequence")
+    }
+    /// Held by every command that changes services.
+    pub fn changes_lock(&self) -> PathBuf {
+        self.workloads().join(".lock")
     }
 }
 
@@ -151,10 +162,44 @@ pub fn definition_text(workload: &Workload) -> Result<String> {
     Ok(toml::to_string_pretty(workload)?)
 }
 
+/// Reads a whole file, refusing one larger than `READ_LIMIT`, so a huge or corrupt file
+/// cannot exhaust memory.
+fn read_bounded(path: &Path) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() > READ_LIMIT {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "larger than 1 MB",
+        ));
+    }
+    let mut text = String::new();
+    file.take(READ_LIMIT).read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// The last `READ_LIMIT` bytes of a file, from the first whole line, and whether anything
+/// before them was left out.
+fn read_tail(path: &Path) -> std::io::Result<(String, bool)> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let cut = length > READ_LIMIT;
+    if cut {
+        file.seek(SeekFrom::Start(length - READ_LIMIT))?;
+    }
+    let mut bytes = vec![];
+    file.take(READ_LIMIT).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = match cut {
+        true => text.split_once('\n').map_or("", |(_, rest)| rest),
+        false => &text,
+    };
+    Ok((text.to_string(), cut))
+}
+
 /// `None` when there is no definition. Unreadable definitions are errors, so callers can tell
 /// a missing definition from one they may not read.
 pub fn read_definition(path: &Path) -> Result<Option<Workload>> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match read_bounded(path) {
         Ok(text) => text,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
@@ -185,35 +230,30 @@ pub fn names(dir: &Path, extension: &str) -> Result<Vec<String>> {
 }
 
 pub fn read_state(path: &Path) -> Option<HostState> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    serde_json::from_str(&read_bounded(path).ok()?).ok()
 }
 
 pub fn write_state(path: &Path, state: &HostState) -> Result<()> {
     write_atomic(path, &serde_json::to_vec_pretty(state)?, |_| Ok(()))
 }
 
-/// Appends an event. Ids come from one sequence shared by every file in the folder, so they
-/// grow across all workloads whatever the clocks say, and the sequence stays locked until the
-/// event is written: a reader that has seen an id never misses a smaller one written later.
-/// The file is cut back to its newest entries once it grows past the limit.
-pub fn append_event(path: &Path, name: &str, message: &str) -> Result<()> {
-    let dir = path.parent().context("Locate the events folder")?;
-    let mut sequence = open_lock_file(&dir.join(SEQUENCE))?;
-    sequence
-        .lock_exclusive()
-        .context("Lock the event sequence")?;
-    let appended = next_event_id(&mut sequence, dir).and_then(|id| {
-        let event = Event {
-            id,
-            at: Utc::now(),
-            name: name.into(),
-            message: message.into(),
-        };
-        write_event(path, &serde_json::to_string(&event)?)
-    });
-    let _ = FileExt::unlock(&sequence);
-    appended
+/// Appends an event. Ids come from one sequence shared by every workload, kept where only
+/// administrators can open it, so they grow across all workloads whatever the clocks say.
+/// The sequence stays locked until the event is written, so a reader that has seen an id
+/// never misses a smaller one written later. Waits at most `EVENT_WAIT` for the sequence,
+/// so the host's supervision never stalls on it. The file is cut back to its newest entries
+/// once it grows past the limit.
+pub fn append_event(layout: &Layout, name: &str, message: &str) -> Result<()> {
+    let mut sequence = lock(&layout.sequence(), EVENT_WAIT)?
+        .context("The event history is busy; the event was not recorded")?;
+    let id = next_event_id(&mut sequence.0, &layout.events_dir())?;
+    let event = Event {
+        id,
+        at: Utc::now(),
+        name: name.into(),
+        message: message.into(),
+    };
+    write_event(&layout.events(name), &serde_json::to_string(&event)?)
 }
 
 /// Holds an exclusive lock on a file until dropped.
@@ -225,21 +265,19 @@ impl Drop for Lock {
     }
 }
 
-/// Takes the exclusive lock on `path` that every command changing services holds, waiting
-/// up to `wait` for another holder to finish.
-pub fn lock(path: &Path, wait: Duration) -> Result<Lock> {
+/// Takes an exclusive lock on `path`, waiting up to `wait` for another holder to finish.
+/// `None` when the wait runs out.
+pub fn lock(path: &Path, wait: Duration) -> Result<Option<Lock>> {
     let file = open_lock_file(path)?;
     let deadline = Instant::now() + wait;
     loop {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(Lock(file)),
+            Ok(()) => return Ok(Some(Lock(file))),
             Err(error) if error.raw_os_error() != fs2::lock_contended_error().raw_os_error() => {
                 return Err(error).with_context(|| format!("Lock {}", path.display()));
             }
-            Err(_) if Instant::now() >= deadline => {
-                anyhow::bail!("Another k3up command is changing services; try again")
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) if Instant::now() >= deadline => return Ok(None),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
         }
     }
 }
@@ -262,13 +300,13 @@ fn open_lock_file(path: &Path) -> Result<File> {
 /// Takes the next id and saves it before the event is written, so a failed write skips an
 /// id rather than reusing one. A missing or unreadable sequence continues after the largest
 /// id already written.
-fn next_event_id(sequence: &mut File, dir: &Path) -> Result<i64> {
+fn next_event_id(sequence: &mut File, events: &Path) -> Result<i64> {
     let mut text = String::new();
     sequence.seek(SeekFrom::Start(0))?;
-    sequence.read_to_string(&mut text)?;
+    sequence.take(64).read_to_string(&mut text)?;
     let last = match text.trim().parse::<i64>() {
         Ok(last) => last,
-        Err(_) => largest_event_id(dir)?,
+        Err(_) => largest_event_id(events)?,
     };
     let id = last + 1;
     sequence.set_len(0)?;
@@ -278,10 +316,10 @@ fn next_event_id(sequence: &mut File, dir: &Path) -> Result<i64> {
     Ok(id)
 }
 
-fn largest_event_id(dir: &Path) -> Result<i64> {
+fn largest_event_id(events: &Path) -> Result<i64> {
     let mut largest = 0;
-    for name in names(dir, "jsonl")? {
-        let Ok(text) = std::fs::read_to_string(dir.join(format!("{name}.jsonl"))) else {
+    for name in names(events, "jsonl")? {
+        let Ok((text, _)) = read_tail(&events.join(format!("{name}.jsonl"))) else {
             continue;
         };
         let ids = text
@@ -294,8 +332,8 @@ fn largest_event_id(dir: &Path) -> Result<i64> {
 }
 
 fn write_event(path: &Path, line: &str) -> Result<()> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let (text, cut) = match read_tail(path) {
+        Ok(read) => read,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return write_atomic(path, format!("{line}\n").as_bytes(), |path| {
                 own(path);
@@ -305,8 +343,8 @@ fn write_event(path: &Path, line: &str) -> Result<()> {
         Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
     };
     let lines: Vec<&str> = text.lines().collect();
-    if lines.len() >= EVENTS_LIMIT {
-        let mut kept = lines[lines.len() + 1 - EVENTS_KEPT..].join("\n");
+    if cut || lines.len() >= EVENTS_LIMIT {
+        let mut kept = lines[lines.len().saturating_sub(EVENTS_KEPT - 1)..].join("\n");
         kept.push('\n');
         kept.push_str(line);
         kept.push('\n');
@@ -315,13 +353,29 @@ fn write_event(path: &Path, line: &str) -> Result<()> {
             Ok(())
         });
     }
-    refuse_redirected(path)?;
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("Open {}", path.display()))?;
+    let mut file = open_append(path)?;
     file.write_all(format!("{line}\n").as_bytes())?;
     Ok(())
+}
+
+/// Opens a file to append to, creating it when missing, and refuses one a write could be
+/// redirected through or that another account owns. On Windows the checks read the handle
+/// that is written to.
+pub fn open_append(path: &Path) -> Result<File> {
+    refuse_redirected_parent(path)?;
+    #[cfg(windows)]
+    {
+        crate::win32::open_append(path)
+    }
+    #[cfg(not(windows))]
+    {
+        refuse_redirected(path)?;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("Open {}", path.display()))
+    }
 }
 
 /// Makes Administrators the owner of a shared file this process created, which the host
@@ -336,7 +390,8 @@ fn own(path: &Path) {
     let _ = path;
 }
 
-/// Newest first, at most one page, only with ids above `after`.
+/// Newest first, at most one page, only with ids above `after`. Only the end of a large file
+/// is read.
 pub fn read_events(layout: &Layout, name: Option<&str>, after: Option<i64>) -> Result<Vec<Event>> {
     let files = match name {
         Some(name) => vec![name.to_string()],
@@ -345,7 +400,7 @@ pub fn read_events(layout: &Layout, name: Option<&str>, after: Option<i64>) -> R
     let after = after.unwrap_or(0);
     let mut events = vec![];
     for file in files {
-        let Ok(text) = std::fs::read_to_string(layout.events(&file)) else {
+        let Ok((text, _)) = read_tail(&layout.events(&file)) else {
             continue;
         };
         events.extend(
@@ -363,14 +418,20 @@ pub fn read_events(layout: &Layout, name: Option<&str>, after: Option<i64>) -> R
 mod tests {
     use super::*;
 
+    fn layout(dir: &tempfile::TempDir) -> Layout {
+        let layout = Layout::new(dir.path());
+        std::fs::create_dir_all(layout.events_dir()).unwrap();
+        std::fs::create_dir_all(layout.workloads()).unwrap();
+        layout
+    }
+
     #[test]
     fn events_merge_newest_first_and_stay_bounded() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::new(dir.path());
-        std::fs::create_dir_all(layout.events_dir()).unwrap();
-        append_event(&layout.events("a"), "a", "first").unwrap();
-        append_event(&layout.events("b"), "b", "second").unwrap();
-        append_event(&layout.events("a"), "a", "third").unwrap();
+        let layout = layout(&dir);
+        append_event(&layout, "a", "first").unwrap();
+        append_event(&layout, "b", "second").unwrap();
+        append_event(&layout, "a", "third").unwrap();
         let all = read_events(&layout, None, None).unwrap();
         let messages: Vec<_> = all.iter().map(|event| event.message.as_str()).collect();
         assert_eq!(messages, ["third", "second", "first"]);
@@ -384,7 +445,7 @@ mod tests {
         );
 
         for index in 0..EVENTS_LIMIT + 5 {
-            append_event(&layout.events("c"), "c", &index.to_string()).unwrap();
+            append_event(&layout, "c", &index.to_string()).unwrap();
         }
         let text = std::fs::read_to_string(layout.events("c")).unwrap();
         let count = text.lines().count();
@@ -408,14 +469,13 @@ mod tests {
     #[test]
     fn concurrent_writers_share_one_increasing_sequence() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::new(dir.path());
-        std::fs::create_dir_all(layout.events_dir()).unwrap();
+        let layout = layout(&dir);
         let writers: Vec<_> = (0..4)
             .map(|writer| {
-                let path = layout.events(&format!("w{writer}"));
+                let layout = layout.clone();
                 std::thread::spawn(move || {
                     for index in 0..50 {
-                        append_event(&path, "w", &index.to_string()).unwrap();
+                        append_event(&layout, &format!("w{writer}"), &index.to_string()).unwrap();
                     }
                 })
             })
@@ -436,8 +496,7 @@ mod tests {
     #[test]
     fn a_lost_or_broken_sequence_continues_after_the_largest_id() {
         let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::new(dir.path());
-        std::fs::create_dir_all(layout.events_dir()).unwrap();
+        let layout = layout(&dir);
         let old = Event {
             id: 1_700_000_000_000_000,
             at: Utc::now(),
@@ -446,14 +505,13 @@ mod tests {
         };
         let line = format!("{}\n", serde_json::to_string(&old).unwrap());
         std::fs::write(layout.events("a"), line).unwrap();
-        append_event(&layout.events("b"), "b", "after the upgrade").unwrap();
+        append_event(&layout, "b", "after the upgrade").unwrap();
         assert_eq!(ids(&layout, "b"), [old.id + 1]);
 
-        let sequence = layout.events_dir().join(SEQUENCE);
-        std::fs::write(&sequence, b"not a number").unwrap();
-        append_event(&layout.events("a"), "a", "after corruption").unwrap();
-        std::fs::remove_file(&sequence).unwrap();
-        append_event(&layout.events("b"), "b", "after deletion").unwrap();
+        std::fs::write(layout.sequence(), b"not a number").unwrap();
+        append_event(&layout, "a", "after corruption").unwrap();
+        std::fs::remove_file(layout.sequence()).unwrap();
+        append_event(&layout, "b", "after deletion").unwrap();
         assert_eq!(ids(&layout, "a"), [old.id, old.id + 2]);
         assert_eq!(ids(&layout, "b"), [old.id + 1, old.id + 3]);
         let merged: Vec<i64> = read_events(&layout, None, Some(old.id))
@@ -465,19 +523,67 @@ mod tests {
     }
 
     #[test]
+    fn a_held_sequence_makes_recording_give_up_instead_of_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(&dir);
+        let held = lock(&layout.sequence(), Duration::ZERO).unwrap().unwrap();
+        let started = Instant::now();
+        let refused = append_event(&layout, "a", "blocked").unwrap_err();
+        let waited = started.elapsed();
+        assert!(
+            waited >= EVENT_WAIT && waited < EVENT_WAIT * 3,
+            "{waited:?}"
+        );
+        assert!(refused.to_string().starts_with("The event history is busy"));
+        assert!(!layout.events("a").exists());
+        drop(held);
+        append_event(&layout, "a", "recorded").unwrap();
+    }
+
+    #[test]
     fn a_second_holder_waits_and_then_gives_up() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".lock");
-        let held = lock(&path, Duration::ZERO).unwrap();
+        let held = lock(&path, Duration::ZERO).unwrap().unwrap();
         let started = Instant::now();
-        let refused = lock(&path, Duration::from_millis(300)).err().unwrap();
+        assert!(lock(&path, Duration::from_millis(300)).unwrap().is_none());
         assert!(started.elapsed() >= Duration::from_millis(300));
-        assert_eq!(
-            refused.to_string(),
-            "Another k3up command is changing services; try again"
-        );
         drop(held);
-        lock(&path, Duration::ZERO).unwrap();
+        assert!(lock(&path, Duration::ZERO).unwrap().is_some());
+    }
+
+    #[test]
+    fn huge_files_are_read_only_in_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(&dir);
+        std::fs::create_dir_all(layout.states()).unwrap();
+        let huge = vec![b'x'; READ_LIMIT as usize + 1];
+        std::fs::write(layout.state("web"), &huge).unwrap();
+        std::fs::write(layout.definition("web"), &huge).unwrap();
+        assert_eq!(read_state(&layout.state("web")), None);
+        let error = format!(
+            "{:#}",
+            read_definition(&layout.definition("web")).unwrap_err()
+        );
+        assert!(error.ends_with("larger than 1 MB"), "{error}");
+
+        let event = Event {
+            id: 7,
+            at: Utc::now(),
+            name: "web".into(),
+            message: "last".into(),
+        };
+        let mut events = huge;
+        events.push(b'\n');
+        events.extend(serde_json::to_vec(&event).unwrap());
+        events.push(b'\n');
+        std::fs::write(layout.events("web"), &events).unwrap();
+        let read = read_events(&layout, Some("web"), None).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].message, "last");
+        append_event(&layout, "web", "after").unwrap();
+        assert!(std::fs::metadata(layout.events("web")).unwrap().len() < READ_LIMIT);
+        assert_eq!(ids(&layout, "web"), [7, 8]);
     }
 
     #[test]

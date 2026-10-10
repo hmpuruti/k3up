@@ -96,10 +96,17 @@ pub fn launch(spec: &Workload, log: &Path, now: DateTime<Utc>) -> Result<Managed
         .append(true)
         .open(log)
         .context("Open log file")
-        .and_then(|mut file| {
-            writeln!(file, "\n[{}] Starting {}", now.to_rfc3339(), spec.name)?;
-            ManagedProcess::spawn(spec, file)
-        })
+        .and_then(|file| launch_into(spec, file, now))
+}
+
+/// As `launch`, with the log already open.
+pub fn launch_into(
+    spec: &Workload,
+    mut log: std::fs::File,
+    now: DateTime<Utc>,
+) -> Result<ManagedProcess> {
+    writeln!(log, "\n[{}] Starting {}", now.to_rfc3339(), spec.name)?;
+    ManagedProcess::spawn(spec, log)
 }
 
 /// Without `after`, the last `lines` lines. With `after`, what was written since that byte

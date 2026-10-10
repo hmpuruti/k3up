@@ -31,6 +31,49 @@ pub fn grants_change(mask: u32) -> bool {
     mask & CHANGE_RIGHTS != 0
 }
 
+/// Whom an access control entry names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Principal {
+    /// SYSTEM, Administrators or TrustedInstaller.
+    Trusted,
+    /// CREATOR OWNER, which stands for the object's owner.
+    CreatorOwner,
+    Other,
+}
+
+/// An access control entry, reduced to what decides whether it lets someone change the object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ace {
+    Allow {
+        principal: Principal,
+        mask: u32,
+        /// Applies only to new children, not to the object itself.
+        inherit_only: bool,
+    },
+    Deny,
+    /// Conditional, object and other entries, which K3 Up never writes.
+    Unknown {
+        inherit_only: bool,
+    },
+}
+
+/// Whether only trusted principals may change an object with these entries, given that its
+/// owner is trusted, which also covers CREATOR OWNER. Inherit-only entries are skipped: they
+/// reach new children only, and whoever creates one needs a grant that already counts here.
+pub fn only_trusted_may_change(aces: &[Ace]) -> bool {
+    aces.iter().all(|ace| match *ace {
+        Ace::Deny
+        | Ace::Allow {
+            inherit_only: true, ..
+        }
+        | Ace::Unknown { inherit_only: true } => true,
+        Ace::Unknown { .. } => false,
+        Ace::Allow {
+            principal, mask, ..
+        } => principal != Principal::Other || !grants_change(mask),
+    })
+}
+
 /// Whether `data` is in services mode. A marker in a folder that someone other than SYSTEM
 /// and Administrators controls is an error: that account could read the definitions written
 /// there and forge the state read from it. Always false outside Windows.
@@ -88,6 +131,48 @@ mod tests {
         for mask in [0x1f01ff, 0x1301bf, 0x2, 0x1_0000, 0x4_0000, 0x4000_0000] {
             assert!(grants_change(mask), "{mask:#x}");
         }
+    }
+
+    #[test]
+    fn only_trusted_principals_may_change_a_protected_object() {
+        let allow = |principal, mask, inherit_only| Ace::Allow {
+            principal,
+            mask,
+            inherit_only,
+        };
+        let program_files = [
+            allow(Principal::Trusted, 0x1f01ff, false),
+            allow(Principal::Trusted, 0x1000_0000, true),
+            allow(Principal::CreatorOwner, 0x1000_0000, true),
+            allow(Principal::Other, 0x1200a9, false),
+            allow(Principal::Other, 0xa000_0000, true),
+            Ace::Deny,
+        ];
+        assert!(only_trusted_may_change(&program_files));
+        // CREATOR OWNER stands for the owner, which the caller requires to be trusted.
+        assert!(only_trusted_may_change(&[allow(
+            Principal::CreatorOwner,
+            0x1f01ff,
+            false
+        )]));
+        // Full control for Users on new children only does not let them change this object.
+        assert!(only_trusted_may_change(&[allow(
+            Principal::Other,
+            0x1f01ff,
+            true
+        )]));
+        for refused in [
+            allow(Principal::Other, 0x1301bf, false),
+            allow(Principal::Other, 0x4_0000, false),
+            Ace::Unknown {
+                inherit_only: false,
+            },
+        ] {
+            assert!(!only_trusted_may_change(&[refused]), "{refused:?}");
+        }
+        assert!(only_trusted_may_change(&[Ace::Unknown {
+            inherit_only: true
+        }]));
     }
 
     #[test]

@@ -209,7 +209,7 @@ impl Backend {
 
     fn event(&self, name: &str, message: &str) {
         // History is a convenience; failing to record it must not fail the change itself.
-        let _ = files::append_event(&self.layout.events(name), name, message);
+        let _ = files::append_event(&self.layout, name, message);
     }
 
     fn services(&self) -> Result<BTreeMap<String, Service>> {
@@ -574,7 +574,10 @@ impl Backend {
             _ => 30,
         };
         scm::stop(&service, Duration::from_secs(timeout + 30))?;
-        self.record_stop(name)
+        // The service has stopped; a reader holding the state file only leaves the old
+        // report in place, which must not turn the stop into a failure.
+        let _ = self.record_stop(name);
+        Ok(())
     }
 
     /// A host that already ended, after a failure or a stop outside K3 Up, left its last
@@ -642,9 +645,10 @@ struct Step {
 /// The lock every command that changes services in the data directory `data` holds. It lives
 /// in the folder only administrators may write.
 pub fn lock(data: &Path) -> Result<files::Lock> {
-    let folder = Layout::new(data).workloads();
-    refuse_unprotected(&folder)?;
-    files::lock(&folder.join(".lock"), Duration::from_secs(60))
+    let layout = Layout::new(data);
+    refuse_unprotected(&layout.workloads())?;
+    files::lock(&layout.changes_lock(), Duration::from_secs(60))?
+        .context("Another k3up command is changing services; try again")
 }
 
 fn refuse_unprotected(folder: &Path) -> Result<()> {

@@ -547,15 +547,17 @@ systemctl --user status k3up-example-worker.service
 
 The installer and the desktop app run the agent under your own account. Services mode runs each workload as its own Windows service instead, like NSSM or WinSW: workloads start at boot, run without anyone logged in, and keep running with no K3 Up process other than their own host. The `k3up` command line manages them.
 
-From an elevated terminal, in the folder that holds `k3up.exe` and `k3up-host.exe`, such as the installer's `%LOCALAPPDATA%\Programs\K3 Up`:
+To turn it on, extract `k3up-windows-x86_64.zip` into `C:\Program Files\K3 Up`, then from an elevated terminal run:
 
 ```powershell
-.\k3up.exe services enable
+& "C:\Program Files\K3 Up\k3up.exe" services enable
 k3up create web --exe C:\srv\web\web.exe --group shop --start-at-boot --start
 sc.exe query K3Up_web
 ```
 
-`services enable` copies `k3up.exe`, `k3up-host.exe` and `k3up-desktop.exe`, when present, to `%ProgramFiles%\K3 Up`, stopping and restarting running workload services around the copy. Every service it stopped is started again even when the copy fails, and if one does not stop or start, `services enable` names it and exits with code 1. It then creates `%ProgramData%\K3 Up` and marks it as the data directory, which `k3up` then uses by default. It refuses while the older agent service from `agent install-service` is installed; run `k3up agent uninstall-service` first. `services disable` turns the mode off once every workload service is removed, and keeps the data.
+A later release will let the installer set this up. Every service runs `k3up-host.exe` as LocalSystem, so `services enable` refuses to install programs from a folder, or a program, that users who aren't administrators can change, such as the installer's `%LOCALAPPDATA%\Programs\K3 Up`.
+
+Run from another protected folder, `services enable` copies `k3up.exe`, `k3up-host.exe` and `k3up-desktop.exe`, when present, to `%ProgramFiles%\K3 Up`, stopping and restarting running workload services around the copy. Each program replaces the installed copy in one step, so a failed copy leaves the old one in place. Every service it stopped is started again even when the copy fails, and if one does not stop or start, `services enable` names it and exits with code 1. It then creates `%ProgramData%\K3 Up` and marks it as the data directory, which `k3up` then uses by default. It refuses while the older agent service from `agent install-service` is installed; run `k3up agent uninstall-service` first. `services disable` turns the mode off once every workload service is removed, and keeps the data.
 
 `services enable` also refuses while your own agent starts at login or is running, because its workloads would run beside the services. Move them across first:
 
@@ -591,7 +593,7 @@ Files in `%ProgramData%\K3 Up`:
 | `events\NAME.jsonl` | Activity history | Administrators change, users read |
 | `services-mode` | Marks the folder as the services mode data directory | Administrators change, users read |
 
-Changing workloads needs an elevated terminal; without one, `k3up` says so. As with the agent, `apply` saves all of its workloads or none. When one fails, K3 Up restores the definitions and services it already changed, and the message says whether the restore worked. Any user can run `k3up list` and `k3up services status` to see names, folders and states, but not definitions, which may hold secrets in their environment variables. K3 Up uses services mode only when the data directory and its marker belong to SYSTEM or Administrators, are not links, and no other account may change them. Otherwise `k3up` falls back to the per-user directory, or refuses a `--data-dir` that points there. The host applies the same check to its folders and the definition before it runs anything, and state and history files never quote a definition: the details of a refusal or a failed launch go to the workload's log, which only administrators read.
+Changing workloads needs an elevated terminal; without one, `k3up` says so. As with the agent, `apply` saves all of its workloads or none. When one fails, K3 Up restores the definitions and services it already changed, and the message says whether the restore worked. Commands that change workloads take turns: one waits up to 60 seconds for another to finish, then fails with "Another k3up command is changing services; try again". `services enable` also gives files already in the folders the folder's permissions, and refuses links and files another account owns. Any user can run `k3up list` and `k3up services status` to see names, folders and states, but not definitions, which may hold secrets in their environment variables. K3 Up uses services mode only when the data directory and its marker belong to SYSTEM or Administrators, are not links, and no other account may change them. Otherwise `k3up` falls back to the per-user directory, or refuses a `--data-dir` that points there. The host applies the same check to its folders and the definition before it runs anything, and state and history files never quote a definition: the details of a refusal or a failed launch go to the workload's log, which only administrators read.
 
 Not supported in services mode yet: schedules, dependencies, TCP readiness checks and per-workload accounts. A definition that uses one is refused with a message that names it. `stats` and `health` show current usage but no history, and there is no agent, so the `agent` commands refuse to run and the desktop app neither registers nor starts one.
 

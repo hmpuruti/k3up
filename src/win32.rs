@@ -1,3 +1,4 @@
+use crate::services::{Ace, Principal};
 use anyhow::{Context, Result, bail};
 use std::{
     ffi::{OsStr, OsString},
@@ -8,27 +9,27 @@ use std::{
     },
     path::{Path, PathBuf},
     ptr,
+    sync::OnceLock,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree},
     Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
         Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-            GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
-            SetNamedSecurityInfoW,
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+            GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
         },
-        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetSecurityDescriptorDacl,
-        GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE, InitializeAcl,
-        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
-        TokenElevation, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
-        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetTokenInformation,
+        INHERIT_ONLY_ACE, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
+        UNPROTECTED_DACL_SECURITY_INFORMATION, WinBuiltinAdministratorsSid, WinCreatorOwnerSid,
+        WinLocalSystemSid,
     },
     Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        GetFileInformationByHandle, READ_CONTROL,
+        CreateDirectoryW, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     },
     System::{
         Com::CoTaskMemFree,
@@ -36,6 +37,9 @@ use windows_sys::Win32::{
     },
     UI::Shell::{FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath},
 };
+
+mod pinned;
+use pinned::{Pinned, SHARE_ALL, SHARE_NO_DELETE};
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
@@ -127,49 +131,36 @@ pub fn create_dir_with(path: &Path, sddl: &str) -> Result<()> {
 
 /// Gives a directory the access in `sddl`, creating it if needed. An existing directory owned
 /// by an account other than SYSTEM or Administrators is refused, because that account could
-/// have planted files the service host would trust.
+/// have planted files the service host would trust. The checks and the change go through one
+/// handle that does not follow links and keeps the directory from being renamed meanwhile.
 pub fn secure_dir(path: &Path, sddl: &str) -> Result<()> {
-    refuse_reparse_point(path)?;
-    if !path.exists() {
-        return create_dir_with(path, sddl);
+    let pinned = match Pinned::open(
+        path,
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        SHARE_NO_DELETE,
+    ) {
+        Ok(pinned) => pinned,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return create_dir_with(path, sddl);
+        }
+        Err(error) => return Err(error).with_context(|| format!("Open {}", path.display())),
+    };
+    if pinned.is_link()? {
+        bail!(
+            "{} is a link to another location; services mode refuses it",
+            path.display()
+        );
     }
-    if !owned_by_system_or_administrators(path)? {
+    if !pinned.security()?.owner_is_system_or_administrators() {
         bail!(
             "{} belongs to another account. Review its contents and remove it, then try again",
             path.display()
         );
     }
-    let attributes = SecurityAttributes::from_sddl(sddl)?;
-    let path_wide = wide(path.as_os_str());
-    let mut present = 0;
-    let mut defaulted = 0;
-    let mut dacl: *mut ACL = ptr::null_mut();
-    // SAFETY: the descriptor is valid while attributes lives; the DACL points into it.
-    let status = unsafe {
-        if GetSecurityDescriptorDacl(
-            attributes.descriptor(),
-            &mut present,
-            &mut dacl,
-            &mut defaulted,
-        ) == 0
-        {
-            return Err(std::io::Error::last_os_error()).context("Read directory ACL");
-        }
-        SetNamedSecurityInfoW(
-            path_wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            dacl,
-            ptr::null(),
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(status as i32))
-            .with_context(|| format!("Protect {}", path.display()));
-    }
-    Ok(())
+    pinned.set(
+        sddl,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+    )
 }
 
 /// Whether `path` is a junction, symbolic link or other reparse point. Path-based security
@@ -196,97 +187,58 @@ pub fn refuse_reparse_point(path: &Path) -> Result<()> {
 /// through, a reparse point or a file with another hard link, and a file another account
 /// owns, since that account could read what is written or change it.
 pub fn refuse_redirected_file(path: &Path) -> Result<()> {
-    refuse_reparse_point(path)?;
-    let file = match std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("Open {}", path.display())),
-    };
-    let handle = file.as_raw_handle() as HANDLE;
-    // SAFETY: the handle is open for the duration of the call; the structure is plain data.
-    let links = unsafe {
-        let mut information: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
-        if GetFileInformationByHandle(handle, &mut information) == 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("Read {}", path.display()));
-        }
-        information.nNumberOfLinks
-    };
-    if links > 1 {
-        bail!(
-            "{} has another hard link; services mode refuses to write to it",
-            path.display()
-        );
+    match Pinned::open(path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL) {
+        Ok(pinned) => check_writable(&pinned),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Open {}", path.display())),
     }
-    if !trusted_owner(handle).with_context(|| format!("Read the owner of {}", path.display()))? {
-        bail!(
-            "{} belongs to another account; services mode refuses to write to it",
-            path.display()
-        );
+}
+
+fn check_writable(pinned: &Pinned) -> Result<()> {
+    let path = pinned.path().display();
+    if pinned.is_link()? {
+        bail!("{path} is a link to another location; services mode refuses it");
+    }
+    if pinned.links()? > 1 {
+        bail!("{path} has another hard link; services mode refuses to write to it");
+    }
+    if !pinned.security()?.owner_is_trusted_or_self()? {
+        bail!("{path} belongs to another account; services mode refuses to write to it");
     }
     Ok(())
 }
 
-fn trusted_owner(handle: HANDLE) -> Result<bool> {
-    let mut owner: PSID = ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: the caller keeps the handle open for the call; out-pointers are valid.
-    let status = unsafe {
-        GetSecurityInfo(
-            handle,
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            &mut owner,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(status as i32).into());
-    }
-    // A file this account owns is no threat to this account's own writes.
-    // SAFETY: owner points into descriptor, which stays allocated until LocalFree below.
-    let trusted = unsafe {
-        if system_or_administrators(owner) {
-            Ok(true)
-        } else {
-            current_user_is(owner)
-        }
-    };
-    // SAFETY: allocated by GetSecurityInfo.
-    unsafe {
-        LocalFree(descriptor);
-    }
-    trusted
+/// Opens a file for appending, creating it if missing, and refuses it as
+/// `refuse_redirected_file` does. The checks read the handle that is then written to, so the
+/// path cannot be swapped for a link in between.
+pub fn open_append(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .access_mode(FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("Open {}", path.display()))?;
+    let pinned = Pinned::from_file(file, path);
+    check_writable(&pinned)?;
+    Ok(pinned.into_file())
 }
 
 /// Brings what an earlier, less protected folder may hold under the folder's own access:
 /// every entry inside gets Administrators as owner and only the permissions it inherits.
 /// Refuses, naming them all, entries that are links, have another hard link or belong to
 /// another account, since resetting them would follow the link or hide what they held.
+///
+/// Each entry is opened by name without following a link, and then must resolve to a path
+/// directly inside its folder's own resolved path, so a folder swapped for a link after it
+/// was listed is caught. Every handle denies deletion and renaming until the reset is done,
+/// which also keeps the folders above it in place.
 pub fn reset_contents(dir: &Path) -> Result<()> {
+    let folder = Pinned::open(dir, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_NO_DELETE)
+        .with_context(|| format!("Open {}", dir.display()))?;
     let mut entries = vec![];
-    collect_entries(dir, &mut entries)?;
-    let refused: Vec<String> = entries
-        .iter()
-        .filter_map(|entry| {
-            let checked = if entry.is_dir() && !is_reparse_point(entry).unwrap_or(true) {
-                owned_by_system_or_administrators(entry).and_then(|trusted| {
-                    anyhow::ensure!(trusted, "belongs to another account");
-                    Ok(())
-                })
-            } else {
-                refuse_redirected_file(entry)
-            };
-            checked.err().map(|error| format!("  {error:#}"))
-        })
-        .collect();
+    let mut refused = vec![];
+    collect_entries(&folder, &mut entries, &mut refused)?;
     if !refused.is_empty() {
         bail!(
             "Remove these from {} and try again:\n{}",
@@ -295,142 +247,173 @@ pub fn reset_contents(dir: &Path) -> Result<()> {
         );
     }
     for entry in &entries {
-        inherit_only(entry)?;
-    }
-    Ok(())
-}
-
-/// Makes Administrators the owner and drops every explicit grant, so only what the parent
-/// passes down applies.
-fn inherit_only(path: &Path) -> Result<()> {
-    let attributes = SecurityAttributes::from_sddl("O:BA")?;
-    let path_wide = wide(path.as_os_str());
-    // u32 elements keep the ACL header aligned.
-    let mut empty = [0u32; size_of::<ACL>().div_ceil(4)];
-    let mut owner: PSID = ptr::null_mut();
-    let mut defaulted = 0;
-    // SAFETY: the descriptor is valid while attributes lives and the owner points into it;
-    // the ACL buffer is large enough for an ACL with no entries.
-    let status = unsafe {
-        if GetSecurityDescriptorOwner(attributes.descriptor(), &mut owner, &mut defaulted) == 0
-            || InitializeAcl(
-                empty.as_mut_ptr().cast(),
-                size_of::<ACL>() as u32,
-                ACL_REVISION,
-            ) == 0
-        {
-            return Err(std::io::Error::last_os_error()).context("Build an empty ACL");
-        }
-        SetNamedSecurityInfoW(
-            path_wide.as_ptr(),
-            SE_FILE_OBJECT,
+        entry.set(
+            INHERIT_ONLY_SDDL,
             OWNER_SECURITY_INFORMATION
                 | DACL_SECURITY_INFORMATION
                 | UNPROTECTED_DACL_SECURITY_INFORMATION,
-            owner,
-            ptr::null_mut(),
-            empty.as_ptr().cast(),
-            ptr::null(),
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(status as i32))
-            .with_context(|| format!("Reset the permissions of {}", path.display()));
+        )?;
     }
     Ok(())
 }
 
-/// Every entry under `dir`, parents before their contents. Links are listed but not followed.
-fn collect_entries(dir: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
-    let listing = std::fs::read_dir(dir).with_context(|| format!("Read {}", dir.display()))?;
+/// Administrators as owner and no explicit grants, so only what the parent passes down
+/// applies once inheritance is turned back on.
+const INHERIT_ONLY_SDDL: &str = "O:BAD:";
+
+/// Every entry under `folder`, parents before their contents, each pinned. Links are refused,
+/// not followed.
+fn collect_entries(
+    folder: &Pinned,
+    entries: &mut Vec<Pinned>,
+    refused: &mut Vec<String>,
+) -> Result<()> {
+    let resolved = folder.final_path()?;
+    let listing = std::fs::read_dir(folder.path())
+        .with_context(|| format!("Read {}", folder.path().display()))?;
     for entry in listing {
         let path = entry
-            .with_context(|| format!("Read {}", dir.display()))?
+            .with_context(|| format!("Read {}", folder.path().display()))?
             .path();
-        let descend = !is_reparse_point(&path)? && path.is_dir();
-        entries.push(path.clone());
+        let pinned = Pinned::open(
+            &path,
+            READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+            SHARE_NO_DELETE,
+        )
+        .with_context(|| format!("Open {}", path.display()))?;
+        if pinned.final_path()?.parent() != Some(resolved.as_path()) {
+            refused.push(format!("  {} moved while it was checked", path.display()));
+            continue;
+        }
+        if let Err(error) = check_writable(&pinned) {
+            refused.push(format!("  {error:#}"));
+            continue;
+        }
+        let descend = pinned.is_dir()?;
+        entries.push(pinned);
         if descend {
-            collect_entries(&path, entries)?;
+            let index = entries.len() - 1;
+            let mut inside = vec![];
+            collect_entries(&entries[index], &mut inside, refused)?;
+            entries.extend(inside);
         }
     }
     Ok(())
 }
 
-/// Whether only SYSTEM and Administrators control `path`: it is not a reparse point, one of
-/// them owns it, and no one else may write to, delete or change the permissions of it.
+/// Whether only SYSTEM, Administrators and TrustedInstaller control `path`: it is not a
+/// reparse point, one of them owns it, and no one else may write to, delete or change the
+/// permissions of it. Both are read through one handle that does not follow links.
 pub fn is_protected(path: &Path) -> bool {
-    if !matches!(is_reparse_point(path), Ok(false)) {
+    let Ok(pinned) = Pinned::open(path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL) else {
         return false;
-    }
-    let path_wide = wide(path.as_os_str());
-    let mut owner: PSID = ptr::null_mut();
-    let mut dacl: *mut ACL = ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: the path is NUL-terminated; out-pointers are valid for the call.
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            path_wide.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut owner,
-            ptr::null_mut(),
-            &mut dacl,
-            ptr::null_mut(),
-            &mut descriptor,
-        )
     };
-    if status != ERROR_SUCCESS {
-        return false;
-    }
-    // SAFETY: owner and dacl point into descriptor, which stays allocated until LocalFree.
-    let protected = unsafe { system_or_administrators(owner) && only_trusted_may_change(dacl) };
-    // SAFETY: allocated by GetNamedSecurityInfoW.
+    matches!(pinned.is_link(), Ok(false))
+        && pinned.security().is_ok_and(|security| security.protected())
+}
+
+/// # Safety
+/// `owner` must point to a valid SID, and `dacl` must be null or point to a valid ACL.
+unsafe fn trusted_owner_and_dacl(owner: PSID, dacl: *const ACL) -> bool {
     unsafe {
-        LocalFree(descriptor);
+        principal(owner) == Principal::Trusted
+            && aces(dacl).is_some_and(|aces| crate::services::only_trusted_may_change(&aces))
     }
-    protected
+}
+
+/// Opens a program to install, sharing it for reading only, so nobody can change, replace or
+/// delete it while it is open. `None` unless just SYSTEM, Administrators and TrustedInstaller
+/// may change it: it is not a link, has no other hard link, and its owner and permissions,
+/// read through the same handle, are trusted.
+pub fn open_protected(path: &Path) -> Result<Option<std::fs::File>> {
+    let pinned = Pinned::open(path, FILE_GENERIC_READ, FILE_SHARE_READ)
+        .with_context(|| format!("Open {}", path.display()))?;
+    let protected = !pinned.is_link()? && pinned.links()? == 1 && pinned.security()?.protected();
+    Ok(protected.then(|| pinned.into_file()))
+}
+
+/// # Safety
+/// `dacl` must be null or point to a valid ACL. A null DACL grants everyone full control,
+/// so it has no entries to return.
+unsafe fn aces(dacl: *const ACL) -> Option<Vec<Ace>> {
+    if dacl.is_null() {
+        return None;
+    }
+    let mut found = vec![];
+    unsafe {
+        for index in 0..(*dacl).AceCount {
+            let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+            if GetAce(dacl, index as u32, &mut ace) == 0 {
+                return None;
+            }
+            let header = &*(ace as *const ACE_HEADER);
+            let inherit_only = header.AceFlags as u32 & INHERIT_ONLY_ACE != 0;
+            found.push(match header.AceType {
+                ACCESS_DENIED_ACE_TYPE | ACCESS_DENIED_OBJECT_ACE_TYPE => Ace::Deny,
+                ACCESS_ALLOWED_ACE_TYPE => {
+                    let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                    Ace::Allow {
+                        principal: principal(&allowed.SidStart as *const u32 as PSID),
+                        mask: allowed.Mask,
+                        inherit_only,
+                    }
+                }
+                _ => Ace::Unknown { inherit_only },
+            });
+        }
+    }
+    Some(found)
+}
+
+/// # Safety
+/// `sid` must point to a valid SID.
+unsafe fn principal(sid: PSID) -> Principal {
+    unsafe {
+        if system_or_administrators(sid) || is_trusted_installer(sid) {
+            Principal::Trusted
+        } else if IsWellKnownSid(sid, WinCreatorOwnerSid) != 0 {
+            Principal::CreatorOwner
+        } else {
+            Principal::Other
+        }
+    }
+}
+
+/// NT SERVICE\TrustedInstaller, which owns Windows' own folders, Program Files among them.
+const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// # Safety
+/// `sid` must point to a valid SID.
+unsafe fn is_trusted_installer(sid: PSID) -> bool {
+    static SID: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    let known = SID.get_or_init(|| {
+        let text = wide(OsStr::new(TRUSTED_INSTALLER));
+        let mut converted: PSID = ptr::null_mut();
+        // SAFETY: text is NUL-terminated; the SID is copied, then freed with LocalFree.
+        unsafe {
+            if ConvertStringSidToSidW(text.as_ptr(), &mut converted) == 0 {
+                return None;
+            }
+            let bytes = std::slice::from_raw_parts(
+                converted as *const u8,
+                GetLengthSid(converted) as usize,
+            )
+            .to_vec();
+            LocalFree(converted);
+            Some(bytes)
+        }
+    });
+    match known {
+        // SAFETY: both point to valid SIDs; EqualSid only reads them.
+        Some(bytes) => unsafe { EqualSid(sid, bytes.as_ptr() as PSID) != 0 },
+        None => false,
+    }
 }
 
 /// Whether a data directory may be trusted as a services mode directory: the directory and
 /// its marker are protected.
 pub fn is_trusted_machine_dir(path: &Path) -> bool {
     is_protected(path) && is_protected(&path.join(crate::services::files::MARKER))
-}
-
-/// # Safety
-/// `dacl` must be null or point to a valid ACL.
-unsafe fn only_trusted_may_change(dacl: *const ACL) -> bool {
-    // A missing DACL grants everyone full control.
-    if dacl.is_null() {
-        return false;
-    }
-    unsafe {
-        for index in 0..(*dacl).AceCount {
-            let mut ace: *mut core::ffi::c_void = ptr::null_mut();
-            if GetAce(dacl, index as u32, &mut ace) == 0 {
-                return false;
-            }
-            let header = &*(ace as *const ACE_HEADER);
-            if header.AceFlags as u32 & INHERIT_ONLY_ACE != 0 {
-                continue;
-            }
-            match header.AceType {
-                ACCESS_DENIED_ACE_TYPE | ACCESS_DENIED_OBJECT_ACE_TYPE => {}
-                ACCESS_ALLOWED_ACE_TYPE => {
-                    let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
-                    let sid = &allowed.SidStart as *const u32 as PSID;
-                    if crate::services::grants_change(allowed.Mask)
-                        && !system_or_administrators(sid)
-                    {
-                        return false;
-                    }
-                }
-                // Conditional and object grants are never written by K3 Up; refuse them.
-                _ => return false,
-            }
-        }
-    }
-    true
 }
 
 pub fn program_data() -> Result<PathBuf> {
@@ -462,103 +445,44 @@ fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf> {
 }
 
 /// Whether a file or directory belongs to SYSTEM or Administrators, the only owners the
-/// service host trusts.
+/// service host trusts. A link is read itself, not followed.
 pub fn owned_by_system_or_administrators(path: &Path) -> Result<bool> {
-    let path_wide = wide(path.as_os_str());
-    let mut owner: PSID = ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: the path is NUL-terminated; out-pointers are valid for the call.
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            path_wide.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            &mut owner,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(status as i32))
-            .with_context(|| format!("Read the owner of {}", path.display()));
-    }
-    // SAFETY: owner points into descriptor, which stays allocated until LocalFree below.
-    let trusted = unsafe { system_or_administrators(owner) };
-    // SAFETY: allocated by GetNamedSecurityInfoW.
-    unsafe {
-        LocalFree(descriptor);
-    }
-    Ok(trusted)
+    let pinned = Pinned::open(path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL)
+        .with_context(|| format!("Read the owner of {}", path.display()))?;
+    Ok(pinned.security()?.owner_is_system_or_administrators())
 }
 
 /// Makes Administrators the owner of a file this process created, whatever its token's
 /// default owner is.
 pub fn set_owner_to_administrators(path: &Path) -> Result<()> {
-    let attributes = SecurityAttributes::from_sddl("O:BA")?;
-    let path_wide = wide(path.as_os_str());
-    let mut owner: PSID = ptr::null_mut();
-    let mut defaulted = 0;
-    // SAFETY: the descriptor is valid while attributes lives; the owner points into it.
-    let status = unsafe {
-        if GetSecurityDescriptorOwner(attributes.descriptor(), &mut owner, &mut defaulted) == 0 {
-            return Err(std::io::Error::last_os_error()).context("Read owner");
-        }
-        SetNamedSecurityInfoW(
-            path_wide.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            owner,
-            ptr::null_mut(),
-            ptr::null(),
-            ptr::null(),
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(status as i32))
-            .with_context(|| format!("Set the owner of {}", path.display()));
-    }
-    Ok(())
+    pin_unlinked(path)?.set("O:BA", OWNER_SECURITY_INFORMATION)
 }
 
 /// Gives a file this process created the owner and DACL in `sddl`, with inheritance blocked.
 pub fn set_security(path: &Path, sddl: &str) -> Result<()> {
-    let attributes = SecurityAttributes::from_sddl(sddl)?;
-    let path_wide = wide(path.as_os_str());
-    let mut owner: PSID = ptr::null_mut();
-    let mut dacl: *mut ACL = ptr::null_mut();
-    let mut present = 0;
-    let mut defaulted = 0;
-    // SAFETY: the descriptor is valid while attributes lives; the owner and DACL point into it.
-    let status = unsafe {
-        if GetSecurityDescriptorOwner(attributes.descriptor(), &mut owner, &mut defaulted) == 0
-            || GetSecurityDescriptorDacl(
-                attributes.descriptor(),
-                &mut present,
-                &mut dacl,
-                &mut defaulted,
-            ) == 0
-        {
-            return Err(std::io::Error::last_os_error()).context("Read security descriptor");
-        }
-        SetNamedSecurityInfoW(
-            path_wide.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
-            owner,
-            ptr::null_mut(),
-            dacl,
-            ptr::null(),
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(status as i32))
-            .with_context(|| format!("Protect {}", path.display()));
+    pin_unlinked(path)?.set(
+        sddl,
+        OWNER_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | PROTECTED_DACL_SECURITY_INFORMATION,
+    )
+}
+
+/// Opens `path` to change its owner and permissions, refusing a link.
+fn pin_unlinked(path: &Path) -> Result<Pinned> {
+    let pinned = Pinned::open(
+        path,
+        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+        SHARE_NO_DELETE,
+    )
+    .with_context(|| format!("Open {}", path.display()))?;
+    if pinned.is_link()? {
+        bail!(
+            "{} is a link to another location; services mode refuses it",
+            path.display()
+        );
     }
-    Ok(())
+    Ok(pinned)
 }
 
 /// Whether this process runs with administrator rights.

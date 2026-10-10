@@ -37,6 +37,7 @@ pub const EXIT_UNTRUSTED: u32 = 3;
 
 const POLL: Duration = Duration::from_millis(250);
 const ROTATE_EVERY: Duration = Duration::from_secs(10);
+const PENDING_LIMIT: usize = 100;
 
 static TARGET: OnceLock<(PathBuf, String)> = OnceLock::new();
 define_windows_service!(ffi_main, service_main);
@@ -87,6 +88,7 @@ fn service_main(arguments: Vec<OsString>) {
         handle,
         state: HostState::default(),
         checkpoint: 0,
+        pending: vec![],
     };
     let exit = host.run(&stopped);
     host.report(ServiceState::Stopped, exit, Duration::ZERO);
@@ -103,6 +105,8 @@ struct Host {
     handle: ServiceStatusHandle,
     state: HostState,
     checkpoint: u32,
+    /// Events not written yet, oldest first.
+    pending: Vec<String>,
 }
 
 impl Host {
@@ -178,7 +182,7 @@ impl Host {
             let now = Utc::now();
             let log = self.layout.log(&self.name);
             let launched =
-                files::refuse_redirected(&log).and_then(|()| supervisor::launch(spec, &log, now));
+                files::open_append(&log).and_then(|file| supervisor::launch_into(spec, file, now));
             let ended = match launched {
                 Ok(process) => {
                     self.state.started_at = Some(now);
@@ -326,20 +330,33 @@ impl Host {
     fn log_line(&self, text: &str) {
         use std::io::Write;
         let log = self.layout.log(&self.name);
-        if !is_protected(&self.layout.logs()) || files::refuse_redirected(&log).is_err() {
+        if !is_protected(&self.layout.logs()) {
             return;
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-        {
+        if let Ok(mut file) = files::open_append(&log) {
             let _ = writeln!(file, "[{}] k3up-host: {text}", Utc::now().to_rfc3339());
         }
     }
 
-    fn note(&self, message: &str) {
-        let _ = files::append_event(&self.layout.events(&self.name), &self.name, message);
+    /// Records an event in the history. One that cannot be written yet, because another
+    /// writer holds the history or a reader blocks the file, is kept and written with the
+    /// next one, so supervision never waits on it.
+    fn note(&mut self, message: &str) {
+        if self.pending.len() == PENDING_LIMIT {
+            self.pending.remove(0);
+        }
+        self.pending.push(message.to_string());
+        while let Some(next) = self.pending.first() {
+            match files::append_event(&self.layout, &self.name, next) {
+                Ok(()) => {
+                    self.pending.remove(0);
+                }
+                Err(error) => {
+                    self.log_line(&format!("Activity history not updated yet: {error:#}"));
+                    break;
+                }
+            }
+        }
     }
 
     fn report(&mut self, state: ServiceState, exit_code: ServiceExitCode, wait_hint: Duration) {

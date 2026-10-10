@@ -12,9 +12,11 @@ use crate::win32::{
     MARKER_SDDL, PRIVATE_DIR_SDDL, ROOT_DIR_SDDL, SHARED_DIR_SDDL, reset_contents, secure_dir,
     set_security,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::{
     collections::BTreeMap,
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -89,15 +91,42 @@ fn install_programs(prefix: &str) -> Result<Vec<String>> {
             target.display()
         )]);
     }
+    let sources = open_sources(&source, &target)?;
     let running: Vec<String> = scm::list(prefix)?
         .into_iter()
         .filter(|service| matches!(service.scm, Scm::Running | Scm::Starting))
         .filter_map(|service| Some(service.name.get(prefix.len()..)?.to_string()))
         .collect();
     while_stopped(&mut Services { prefix }, &running, || {
-        copy_programs(&source, &target)
+        copy_programs(sources, &target)
     })
     .context("Updating the programs in Program Files failed")
+}
+
+/// The programs in `source` to install in `target`, held open so nobody can change them before
+/// they are copied. The host runs as LocalSystem for every workload, so a folder or program
+/// that users who aren't administrators may change is refused.
+pub fn open_sources(source: &Path, target: &Path) -> Result<Vec<(&'static str, File)>> {
+    let refuse = |path: &Path| {
+        anyhow!(
+            "{} can be changed by users who aren't administrators, so services mode won't install programs from it. Extract the K3 Up release zip into {} and run \"{}\" services enable from an elevated terminal.",
+            path.display(),
+            target.display(),
+            target.join("k3up.exe").display()
+        )
+    };
+    if !crate::win32::is_protected(source) {
+        return Err(refuse(source));
+    }
+    PROGRAMS
+        .into_iter()
+        .filter(|program| source.join(program).is_file())
+        .map(|program| {
+            let path = source.join(program);
+            let file = crate::win32::open_protected(&path)?.ok_or_else(|| refuse(&path))?;
+            Ok((program, file))
+        })
+        .collect()
 }
 
 /// Workload services, by workload name.
@@ -133,24 +162,22 @@ impl Control for Services<'_> {
     }
 }
 
-fn copy_programs(source: &Path, target: &Path) -> Result<Vec<String>> {
+fn copy_programs(sources: Vec<(&str, File)>, target: &Path) -> Result<Vec<String>> {
     if !target.exists() {
         // Inherits the Program Files ACL, which lets only administrators write.
         std::fs::create_dir(target).with_context(|| format!("Create {}", target.display()))?;
     }
     let mut lines = vec![];
-    for program in PROGRAMS {
-        let from = source.join(program);
-        if from.is_file() {
-            let to = target.join(program);
-            // A partly written host would break every workload, so the copy replaces the
-            // installed program in one step or not at all.
-            std::fs::read(&from)
-                .with_context(|| format!("Read {}", from.display()))
-                .and_then(|bytes| files::write_atomic(&to, &bytes, |_| Ok(())))
-                .with_context(|| format!("Copy {program} to {}", to.display()))?;
-            lines.push(format!("Copied {program} to {}", target.display()));
-        }
+    for (program, mut file) in sources {
+        let to = target.join(program);
+        let mut bytes = vec![];
+        // A partly written host would break every workload, so the copy replaces the
+        // installed program in one step or not at all.
+        file.read_to_end(&mut bytes)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| files::write_atomic(&to, &bytes, |_| Ok(())))
+            .with_context(|| format!("Copy {program} to {}", to.display()))?;
+        lines.push(format!("Copied {program} to {}", target.display()));
     }
     Ok(lines)
 }

@@ -829,7 +829,7 @@ fn files_left_in_the_folders_lose_their_own_permissions() {
         error.contains("planted.jsonl belongs to another account"),
         "{error}"
     );
-    let appended = files::append_event(&history, "planted", "refused");
+    let appended = files::append_event(&files::Layout::new(&machine.data), "planted", "refused");
     assert!(
         format!("{:#}", appended.unwrap_err()).contains("belongs to another account"),
         "the host must not append to a file another account owns"
@@ -1140,4 +1140,110 @@ fn concurrent_applies_leave_one_consistent_workload() {
         }),
         "{description}"
     );
+}
+
+#[test]
+fn readers_holding_shared_files_do_not_stall_the_host() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let mut looping = machine.workload("looping", "exit");
+    looping.restart = Restart::Always;
+    looping.max_restarts = RestartLimit::Unlimited;
+    looping.restart_backoff = RestartBackoff::Fixed;
+    assert!(machine.put(looping).ok);
+    let _ = machine.send(Command::Start {
+        name: "looping".into(),
+    });
+    let starts = || machine.log("looping").matches("Starting looping").count();
+    let deadline = Instant::now() + WAIT;
+    while starts() < 2 {
+        assert!(Instant::now() < deadline, "{}", machine.log("looping"));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // A user may open these files, and with no sharing nobody else can write them.
+    let hold = |path: PathBuf| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
+    };
+    let held = [
+        hold(machine.data.join("state").join("looping.json")),
+        hold(machine.data.join("events").join("looping.jsonl")),
+    ];
+    let before = starts();
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(starts() >= before + 2, "{}", machine.log("looping"));
+    assert!(machine.sc("query", "looping").contains("RUNNING"));
+
+    let requested = Instant::now();
+    machine.ok(Command::Stop {
+        name: "looping".into(),
+    });
+    assert!(requested.elapsed() < Duration::from_secs(30));
+    assert!(machine.sc("query", "looping").contains("STOPPED"));
+    drop(held);
+    assert!(
+        machine
+            .log("looping")
+            .contains("Activity history not updated yet")
+    );
+}
+
+#[test]
+fn programs_are_installed_only_from_protected_folders() {
+    if !elevated() {
+        return;
+    }
+    let target = setup::install_dir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let open = dir.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::write(open.join("k3up-host.exe"), b"host").unwrap();
+    icacls(&open, &["/grant", "*S-1-5-32-545:(OI)(CI)M"]);
+    let error = setup::open_sources(&open, &target)
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "{} can be changed by users who aren't administrators, so services mode won't install programs from it. Extract the K3 Up release zip into {} and run \"{}\" services enable from an elevated terminal.",
+            open.display(),
+            target.display(),
+            target.join("k3up.exe").display()
+        )
+    );
+
+    let protected = dir.path().join("protected");
+    k3up::win32::create_dir_with(&protected, k3up::win32::PRIVATE_DIR_SDDL).unwrap();
+    for (program, bytes) in [("k3up-host.exe", "host"), ("k3up.exe", "cli")] {
+        std::fs::write(protected.join(program), bytes).unwrap();
+        icacls(&protected.join(program), &["/setowner", "*S-1-5-32-544"]);
+    }
+    let sources = setup::open_sources(&protected, &target).unwrap();
+    let names: Vec<&str> = sources.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, ["k3up-host.exe", "k3up.exe"]);
+    // Held open, a source cannot be replaced before it is copied.
+    assert!(std::fs::write(protected.join("k3up-host.exe"), b"swapped").is_err());
+    drop(sources);
+
+    // A program that users may change is refused even in a protected folder.
+    icacls(&protected.join("k3up.exe"), &["/grant", "*S-1-5-32-545:M"]);
+    let error = setup::open_sources(&protected, &target)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.starts_with(&format!(
+        "{} can be changed",
+        protected.join("k3up.exe").display()
+    )));
+
+    // Program Files belongs to TrustedInstaller and grants CREATOR OWNER on new children.
+    assert!(k3up::win32::is_protected(
+        &k3up::win32::program_files().unwrap()
+    ));
 }
