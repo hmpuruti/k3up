@@ -1403,3 +1403,52 @@ fn a_busy_state_file_keeps_the_workload_until_remove_can_finish() {
     assert_eq!(fresh.state, State::Stopped, "{fresh:?}");
     assert_ne!(fresh.reason, "left behind");
 }
+
+#[test]
+fn an_install_folder_users_may_change_is_refused() {
+    if !elevated() {
+        return;
+    }
+    let dir = protected_temp_dir();
+    let target = dir.path().join("K3 Up");
+    k3up::win32::create_dir_with(&target, k3up::win32::PRIVATE_DIR_SDDL).unwrap();
+    let host = target.join("k3up-host.exe");
+    std::fs::write(&host, b"host").unwrap();
+    icacls(&host, &["/setowner", "*S-1-5-32-544"]);
+    setup::check_target(&target).unwrap();
+
+    icacls(&target, &["/grant", "*S-1-5-32-545:(OI)(CI)M"]);
+    let error = setup::check_target(&target).unwrap_err().to_string();
+    assert!(
+        error.contains(&format!("\n  {}\n", target.display())),
+        "{error}"
+    );
+    assert!(error.ends_with(&format!(
+        "Delete {} and extract the K3 Up release zip into it again.",
+        target.display()
+    )));
+}
+
+#[test]
+fn definitions_users_could_edit_are_not_repaired_into_trust() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(machine.put(machine.workload("edited", "pulse")).ok);
+    assert!(machine.put(machine.workload("kept", "pulse")).ok);
+    setup::prepare(&machine.data).unwrap();
+
+    let edited = machine.data.join("workloads").join("edited.toml");
+    icacls(&edited, &["/grant", "*S-1-5-32-545:M"]);
+    let error = format!("{:#}", setup::prepare(&machine.data).unwrap_err());
+    assert!(
+        error.contains(&format!("  {}", edited.display())),
+        "{error}"
+    );
+    assert!(!error.contains("kept.toml"), "{error}");
+    assert!(
+        error.ends_with("apply the workloads again from a trusted manifest"),
+        "{error}"
+    );
+    assert!(k3up::win32::writable_by_others(&edited).unwrap());
+}

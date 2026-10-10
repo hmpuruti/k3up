@@ -536,10 +536,15 @@ fn log_bytes(data: &Path, name: &str) -> u64 {
     file_size(&logs.join(format!("{name}.log"))) + file_size(&logs.join(format!("{name}.log.1")))
 }
 
+/// The files in the data directory and its `logs` folder, and in services mode also those in
+/// the definition, state and event folders. Each folder counts at most `DATA_FILES` entries,
+/// so a folder flooded with files cannot stall sampling.
 fn data_bytes(data: &Path) -> u64 {
-    let size = |directory: &Path| {
+    const DATA_FILES: usize = 10_000;
+    let size = |directory: &Path| -> u64 {
         std::fs::read_dir(directory).map_or(0, |entries| {
             entries
+                .take(DATA_FILES)
                 .flatten()
                 .filter_map(|entry| entry.metadata().ok())
                 .filter(|metadata| metadata.is_file())
@@ -547,7 +552,12 @@ fn data_bytes(data: &Path) -> u64 {
                 .sum()
         })
     };
-    size(data) + size(&data.join("logs"))
+    let mut folders = vec![data.to_path_buf(), data.join("logs")];
+    if data.join(crate::services::files::MARKER).exists() {
+        let layout = crate::services::files::Layout::new(data);
+        folders.extend([layout.workloads(), layout.states(), layout.events_dir()]);
+    }
+    folders.iter().map(|folder| size(folder)).sum()
 }
 
 /// Samples a single process, such as the desktop app itself.
@@ -600,6 +610,28 @@ impl ProcessProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_usage_counts_every_folder_of_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = [
+            ("agent.db", 1),
+            ("logs/web.log", 10),
+            ("workloads/web.toml", 100),
+            ("workloads/.sequence", 1000),
+            ("state/web.json", 10_000),
+            ("events/web.jsonl", 100_000),
+        ];
+        for (path, length) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![b'x'; length]).unwrap();
+        }
+        assert_eq!(data_bytes(root), 11);
+        std::fs::write(root.join(crate::services::files::MARKER), b"").unwrap();
+        assert_eq!(data_bytes(root), 111_111);
+    }
 
     #[test]
     fn tree_walks_descendants_once() {

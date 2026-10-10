@@ -34,6 +34,7 @@ pub fn install_dir() -> Result<PathBuf> {
 /// permissions.
 pub fn prepare(data: &Path) -> Result<()> {
     let layout = Layout::new(data);
+    refuse_tampered(&layout)?;
     secure_dir(data, ROOT_DIR_SDDL)?;
     for (folder, sddl) in [
         (layout.workloads(), PRIVATE_DIR_SDDL),
@@ -47,6 +48,38 @@ pub fn prepare(data: &Path) -> Result<()> {
     files::write_atomic(&layout.marker(), b"", |path| {
         set_security(path, MARKER_SDDL)
     })
+}
+
+/// Refuses definitions that users who aren't administrators could have edited, or that sit
+/// in a folder they could change: the host would run what they wrote as LocalSystem, and
+/// repairing the permissions must not make them trusted. Logs, state and history are never
+/// run, so their permissions are simply repaired.
+fn refuse_tampered(layout: &Layout) -> Result<()> {
+    let folder = layout.workloads();
+    if !folder.exists() {
+        return Ok(());
+    }
+    let mut suspect = vec![];
+    if crate::win32::writable_by_others(&folder)? {
+        suspect.push(folder.clone());
+    }
+    for name in files::names(&folder, "toml")? {
+        let definition = layout.definition(&name);
+        if crate::win32::writable_by_others(&definition)? {
+            suspect.push(definition);
+        }
+    }
+    if suspect.is_empty() {
+        return Ok(());
+    }
+    let listed: Vec<String> = suspect
+        .iter()
+        .map(|path| format!("  {}", path.display()))
+        .collect();
+    bail!(
+        "Users who aren't administrators could have changed these definitions:\n{}\nReview them, delete them, and apply the workloads again from a trusted manifest",
+        listed.join("\n")
+    )
 }
 
 pub fn enable(data: &Path) -> Result<Vec<String>> {
@@ -67,6 +100,9 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
     super::check_registration(super::registered().as_deref(), data)?;
     let _lock = lock_if_prepared(data)?;
     let target = install_dir()?;
+    if target.exists() {
+        check_target(&target)?;
+    }
     let sources = program_sources(&target)?;
     let prefix = settings.prefix.as_str();
     let running: Vec<String> = scm::list(prefix)?
@@ -131,6 +167,33 @@ fn program_sources(target: &Path) -> Result<Option<Vec<(&'static str, File)>>> {
         return Ok(None);
     }
     open_sources(&source, target).map(Some)
+}
+
+/// Refuses an install folder that users who aren't administrators could change, or that
+/// holds a program they could change: every service runs the host from there as LocalSystem.
+/// It is not repaired, since its programs may already have been replaced.
+pub fn check_target(target: &Path) -> Result<()> {
+    let mut problems = vec![];
+    if !crate::win32::is_protected(target) {
+        problems.push(format!("  {}", target.display()));
+    }
+    if !crate::win32::ancestors_protected(target) {
+        problems.push(format!("  a folder above {}", target.display()));
+    }
+    for program in PROGRAMS {
+        let path = target.join(program);
+        if path.exists() && crate::win32::open_protected(&path)?.is_none() {
+            problems.push(format!("  {}", path.display()));
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "Users who aren't administrators can change these, so services mode won't run programs from them:\n{}\nDelete {} and extract the K3 Up release zip into it again.",
+        problems.join("\n"),
+        target.display()
+    )
 }
 
 /// The programs in `source` to install in `target`, held open so nobody can change them before

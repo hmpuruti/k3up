@@ -221,6 +221,15 @@ impl Security {
         unsafe { trusted_owner_and_dacl(self.owner, self.dacl) }
     }
 
+    /// Whether the DACL lets an account other than SYSTEM, Administrators, TrustedInstaller
+    /// or the owner write to, delete or re-permission the object.
+    pub(super) fn others_may_change(&self) -> bool {
+        // SAFETY: the DACL points into the descriptor, which lives as long as self.
+        unsafe {
+            !aces(self.dacl).is_some_and(|aces| crate::services::only_trusted_may_change(&aces))
+        }
+    }
+
     /// Owned by SYSTEM, Administrators or TrustedInstaller, and no one else may move, delete
     /// or re-permission it or what it holds.
     pub(super) fn keeps_children_in_place(&self) -> bool {

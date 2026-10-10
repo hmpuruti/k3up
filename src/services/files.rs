@@ -172,6 +172,19 @@ pub fn definition_text(workload: &Workload, instance: Option<&str>) -> Result<St
     })
 }
 
+/// Refuses a definition larger than the host and `k3up` read, before it is saved.
+pub fn check_definition_size(name: &str, text: &str) -> Result<()> {
+    let length = text.len() as u64;
+    if length > READ_LIMIT {
+        anyhow::bail!(
+            "The definition for {name} is {} KB; the limit is {} KB",
+            length.div_ceil(1024),
+            READ_LIMIT / 1024
+        );
+    }
+    Ok(())
+}
+
 /// A new identity for a workload created under a name, so a state file left behind by an
 /// earlier workload of that name is never taken for its own.
 pub fn new_instance() -> String {
@@ -446,15 +459,9 @@ fn own(path: &Path) {
     let _ = path;
 }
 
-/// A value that changes whenever an event is recorded: the last id handed out, read without
-/// waiting for the lock. Users who may not open the administrators' folder get the size and
-/// modification time of every event file instead.
+/// A value that changes once an event is written: the size and modification time of every
+/// event file, which every user may read. The sequence would move before the event exists.
 pub fn events_mark(layout: &Layout) -> u64 {
-    if let Ok(text) = read_bounded(&layout.sequence())
-        && let Ok(id) = text.trim().parse::<i64>()
-    {
-        return id as u64;
-    }
     let mut mark = 0xcbf29ce484222325u64;
     for name in names(&layout.events_dir(), "jsonl").unwrap_or_default() {
         let Ok(metadata) = std::fs::metadata(layout.events(&name)) else {
@@ -634,15 +641,46 @@ mod tests {
         append_event(&layout, "a", "Log rotation failed").unwrap();
         let first = events_mark(&layout);
         assert_ne!(first, empty);
-        append_event(&layout, "a", "Log rotation failed").unwrap();
-        assert_ne!(events_mark(&layout), first);
 
-        // Without the sequence, as for users who may not read it, file sizes still move.
-        std::fs::remove_file(layout.sequence()).unwrap();
-        let from_files = events_mark(&layout);
+        // Taking the next id is not enough; only the written event moves the mark.
+        let mut sequence = lock(&layout.sequence(), Duration::ZERO).unwrap().unwrap();
+        let id = next_event_id(&mut sequence.0, &layout.events_dir()).unwrap();
+        assert_eq!(events_mark(&layout), first);
+        let event = Event {
+            id,
+            at: Utc::now(),
+            name: "a".into(),
+            message: "Log rotation failed".into(),
+        };
+        write_event(&layout.events("a"), &serde_json::to_string(&event).unwrap()).unwrap();
+        drop(sequence);
+        let second = events_mark(&layout);
+        assert_ne!(second, first);
         append_event(&layout, "b", "Log rotation failed").unwrap();
-        std::fs::remove_file(layout.sequence()).unwrap();
-        assert_ne!(events_mark(&layout), from_files);
+        assert_ne!(events_mark(&layout), second);
+    }
+
+    #[test]
+    fn definitions_too_large_to_read_back_are_refused() {
+        let mut workload = Workload {
+            name: "web".into(),
+            executable: "/bin/sleep".into(),
+            ..Default::default()
+        };
+        let text = definition_text(&workload, Some("0a1b")).unwrap();
+        check_definition_size("web", &text).unwrap();
+        workload
+            .environment
+            .insert("HUGE".into(), "x".repeat(READ_LIMIT as usize));
+        let text = definition_text(&workload, Some("0a1b")).unwrap();
+        let error = check_definition_size("web", &text).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "The definition for web is {} KB; the limit is 1024 KB",
+                (text.len() as u64).div_ceil(1024)
+            )
+        );
     }
 
     #[test]

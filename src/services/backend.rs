@@ -405,6 +405,10 @@ impl Backend {
                     Some(bytes) => files::instance_in(bytes),
                     None => Some(files::new_instance()),
                 };
+                files::check_definition_size(
+                    name,
+                    &files::definition_text(&change.workload, instance.as_deref())?,
+                )?;
                 Ok(Step {
                     change,
                     file,

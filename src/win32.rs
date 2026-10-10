@@ -336,6 +336,15 @@ pub fn ancestors_protected(path: &Path) -> bool {
     })
 }
 
+/// Whether an account other than SYSTEM, Administrators and TrustedInstaller may write to,
+/// delete or re-permission `path` as it stands, which for a definition means it may have been
+/// edited. A link is judged by its own permissions; other checks refuse links.
+pub fn writable_by_others(path: &Path) -> Result<bool> {
+    let pinned = Pinned::open(path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL)
+        .with_context(|| format!("Open {}", path.display()))?;
+    Ok(pinned.security()?.others_may_change())
+}
+
 /// Opens a file to read it, without following a link, and only if it resolves to a path
 /// directly inside its folder as that folder resolves, so a link swapped in for the folder
 /// is caught. Others may read but not change or delete the file while it is open.
