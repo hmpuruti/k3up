@@ -561,6 +561,21 @@ pub fn rail_segment(active: bool) -> impl Fn(&Theme, button::Status) -> button::
     }
 }
 
+pub fn folder(theme: &Theme, status: button::Status) -> button::Style {
+    let t = tones(theme);
+    let background = match status {
+        button::Status::Hovered => t.line,
+        button::Status::Pressed => t.line_strong,
+        _ => Color::TRANSPARENT,
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color: t.ink,
+        border: border(Color::TRANSPARENT, 0.0, RADIUS_SM),
+        shadow: no_shadow(),
+    }
+}
+
 pub fn card(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let t = tones(theme);

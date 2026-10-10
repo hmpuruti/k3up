@@ -71,31 +71,46 @@ fn print_response(response: Response, json: bool) -> Result<bool> {
     Ok(success)
 }
 
+/// Folders come first as header lines above their workloads; ungrouped workloads follow.
 fn print_workloads(workloads: &[k3up::model::Status]) {
     println!(
         "{:<24} {:<12} {:<8} {:<8} {:<6} {:<12} REASON",
         "NAME", "STATE", "PID", "RETRIES", "EXIT", "NEXT RUN"
     );
-    let now = chrono::Utc::now();
-    for status in workloads {
-        let dash = || "-".to_string();
-        println!(
-            "{:<24} {:<12} {:<8} {:<8} {:<6} {:<12} {}",
-            status.workload.name,
-            status.state,
-            status.pid.map(|id| id.to_string()).unwrap_or_else(dash),
-            status.restart_count,
-            status
-                .last_exit
-                .map(|code| code.to_string())
-                .unwrap_or_else(dash),
-            status
-                .next_run
-                .map(|at| next_run(at, now))
-                .unwrap_or_else(dash),
-            status.reason
-        );
+    let tree = k3up::group::tree(workloads);
+    for folder in &tree.folders {
+        if folder.members.is_empty() {
+            continue;
+        }
+        println!("{}", folder.path);
+        for &index in &folder.members {
+            print_status(&workloads[index], "  ");
+        }
     }
+    for &index in &tree.ungrouped {
+        print_status(&workloads[index], "");
+    }
+}
+
+fn print_status(status: &k3up::model::Status, indent: &str) {
+    let dash = || "-".to_string();
+    println!(
+        "{indent}{:<width$} {:<12} {:<8} {:<8} {:<6} {:<12} {}",
+        status.workload.name,
+        status.state,
+        status.pid.map(|id| id.to_string()).unwrap_or_else(dash),
+        status.restart_count,
+        status
+            .last_exit
+            .map(|code| code.to_string())
+            .unwrap_or_else(dash),
+        status
+            .next_run
+            .map(|at| next_run(at, chrono::Utc::now()))
+            .unwrap_or_else(dash),
+        status.reason,
+        width = 24 - indent.len()
+    );
 }
 
 fn next_run(at: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {

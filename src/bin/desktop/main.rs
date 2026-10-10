@@ -17,6 +17,7 @@ mod output;
 mod schedules;
 mod sidebar;
 mod theme;
+mod tree;
 mod widgets;
 
 use app::App;

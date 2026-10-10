@@ -472,3 +472,293 @@ fn usage_errors_exit_with_two_and_bad_programs_fail_locally() {
         response.message
     );
 }
+
+fn create_grouped(agent: &Agent, name: &str, group: &str, extra: &[&str]) {
+    let mut arguments = vec!["create", name, "--exe", "sleep"];
+    if !group.is_empty() {
+        arguments.extend(["--group", group]);
+    }
+    arguments.extend(extra);
+    arguments.extend(["--", "300"]);
+    let (success, response) = agent.call(&arguments);
+    assert!(success, "{name}: {}", response.message);
+}
+
+#[test]
+fn list_prints_folders_as_headers_and_filters_by_folder() {
+    let agent = Agent::start();
+    create_grouped(&agent, "entra-users", "watchtower/entra", &[]);
+    create_grouped(&agent, "intune-policies", "Watchtower/Intune", &[]);
+    create_grouped(&agent, "imperva", "watchtower/imperva", &[]);
+    create_grouped(&agent, "solo", "", &[]);
+    create_grouped(&agent, "entra-devices", "watchtower/entra", &[]);
+    let (success, text) = agent.run(&["list"]);
+    assert!(success);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[1], "watchtower/entra");
+    assert!(lines[2].starts_with("  entra-devices "), "{}", lines[2]);
+    assert!(lines[3].starts_with("  entra-users "), "{}", lines[3]);
+    assert_eq!(lines[4], "watchtower/imperva");
+    assert!(lines[5].starts_with("  imperva "), "{}", lines[5]);
+    assert_eq!(lines[6], "watchtower/Intune");
+    assert!(lines[7].starts_with("  intune-policies "), "{}", lines[7]);
+    assert!(lines[8].starts_with("solo "), "{}", lines[8]);
+    assert_eq!(lines.len(), 9);
+    let state_column = lines[0].find("STATE").unwrap();
+    for line in [lines[2], lines[8]] {
+        assert_eq!(line.find("stopped"), Some(state_column), "{line}");
+    }
+
+    let (success, text) = agent.run(&["list", "--group", "WATCHTOWER/entra"]);
+    assert!(success);
+    assert!(
+        text.contains("entra-users") && !text.contains("imperva"),
+        "{text}"
+    );
+    let (success, response) = agent.call(&["list", "--group", "watchtower"]);
+    assert!(success);
+    assert_eq!(response.workloads.len(), 4);
+    let (success, response) = agent.call(&["list", "--group", "watchtower/en"]);
+    assert!(!success);
+    assert!(
+        response.message.contains("'watchtower/en'"),
+        "{}",
+        response.message
+    );
+    let (success, response) = agent.call(&["list", "--group", "a//b"]);
+    assert!(!success && response.message.contains("empty segments"));
+
+    let (success, value) = agent.json(&["list"]);
+    assert!(success);
+    let workloads = value["workloads"].as_array().unwrap();
+    assert_eq!(workloads[0]["workload"]["name"], "entra-devices");
+    assert_eq!(workloads[0]["workload"]["group"], "watchtower/entra");
+    assert_eq!(workloads[4]["workload"]["name"], "solo");
+    assert_eq!(workloads[4]["workload"]["group"], "");
+    let (success, text) = agent.run(&["show", "entra-users"]);
+    assert!(success);
+    assert!(text.contains("group = \"watchtower/entra\""), "{text}");
+    let (success, text) = agent.run(&["show", "solo"]);
+    assert!(success && !text.contains("group"), "{text}");
+}
+
+#[test]
+fn groups_reports_the_folder_tree_with_counts() {
+    let agent = Agent::start();
+    create_grouped(&agent, "entra-users", "watchtower/entra", &[]);
+    create_grouped(&agent, "solo", "", &[]);
+    let (success, response) = agent.call(&[
+        "create",
+        "crash",
+        "--exe",
+        "false",
+        "--group",
+        "watchtower/intune",
+        "--job",
+    ]);
+    assert!(success, "{}", response.message);
+    let (success, _) = agent.call(&["start", "entra-users", "--wait", "--timeout", "20"]);
+    assert!(success);
+    let (success, _) = agent.call(&["start", "crash", "--wait", "--timeout", "20"]);
+    assert!(!success);
+    let (success, value) = agent.json(&["groups"]);
+    assert!(success, "{value}");
+    assert_eq!(
+        value,
+        serde_json::json!([
+            { "path": "watchtower", "workloads": 2, "running": 1, "attention": 1 },
+            { "path": "watchtower/entra", "workloads": 1, "running": 1, "attention": 0 },
+            { "path": "watchtower/intune", "workloads": 1, "running": 0, "attention": 1 },
+        ])
+    );
+    let (success, text) = agent.run(&["groups"]);
+    assert!(success);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("FOLDER"), "{text}");
+    assert!(
+        lines[1].starts_with("watchtower ") && lines[1].ends_with("1 running, 1 failed"),
+        "{text}"
+    );
+    assert!(
+        lines[2].starts_with("  entra ") && lines[2].ends_with("1 running"),
+        "{text}"
+    );
+    assert!(
+        lines[3].starts_with("  intune ") && lines[3].ends_with("1 failed"),
+        "{text}"
+    );
+    assert!(
+        lines[4].starts_with("(no folder)") && lines[4].ends_with("1 stopped"),
+        "{text}"
+    );
+    let (success, _) = agent.call(&["stop", "entra-users"]);
+    assert!(success);
+    let empty = Agent::start();
+    let (success, value) = empty.json(&["groups"]);
+    assert!(success);
+    assert_eq!(value, serde_json::json!([]));
+    let (_, text) = empty.run(&["groups"]);
+    assert_eq!(text.trim(), "No workloads");
+}
+
+#[test]
+fn group_start_and_stop_follow_dependency_order() {
+    let agent = Agent::start();
+    create_grouped(&agent, "db", "stack/data", &[]);
+    create_grouped(&agent, "api", "stack/app", &["--depends-on", "db"]);
+    create_grouped(&agent, "web", "stack/app", &["--depends-on", "api"]);
+    create_grouped(&agent, "other", "elsewhere", &[]);
+    let (success, text) = agent.run(&["start", "--group", "Stack", "--wait", "--timeout", "20"]);
+    assert!(success, "{text}");
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        ["Started db", "Started api", "Started web", "3 started"]
+    );
+    for name in ["db", "api", "web"] {
+        assert_eq!(agent.show(name).state, State::Running, "{name}");
+    }
+    assert_eq!(agent.show("other").state, State::Stopped);
+
+    let (success, response) = agent.call(&["restart", "--group", "stack/app", "--wait"]);
+    assert!(success, "{}", response.message);
+    assert_eq!(
+        response.message,
+        "Restarted api\nRestarted web\n2 restarted"
+    );
+    assert_eq!(response.workloads.len(), 2);
+
+    let (success, text) = agent.run(&["stop", "--group", "stack"]);
+    assert!(success, "{text}");
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        ["Stopped web", "Stopped api", "Stopped db", "3 stopped"]
+    );
+    for name in ["db", "api", "web"] {
+        let status = agent.show(name);
+        assert!(status.pid.is_none() && !status.desired_running, "{name}");
+    }
+
+    let (success, response) = agent.call(&["start", "--group", "nope"]);
+    assert!(!success);
+    assert_eq!(response.message, "No workloads in folder 'nope'");
+    let (success, response) = agent.call(&["stop", "--group", "stack/ap"]);
+    assert!(!success);
+    assert!(response.message.contains("'stack/ap'"));
+}
+
+#[test]
+fn group_start_attempts_every_workload_and_exits_one_on_failure() {
+    let agent = Agent::start();
+    let (success, _) = agent.call(&["create", "bad", "--exe", "false", "--group", "g", "--job"]);
+    assert!(success);
+    create_grouped(&agent, "good", "g", &[]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_k3up"))
+        .arg("--data-dir")
+        .arg(agent.dir.path())
+        .args(["start", "--group", "g", "--wait", "--timeout", "20"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("Failed bad: bad failed"), "{text}");
+    assert_eq!(lines[1], "Started good");
+    assert_eq!(lines[2], "1 started, 1 failed");
+    assert_eq!(agent.show("good").state, State::Running);
+    let (success, response) = agent.call(&["start", "--group", "g", "--wait", "--timeout", "20"]);
+    assert!(!success);
+    assert!(!response.ok);
+    assert_eq!(response.workloads.len(), 2);
+    assert!(response.message.ends_with("1 started, 1 failed"));
+}
+
+#[test]
+fn export_group_keeps_only_that_folder() {
+    let agent = Agent::start();
+    create_grouped(&agent, "a", "x/y", &[]);
+    create_grouped(&agent, "b", "x", &[]);
+    create_grouped(&agent, "c", "z", &[]);
+    let (success, response) = agent.call(&["export", "--group", "x"]);
+    assert!(success, "{}", response.message);
+    let names: Vec<_> = response
+        .manifest
+        .unwrap()
+        .workloads
+        .iter()
+        .map(|workload| workload.name.clone())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+    let file = agent.dir.path().join("z.toml");
+    let (success, _) = agent.call(&["export", "--group", "Z", "--output", file.to_str().unwrap()]);
+    assert!(success);
+    let manifest: Manifest = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(manifest.workloads.len(), 1);
+    assert_eq!(manifest.workloads[0].name, "c");
+    assert_eq!(manifest.workloads[0].group, "z");
+    let (success, response) = agent.call(&["export", "--group", "nope"]);
+    assert!(!success);
+    assert_eq!(response.message, "No workloads in folder 'nope'");
+}
+
+#[test]
+fn editing_only_labels_keeps_a_running_workload_running() {
+    let agent = Agent::start();
+    let (success, _) = agent.call(&["create", "runner", "--exe", "sleep", "--", "300"]);
+    assert!(success);
+    let (success, response) = agent.call(&["start", "runner", "--wait", "--timeout", "20"]);
+    assert!(success, "{}", response.message);
+    let pid = response.workloads[0].pid.unwrap();
+
+    let (success, response) = agent.call(&["edit", "runner", "--group", "Watchtower/Entra"]);
+    assert!(success, "{}", response.message);
+    let status = agent.show("runner");
+    assert_eq!(status.workload.group, "Watchtower/Entra");
+    assert_eq!(status.pid, Some(pid));
+    assert_eq!(status.state, State::Running);
+    let (success, _) = agent.call(&["edit", "runner", "--description", "Entra users"]);
+    assert!(success);
+    let (success, _) = agent.call(&["edit", "runner", "--clear-group"]);
+    assert!(success);
+    let status = agent.show("runner");
+    assert_eq!(status.workload.group, "");
+    assert_eq!(status.workload.description, "Entra users");
+    assert_eq!(status.pid, Some(pid));
+    let (success, response) = agent.call(&["edit", "runner", "--group", "a b"]);
+    assert!(
+        success && response.message == "Update runner",
+        "{}",
+        response.message
+    );
+    let (success, response) = agent.call(&["edit", "runner", "--group", "a b"]);
+    assert!(success && response.message == "No changes");
+
+    let (success, response) = agent.call(&["edit", "runner", "--env", "X=1"]);
+    assert!(!success);
+    assert!(
+        response.message.contains("--restart-running"),
+        "{}",
+        response.message
+    );
+    assert_eq!(agent.show("runner").pid, Some(pid));
+    let (success, response) =
+        agent.call(&["edit", "runner", "--group", "ops", "--restart-running"]);
+    assert!(success, "{}", response.message);
+    let status = agent.show("runner");
+    assert_eq!(status.workload.group, "ops");
+    assert_ne!(status.pid, Some(pid));
+
+    let (success, response) = agent.call(&["edit", "runner", "--group", "a/b/c/d/e/f"]);
+    assert!(
+        !success && response.message.contains("5 levels"),
+        "{}",
+        response.message
+    );
+    let (success, response) = agent.call(&["events", "runner", "--limit", "20"]);
+    assert!(success);
+    assert!(
+        response
+            .events
+            .iter()
+            .any(|event| event.message.contains("group or description changed"))
+    );
+}

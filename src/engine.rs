@@ -490,7 +490,9 @@ impl Engine {
             }
             let existing = merged.get(&spec.name);
             if existing != Some(spec) {
-                if let Some(entry) = self.entries.get(&spec.name)
+                let relabel = existing.is_some_and(|current| current.only_labels_differ(spec));
+                if !relabel
+                    && let Some(entry) = self.entries.get(&spec.name)
                     && (entry.process.is_some() || entry.status.desired_running)
                 {
                     bail!("Stop '{}' before changing its definition", spec.name);
@@ -513,24 +515,31 @@ impl Engine {
         }
         .validate()?;
         let mut records = vec![];
+        let mut relabelled = vec![];
         for spec in manifest.workloads {
-            if self
-                .entries
-                .get(&spec.name)
-                .is_some_and(|entry| entry.status.workload == spec)
-            {
-                continue;
+            match self.entries.get(&spec.name) {
+                Some(entry) if entry.status.workload == spec => continue,
+                // A relabelled workload keeps its runtime: nothing about the process changed.
+                Some(entry) if entry.status.workload.only_labels_differ(&spec) => {
+                    relabelled.push(spec.name.clone());
+                    records.push(Record {
+                        desired: entry.status.desired_running,
+                        next_run: entry.status.next_run,
+                        workload: spec,
+                    });
+                }
+                existing => {
+                    // New definitions can opt into agent startup. Existing stopped definitions remain stopped.
+                    let desired =
+                        existing.is_none() && spec.start_at_boot && spec.kind == Kind::Service;
+                    let next_run = spec.first_run(now)?;
+                    records.push(Record {
+                        workload: spec,
+                        desired,
+                        next_run,
+                    });
+                }
             }
-            // New definitions can opt into agent startup. Existing stopped definitions remain stopped.
-            let desired = !self.entries.contains_key(&spec.name)
-                && spec.start_at_boot
-                && spec.kind == Kind::Service;
-            let next_run = spec.first_run(now)?;
-            records.push(Record {
-                workload: spec,
-                desired,
-                next_run,
-            });
         }
         let message = if changes.is_empty() {
             "No changes".into()
@@ -543,6 +552,13 @@ impl Engine {
         self.store.save_batch(&records)?;
         for record in records {
             let name = record.workload.name.clone();
+            if relabelled.contains(&name) {
+                self.entries.get_mut(&name).unwrap().status.workload = record.workload;
+                self.store
+                    .event(&name, "Definition saved; group or description changed")?;
+                self.changed();
+                continue;
+            }
             let status = Status {
                 workload: record.workload,
                 state: State::Stopped,

@@ -60,6 +60,7 @@ pub struct Edit {
     pub clear_run_timeout: bool,
     pub clear_args: bool,
     pub clear_success_exit_codes: bool,
+    pub clear_group: bool,
     pub restart_running: bool,
     pub args: Vec<String>,
 }
@@ -68,12 +69,6 @@ pub fn edit(client: &Client, request: Edit) -> Result<Response> {
     let name = request.name.clone();
     let current = get(client, &name)?;
     let live = current.pid.is_some() || current.desired_running;
-    if live && !request.restart_running {
-        bail!(
-            "'{name}' is {}. Stop it first, or pass --restart-running to stop it, apply the change and start it again",
-            current.state
-        );
-    }
     let mut workload = current.workload.clone();
     if request.clear_env {
         workload.environment.clear();
@@ -99,6 +94,9 @@ pub fn edit(client: &Client, request: Edit) -> Result<Response> {
     if request.clear_success_exit_codes {
         workload.success_exit_codes.clear();
     }
+    if request.clear_group {
+        workload.group.clear();
+    }
     if let Some(exe) = &request.exe {
         workload.executable = resolve::executable(exe)?.to_string_lossy().into();
     }
@@ -110,8 +108,16 @@ pub fn edit(client: &Client, request: Edit) -> Result<Response> {
     if workload == current.workload {
         return Ok(Response::success("No changes"));
     }
-    if !live {
+    // Labels apply to a running workload at once, unless a restart was asked for anyway.
+    let relabel = current.workload.only_labels_differ(&workload);
+    if !live || (relabel && !request.restart_running) {
         return put(client, workload);
+    }
+    if !request.restart_running {
+        bail!(
+            "'{name}' is {}. Stop it first, or pass --restart-running to stop it, apply the change and start it again",
+            current.state
+        );
     }
     checked(client.send(Command::Stop { name: name.clone() })?)?;
     let saved = put(client, workload);
@@ -148,6 +154,9 @@ fn apply_flags(workload: &mut Workload, flags: &WorkloadFlags) -> Result<()> {
     }
     if let Some(description) = &flags.description {
         workload.description = description.clone();
+    }
+    if let Some(group) = &flags.group {
+        workload.group = group.clone();
     }
     if let Some(job) = flags.job {
         workload.kind = if job { Kind::Job } else { Kind::Service };
@@ -286,21 +295,32 @@ pub fn show(client: &Client, name: &str) -> Result<Outcome> {
     })
 }
 
+pub fn deadline(wait: bool, timeout: u64) -> Option<Instant> {
+    wait.then(|| Instant::now() + Duration::from_secs(timeout))
+}
+
 pub fn start(client: &Client, name: &str, wait: bool, timeout: u64) -> Result<Response> {
+    start_by(client, name, deadline(wait, timeout))
+}
+
+/// With a deadline, waits for the workload to be ready, sharing the deadline across a group.
+pub fn start_by(client: &Client, name: &str, deadline: Option<Instant>) -> Result<Response> {
     let response = client.send(Command::Start { name: name.into() })?;
-    if response.ok && wait {
-        wait_ready(client, name, timeout)
-    } else {
-        Ok(response)
+    match deadline {
+        Some(deadline) if response.ok => wait_ready(client, name, deadline),
+        _ => Ok(response),
     }
 }
 
 pub fn restart(client: &Client, name: &str, wait: bool, timeout: u64) -> Result<Response> {
+    restart_by(client, name, deadline(wait, timeout))
+}
+
+pub fn restart_by(client: &Client, name: &str, deadline: Option<Instant>) -> Result<Response> {
     let response = client.send(Command::Restart { name: name.into() })?;
-    if response.ok && wait {
-        wait_ready(client, name, timeout)
-    } else {
-        Ok(response)
+    match deadline {
+        Some(deadline) if response.ok => wait_ready(client, name, deadline),
+        _ => Ok(response),
     }
 }
 
@@ -312,8 +332,7 @@ pub fn remove(client: &Client, name: String, stop: bool) -> Result<Response> {
 }
 
 /// Services are ready once running (after any TCP check); jobs only once they exit successfully.
-fn wait_ready(client: &Client, name: &str, seconds: u64) -> Result<Response> {
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+fn wait_ready(client: &Client, name: &str, deadline: Instant) -> Result<Response> {
     loop {
         let response = checked(client.send(Command::Get { name: name.into() })?)?;
         let status = &response.workloads[0];
