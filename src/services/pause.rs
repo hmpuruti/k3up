@@ -16,13 +16,15 @@ pub enum Role {
     Service,
     /// The definition could not be read or parsed.
     Unknown,
+    /// The service runs, but its definition is gone, so nothing says what it is.
+    Missing,
 }
 
-/// A missing definition counts as a service, since nothing says it is a job.
 pub fn role(definition: &Result<Option<Workload>>) -> Role {
     match definition {
         Ok(Some(workload)) if workload.kind == Kind::Job => Role::Job,
-        Ok(_) => Role::Service,
+        Ok(Some(_)) => Role::Service,
+        Ok(None) => Role::Missing,
         Err(_) => Role::Unknown,
     }
 }
@@ -32,11 +34,14 @@ pub fn role(definition: &Result<Option<Workload>>) -> Role {
 pub fn split_running(running: Vec<(String, Role)>) -> Result<(Vec<String>, Vec<String>)> {
     let unknown: Vec<String> = running
         .iter()
-        .filter(|(_, role)| *role == Role::Unknown)
-        .map(|(name, _)| {
-            format!(
+        .filter_map(|(name, role)| match role {
+            Role::Unknown => Some(format!(
                 "Can't read the definition of {name} to tell whether it is a job; try again when it is readable"
-            )
+            )),
+            Role::Missing => Some(format!(
+                "{name} is running but has no definition, so its kind is unknown; remove it with `k3up remove --stop {name}` or restore its definition"
+            )),
+            Role::Job | Role::Service => None,
         })
         .collect();
     if !unknown.is_empty() {
@@ -210,8 +215,20 @@ mod tests {
         };
         assert_eq!(role(&Ok(Some(workload(Kind::Job)))), Role::Job);
         assert_eq!(role(&Ok(Some(workload(Kind::Service)))), Role::Service);
-        assert_eq!(role(&Ok(None)), Role::Service);
+        assert_eq!(role(&Ok(None)), Role::Missing);
         assert_eq!(role(&Err(anyhow!("sharing violation"))), Role::Unknown);
+    }
+
+    #[test]
+    fn a_running_workload_without_a_definition_refuses_the_change() {
+        let running = vec![
+            ("web".to_string(), role(&Ok(Some(Workload::default())))),
+            ("orphan".to_string(), role(&Ok(None))),
+        ];
+        assert_eq!(
+            split_running(running).unwrap_err().to_string(),
+            "orphan is running but has no definition, so its kind is unknown; remove it with `k3up remove --stop orphan` or restore its definition"
+        );
     }
 
     #[test]

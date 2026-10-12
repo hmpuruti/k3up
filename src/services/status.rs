@@ -3,7 +3,7 @@
 use super::files::HostState;
 use crate::model::{Kind, State, Status, Workload};
 use anyhow::{Result, bail};
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 const DISPLAY_PREFIX: &str = "K3 Up: ";
 const SAME_NAME: &str = "Windows treats names that differ only in case as the same";
@@ -33,11 +33,14 @@ pub struct Service {
     pub crashed: bool,
 }
 
-/// The value after `--instance` in a service's command line.
+/// The value of `--instance` in a service's command line. After the program come option and
+/// value pairs, read in order, so a workload named `--instance` is never taken for the option.
 pub fn instance_of(command_line: &str) -> Option<String> {
-    let mut words = split_command_line(command_line).into_iter();
-    words.find(|word| word == "--instance")?;
-    words.next()
+    let words = split_command_line(command_line);
+    words.get(1..)?.chunks(2).find_map(|pair| match pair {
+        [option, value] if option == "--instance" => Some(value.clone()),
+        _ => None,
+    })
 }
 
 /// Splits a command line the way Windows programs read their arguments, so a quoted data
@@ -172,6 +175,16 @@ pub fn refuse_case_clashes(manifest: &[&str], existing: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The entry for `name`, ignoring case as Windows does for file and service names.
+pub fn same_name<'a, T>(found: &'a BTreeMap<String, T>, name: &str) -> Option<&'a T> {
+    found.get(name).or_else(|| {
+        found
+            .iter()
+            .find(|(other, _)| other.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
+    })
+}
+
 /// What a workload's Windows service is set to: what K3 Up asks for, or what the service
 /// manager holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -184,6 +197,8 @@ pub struct ServiceSettings {
     pub display_name: String,
     pub description: String,
     pub recovery: Recovery,
+    /// The services and groups that must run first. K3 Up sets none.
+    pub dependencies: Vec<String>,
 }
 
 /// What the service manager does when the host crashes.
@@ -238,6 +253,7 @@ pub fn drift(wanted: &ServiceSettings, found: &ServiceSettings) -> Drift {
             ("display name", wanted.display_name == found.display_name),
             ("description", wanted.description == found.description),
             ("recovery actions", wanted.recovery == found.recovery),
+            ("dependencies", wanted.dependencies == found.dependencies),
         ]
         .into_iter()
         .filter(|(_, same)| !same)
@@ -514,6 +530,24 @@ mod tests {
                 r#""C:\k3up-host.exe" --data-dir "C:\svc --instance stale" --workload web --instance 0a1b"#
             ),
             Some("0a1b".into())
+        );
+    }
+
+    #[test]
+    fn a_workload_named_like_an_option_is_read_as_a_value() {
+        for name in ["--instance", "--data-dir", "--workload", "-x"] {
+            let line = format!(
+                r#""C:\k3up-host.exe" --data-dir "C:\data" --workload {name} --instance 0a1b"#
+            );
+            assert_eq!(instance_of(&line), Some("0a1b".into()), "{name}");
+            let line = format!(r#""C:\k3up-host.exe" --data-dir "C:\data" --workload {name}"#);
+            assert_eq!(instance_of(&line), None, "{name}");
+        }
+        assert_eq!(
+            instance_of(
+                r#""C:\k3up-host.exe" --data-dir C:\data --workload --instance --instance"#
+            ),
+            None
         );
     }
 
@@ -870,6 +904,15 @@ mod tests {
         refuse_case_clashes(&["web-1", "WEB_1"], &["web_2"]).unwrap();
     }
 
+    #[test]
+    fn names_match_in_any_case() {
+        let found = BTreeMap::from([("Web".to_string(), 1), ("api".to_string(), 2)]);
+        assert_eq!(same_name(&found, "Web"), Some(&1));
+        assert_eq!(same_name(&found, "web"), Some(&1));
+        assert_eq!(same_name(&found, "API"), Some(&2));
+        assert_eq!(same_name(&found, "db"), None);
+    }
+
     fn settings() -> ServiceSettings {
         ServiceSettings {
             command: [r"C:\k3up-host.exe", "--workload", "web"]
@@ -885,6 +928,7 @@ mod tests {
                 actions: vec![(1, Duration::from_secs(5))],
                 on_non_crash_failures: false,
             },
+            dependencies: vec![],
         }
     }
 
@@ -898,7 +942,7 @@ mod tests {
         found.account = r".\localsystem".into();
         assert!(drift(&wanted, &found).is_empty());
 
-        let changes: [(&str, Change); 8] = [
+        let changes: [(&str, Change); 9] = [
             ("command line", |found| {
                 found.command[0] = r"C:\other.exe".into()
             }),
@@ -910,6 +954,9 @@ mod tests {
             ("description", |found| found.description.clear()),
             ("recovery actions", |found| {
                 found.recovery.on_non_crash_failures = true
+            }),
+            ("dependencies", |found| {
+                found.dependencies.push("Tcpip".into())
             }),
         ];
         for (setting, change) in changes {

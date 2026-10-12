@@ -42,4 +42,23 @@ mod tests {
             .unwrap();
         assert_eq!(args.workload, "-worker");
     }
+
+    #[test]
+    fn a_workload_named_like_an_option_is_its_value() {
+        for name in ["--instance", "--data-dir", "--workload", "-x"] {
+            let args = Args::try_parse_from([
+                "k3up-host",
+                "--data-dir",
+                "/d",
+                "--workload",
+                name,
+                "--instance",
+                "REAL",
+            ])
+            .unwrap();
+            assert_eq!(args.workload, name);
+            assert_eq!(args.instance.as_deref(), Some("REAL"), "{name}");
+            assert_eq!(args.data_dir, PathBuf::from("/d"));
+        }
+    }
 }

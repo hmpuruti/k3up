@@ -78,7 +78,8 @@ pub fn setup_lock(prefix: &str, wait: Duration) -> Result<crate::win32::HeldMute
 /// Refuses definitions that users who aren't administrators could have edited, or that sit
 /// in a folder they could change: the host would run what they wrote as LocalSystem, and
 /// repairing the permissions must not make them trusted. Logs, state and history are never
-/// run, so their permissions are simply repaired.
+/// run, so their permissions are simply repaired. Every entry counts, whatever its name, since
+/// Windows opens `web.TOML` as `web.toml`.
 fn refuse_tampered(layout: &Layout) -> Result<()> {
     let folder = layout.workloads();
     if !folder.exists() {
@@ -88,10 +89,18 @@ fn refuse_tampered(layout: &Layout) -> Result<()> {
     if crate::win32::writable_by_others(&folder)? {
         suspect.push(folder.clone());
     }
-    for name in files::names(&folder, "toml")? {
-        let definition = layout.definition(&name);
-        if crate::win32::writable_by_others(&definition)? {
-            suspect.push(definition);
+    let mut entries = vec![];
+    for entry in std::fs::read_dir(&folder).with_context(|| format!("Read {}", folder.display()))? {
+        entries.push(
+            entry
+                .with_context(|| format!("Read {}", folder.display()))?
+                .path(),
+        );
+    }
+    entries.sort();
+    for entry in entries {
+        if crate::win32::writable_by_others(&entry)? {
+            suspect.push(entry);
         }
     }
     if suspect.is_empty() {

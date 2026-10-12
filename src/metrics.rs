@@ -531,33 +531,71 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
-fn log_bytes(data: &Path, name: &str) -> u64 {
+pub(crate) fn log_bytes(data: &Path, name: &str) -> u64 {
     let logs = data.join("logs");
     file_size(&logs.join(format!("{name}.log"))) + file_size(&logs.join(format!("{name}.log.1")))
 }
 
+/// Each folder counts at most this many entries, so a folder flooded with files cannot stall
+/// sampling.
+const DATA_FILES: usize = 10_000;
+
 /// The files in the data directory and its `logs` folder, and in services mode also those in
-/// the definition, state and event folders. Each folder counts at most `DATA_FILES` entries,
-/// so a folder flooded with files cannot stall sampling.
+/// the definition, state and event folders.
 fn data_bytes(data: &Path) -> u64 {
-    const DATA_FILES: usize = 10_000;
-    let size = |directory: &Path| -> u64 {
-        std::fs::read_dir(directory).map_or(0, |entries| {
-            entries
-                .take(DATA_FILES)
-                .flatten()
-                .filter_map(|entry| entry.metadata().ok())
-                .filter(|metadata| metadata.is_file())
-                .map(|metadata| metadata.len())
-                .sum()
-        })
-    };
-    let mut folders = vec![data.to_path_buf(), data.join("logs")];
-    if data.join(crate::services::files::MARKER).exists() {
-        let layout = crate::services::files::Layout::new(data);
-        folders.extend([layout.workloads(), layout.states(), layout.events_dir()]);
+    data_bytes_from(data, folder_bytes, || reported_log_bytes(data))
+}
+
+/// `listed` sizes a folder, or gives `None` when this account may not list it. Only
+/// administrators may list the logs folder in services mode, so for everyone else the hosts'
+/// own reports of their log sizes stand in. Definitions are small enough to leave out.
+fn data_bytes_from(
+    data: &Path,
+    listed: impl Fn(&Path) -> Option<u64>,
+    reported_logs: impl FnOnce() -> u64,
+) -> u64 {
+    let root = listed(data).unwrap_or(0);
+    let logs = listed(&data.join("logs"));
+    if !data.join(crate::services::files::MARKER).exists() {
+        return root + logs.unwrap_or(0);
     }
-    folders.iter().map(|folder| size(folder)).sum()
+    let layout = crate::services::files::Layout::new(data);
+    let others: u64 = [layout.workloads(), layout.states(), layout.events_dir()]
+        .iter()
+        .filter_map(|folder| listed(folder))
+        .sum();
+    root + logs.unwrap_or_else(reported_logs) + others
+}
+
+/// A missing folder is empty; one that can't be listed is `None`.
+fn folder_bytes(directory: &Path) -> Option<u64> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    Some(
+        entries
+            .take(DATA_FILES)
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum(),
+    )
+}
+
+/// The log sizes the services mode hosts recorded in their state files, which every user may
+/// read.
+fn reported_log_bytes(data: &Path) -> u64 {
+    use crate::services::files;
+    let layout = files::Layout::new(data);
+    files::names(&layout.states(), "json")
+        .unwrap_or_default()
+        .iter()
+        .take(DATA_FILES)
+        .filter_map(|name| files::read_state(&layout.state(name))?.log_bytes)
+        .sum()
 }
 
 /// Samples a single process, such as the desktop app itself.
@@ -631,6 +669,62 @@ mod tests {
         assert_eq!(data_bytes(root), 11);
         std::fs::write(root.join(crate::services::files::MARKER), b"").unwrap();
         assert_eq!(data_bytes(root), 111_111);
+    }
+
+    #[test]
+    fn logs_this_account_cannot_list_count_as_the_hosts_report_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (path, length) in [
+            ("logs/web.log", 10),
+            ("workloads/web.toml", 100),
+            ("state/web.json", 1000),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![b'x'; length]).unwrap();
+        }
+        let hidden = |hidden: &'static [&'static str]| {
+            move |folder: &Path| {
+                let name = folder.file_name()?.to_str()?;
+                (!hidden.contains(&name)).then(|| folder_bytes(folder))?
+            }
+        };
+        let reported = || 5000;
+        assert_eq!(data_bytes_from(root, hidden(&[]), reported), 10);
+        assert_eq!(data_bytes_from(root, hidden(&["logs"]), reported), 0);
+
+        std::fs::write(root.join(crate::services::files::MARKER), b"").unwrap();
+        assert_eq!(data_bytes_from(root, hidden(&[]), reported), 1110);
+        assert_eq!(
+            data_bytes_from(root, hidden(&["logs", "workloads"]), reported),
+            6000
+        );
+        assert_eq!(
+            data_bytes_from(root, hidden(&["workloads"]), || panic!("logs are listed")),
+            1010
+        );
+    }
+
+    /// On Windows only state files that administrators control are read, which needs a
+    /// protected folder; the services tests cover that.
+    #[cfg(not(windows))]
+    #[test]
+    fn reported_log_sizes_come_from_the_state_files() {
+        use crate::services::files::{HostState, Layout, write_state};
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        std::fs::create_dir_all(layout.states()).unwrap();
+        assert_eq!(reported_log_bytes(dir.path()), 0);
+        for (name, log_bytes) in [("web", Some(70)), ("api", Some(7)), ("old", None)] {
+            let state = HostState {
+                log_bytes,
+                ..Default::default()
+            };
+            write_state(&layout.state(name), &state).unwrap();
+        }
+        std::fs::write(layout.states().join("broken.json"), b"{").unwrap();
+        assert_eq!(reported_log_bytes(dir.path()), 77);
     }
 
     #[test]

@@ -268,21 +268,27 @@ impl Backend {
             Err(error) if denied(&error) => None,
             Err(error) => return Err(error),
         };
-        let mut names: BTreeSet<&String> = services.keys().collect();
-        names.extend(definitions.iter().flat_map(|found| found.keys()));
+        let mut names: Vec<&String> = services.keys().collect();
+        for name in definitions.iter().flat_map(|found| found.keys()) {
+            if status::same_name(&services, name).is_none() {
+                names.push(name);
+            }
+        }
+        names.sort();
         Ok(names
             .into_iter()
             .map(|name| {
                 let definition = match &definitions {
                     None => Definition::Hidden,
-                    Some(found) => found.get(name).map_or(Definition::Missing, |workload| {
-                        Definition::Present(Box::new(workload.clone()))
-                    }),
+                    Some(found) => status::same_name(found, name)
+                        .map_or(Definition::Missing, |workload| {
+                            Definition::Present(Box::new(workload.clone()))
+                        }),
                 };
                 status::status(
                     name,
                     definition,
-                    services.get(name),
+                    status::same_name(&services, name),
                     files::read_state(&self.layout.state(name)),
                     crate::win32::process_alive,
                 )

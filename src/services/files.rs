@@ -87,6 +87,10 @@ pub struct HostState {
     /// The instance of the definition the report is about. A report whose instance differs
     /// from the service's was left by an earlier workload of the same name.
     pub instance: Option<String>,
+    /// The size of the workload's log and its rotated copy, for users who may not read the
+    /// logs folder. Missing from reports written before it existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_bytes: Option<u64>,
 }
 
 /// Replaces `path` in one step, so readers never see a partly written file. `prepare` runs on
@@ -290,7 +294,8 @@ fn parse_definition(text: &str, path: &Path) -> Result<(Workload, Option<String>
     parsed().with_context(|| format!("Invalid definition {}", path.display()))
 }
 
-/// The names of the files in `dir` with the given extension, sorted. A missing folder is empty.
+/// The names of the files in `dir` with the given extension in any case, as Windows opens
+/// them, sorted. A missing folder is empty.
 pub fn names(dir: &Path, extension: &str) -> Result<Vec<String>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -301,7 +306,9 @@ pub fn names(dir: &Path, extension: &str) -> Result<Vec<String>> {
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            (path.extension()? == extension)
+            path.extension()?
+                .to_str()?
+                .eq_ignore_ascii_case(extension)
                 .then(|| path.file_stem()?.to_str().map(str::to_string))
                 .flatten()
         })
@@ -870,11 +877,37 @@ mod tests {
             pid: Some(7),
             host_pid: 6,
             reason: "Process started".into(),
+            log_bytes: Some(1234),
             ..Default::default()
         };
         write_state(&layout.state("web"), &state).unwrap();
         write_state(&layout.state("web"), &state).unwrap();
         assert_eq!(read_state(&layout.state("web")), Some(state));
         assert_eq!(names(&layout.states(), "json").unwrap(), ["web"]);
+    }
+
+    #[test]
+    fn extensions_match_in_any_case() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in [
+            "web.TOML",
+            "api.toml",
+            "db.Toml",
+            "notes.txt",
+            "toml",
+            "web.toml.tmp",
+        ] {
+            std::fs::write(dir.path().join(file), b"").unwrap();
+        }
+        assert_eq!(names(dir.path(), "toml").unwrap(), ["api", "db", "web"]);
+    }
+
+    #[test]
+    fn reports_written_before_log_sizes_existed_still_load() {
+        let old = r#"{"state":"running","pid":7,"host_pid":6,"reason":"Process started"}"#;
+        let state: HostState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.log_bytes, None);
+        assert_eq!(state.pid, Some(7));
+        assert!(!serde_json::to_string(&state).unwrap().contains("log_bytes"));
     }
 }

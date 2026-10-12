@@ -41,8 +41,8 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(30);
 const DELETE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCOUNT: &str = "LocalSystem";
 
-/// Services whose next reconfiguration fails right after the account is switched, so tests
-/// can check the rollback.
+/// Services whose next reconfiguration fails once every setting, the account included, has
+/// changed, so tests can check the rollback.
 #[doc(hidden)]
 pub static FAIL_AFTER_ACCOUNT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -354,6 +354,7 @@ pub fn wanted(workload: &Workload, at: &Registration) -> ServiceSettings {
         display_name: info.display_name.to_string_lossy().into_owned(),
         description: description(workload).into(),
         recovery: recovery(&failure_actions(), false),
+        dependencies: vec![],
     }
 }
 
@@ -376,6 +377,16 @@ pub fn settings(service: &str) -> Result<ServiceSettings> {
                 &handle.get_failure_actions()?,
                 handle.get_failure_actions_on_non_crash_failures()?,
             ),
+            dependencies: config
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    dependency
+                        .to_system_identifier()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect(),
         })
     };
     read().with_context(|| format!("Read service {service}"))
@@ -428,9 +439,55 @@ pub fn reconfigure(workload: &Workload, at: &Registration) -> Result<()> {
     };
     handle
         .change_config(&info)
+        .and_then(|()| set_dependencies(&handle, &dependency_list(&[])))
         .with_context(|| format!("Change service {}", at.service))?;
-    fail_if_asked(at.service)?;
-    configure(&handle, workload).with_context(|| format!("Configure service {}", at.service))
+    configure(&handle, workload).with_context(|| format!("Configure service {}", at.service))?;
+    fail_if_asked(at.service)
+}
+
+/// The double-NUL-terminated list `ChangeServiceConfigW` takes. An empty one removes every
+/// dependency.
+fn dependency_list(dependencies: &[OsString]) -> Vec<u16> {
+    let mut list: Vec<u16> = dependencies
+        .iter()
+        .flat_map(|dependency| crate::win32::wide(dependency))
+        .collect();
+    list.push(0);
+    if list.len() == 1 {
+        list.push(0);
+    }
+    list
+}
+
+/// `change_config` leaves the dependencies alone when it is given none.
+fn set_dependencies(
+    handle: &windows_service::service::Service,
+    list: &[u16],
+) -> windows_service::Result<()> {
+    // SAFETY: the list is double-NUL-terminated and outlives the call; null pointers and
+    // SERVICE_NO_CHANGE leave every other setting as it is.
+    let changed = unsafe {
+        ChangeServiceConfigW(
+            handle.raw_handle(),
+            SERVICE_NO_CHANGE,
+            SERVICE_NO_CHANGE,
+            SERVICE_NO_CHANGE,
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+            list.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+        )
+    } != 0;
+    if changed {
+        Ok(())
+    } else {
+        Err(windows_service::Error::Winapi(
+            std::io::Error::last_os_error(),
+        ))
+    }
 }
 
 fn fail_if_asked(service: &str) -> Result<()> {
@@ -459,6 +516,7 @@ pub struct Snapshot {
     delayed: bool,
     failure_actions: ServiceFailureActions,
     on_non_crash_failures: bool,
+    dependencies: Vec<u16>,
 }
 
 /// Opens the service with the rights a change needs, so a caller without them fails here,
@@ -478,6 +536,13 @@ pub fn snapshot(service: &str) -> Result<Snapshot> {
             delayed: delayed(&handle)?,
             failure_actions: handle.get_failure_actions()?,
             on_non_crash_failures: handle.get_failure_actions_on_non_crash_failures()?,
+            dependencies: dependency_list(
+                &config
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.to_system_identifier())
+                    .collect::<Vec<_>>(),
+            ),
         })
     };
     read().with_context(|| format!("Read service {service}"))
@@ -544,19 +609,20 @@ pub fn restore(service: &str, snapshot: &Snapshot) -> Result<()> {
             snapshot.command_line.as_ptr(),
             ptr::null(),
             ptr::null_mut(),
-            ptr::null(),
+            snapshot.dependencies.as_ptr(),
             name.as_ref().map_or(ptr::null(), |name| name.as_ptr()),
             password,
             snapshot.display_name.as_ptr(),
         )
     } != 0;
-    // Without actions, the reset period is ignored and the actions are kept; an empty list
-    // removes them.
+    // `None` leaves each of these as it is, and an empty value removes it, so the snapshot's
+    // absent values become empty ones.
+    let saved = &snapshot.failure_actions;
     let failure_actions = ServiceFailureActions {
-        actions: Some(snapshot.failure_actions.actions.clone().unwrap_or_default()),
-        reboot_msg: None,
-        command: None,
-        ..snapshot.failure_actions.clone()
+        reset_period: saved.reset_period,
+        actions: Some(saved.actions.clone().unwrap_or_default()),
+        reboot_msg: Some(saved.reboot_msg.clone().unwrap_or_default()),
+        command: Some(saved.command.clone().unwrap_or_default()),
     };
     let restored = if changed {
         handle

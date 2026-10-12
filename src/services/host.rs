@@ -39,6 +39,8 @@ const POLL: Duration = Duration::from_millis(250);
 const ROTATE_EVERY: Duration = Duration::from_secs(10);
 const PENDING_LIMIT: usize = 100;
 const SAVE_RETRY_LIMIT: Duration = Duration::from_secs(2);
+/// How long a host about to exit keeps trying to write what it could not write yet.
+const FLUSH_LIMIT: Duration = Duration::from_secs(5);
 
 static TARGET: OnceLock<(PathBuf, String, Option<String>)> = OnceLock::new();
 define_windows_service!(ffi_main, service_main);
@@ -95,9 +97,12 @@ fn service_main(arguments: Vec<OsString>) {
         },
         checkpoint: 0,
         pending: vec![],
+        unwritten: None,
         unsaved: None,
+        stopping: false,
     };
     let exit = host.run(&stopped);
+    host.flush();
     host.report(ServiceState::Stopped, exit, Duration::ZERO);
 }
 
@@ -114,8 +119,12 @@ struct Host {
     checkpoint: u32,
     /// Events not written yet, oldest first.
     pending: Vec<String>,
+    /// Set while `pending` holds events that could not be written.
+    unwritten: Option<Retry>,
     /// Set while the state file holds an older state than `state`.
     unsaved: Option<Retry>,
+    /// A stop was requested, so the service manager expects stop progress until the host ends.
+    stopping: bool,
 }
 
 /// When to try writing the state file again, and how long to wait after that.
@@ -139,6 +148,14 @@ impl Retry {
             at: now + delay,
             delay,
         }
+    }
+
+    fn after(retry: Option<Self>, now: Instant) -> Self {
+        retry.map_or_else(|| Self::first(now), |retry| retry.next(now))
+    }
+
+    fn due(retry: Option<Self>, now: Instant) -> bool {
+        retry.is_some_and(|retry| now >= retry.at)
     }
 }
 
@@ -281,11 +298,12 @@ impl Host {
         let mut rotated = Instant::now();
         loop {
             if !matches!(stop.recv_timeout(POLL), Err(RecvTimeoutError::Timeout)) {
+                self.stopping = true;
                 self.stop_process(spec, process);
                 self.record(State::Stopped, "Stopped by request");
                 return None;
             }
-            self.retry_save();
+            self.retry();
             let now = Utc::now();
             match process.poll() {
                 Ok(Some(code)) => {
@@ -330,6 +348,9 @@ impl Host {
                     self.log_line(&format!("Log rotation failed: {error:#}"));
                     self.note("Log rotation failed");
                 }
+                if self.unsaved.is_none() && self.state.log_bytes != Some(self.log_bytes()) {
+                    self.save();
+                }
             }
         }
     }
@@ -365,9 +386,10 @@ impl Host {
                 stop.recv_timeout(left.min(POLL)),
                 Err(RecvTimeoutError::Timeout)
             ) {
+                self.stopping = true;
                 return true;
             }
-            self.retry_save();
+            self.retry();
         }
     }
 
@@ -388,21 +410,59 @@ impl Host {
     fn save(&mut self) {
         self.state.host_pid = std::process::id();
         self.state.updated_at = Utc::now();
-        let written = files::write_state(&self.layout.state(&self.name), &self.state);
-        let now = Instant::now();
-        self.unsaved = match (written, self.unsaved) {
-            (Ok(()), _) => None,
-            (Err(error), None) => {
-                self.log_line(&format!("State not saved yet: {error:#}"));
-                Some(Retry::first(now))
+        self.state.log_bytes = Some(self.log_bytes());
+        match files::write_state(&self.layout.state(&self.name), &self.state) {
+            Ok(()) => self.unsaved = None,
+            Err(error) => {
+                if self.unsaved.is_none() {
+                    self.log_line(&format!("State not saved yet: {error:#}"));
+                }
+                self.unsaved = Some(Retry::after(self.unsaved, Instant::now()));
             }
-            (Err(_), Some(retry)) => Some(retry.next(now)),
-        };
+        }
     }
 
-    fn retry_save(&mut self) {
-        if self.unsaved.is_some_and(|retry| Instant::now() >= retry.at) {
+    fn log_bytes(&self) -> u64 {
+        crate::metrics::log_bytes(self.layout.root(), &self.name)
+    }
+
+    /// Writes the state and events that could not be written before, once their retry is due.
+    fn retry(&mut self) {
+        let now = Instant::now();
+        if Retry::due(self.unsaved, now) {
             self.save();
+        }
+        if Retry::due(self.unwritten, now) {
+            self.write_pending();
+        }
+    }
+
+    /// Nothing writes the state or events after the host exits, so it keeps trying for up to
+    /// `FLUSH_LIMIT` first, and logs what it still could not write.
+    fn flush(&mut self) {
+        let deadline = Instant::now() + FLUSH_LIMIT;
+        while (self.unsaved.is_some() || self.unwritten.is_some()) && Instant::now() < deadline {
+            if self.stopping {
+                self.report(
+                    ServiceState::StopPending,
+                    ServiceExitCode::NO_ERROR,
+                    FLUSH_LIMIT,
+                );
+            }
+            std::thread::sleep(POLL);
+            self.retry();
+        }
+        if self.unsaved.is_some() {
+            self.log_line(&format!(
+                "Exited without saving the state {}: {}",
+                self.state.state, self.state.reason
+            ));
+        }
+        if self.unwritten.is_some() {
+            self.log_line(&format!(
+                "Exited without recording {} events in the activity history",
+                self.pending.len()
+            ));
         }
     }
 
@@ -419,24 +479,28 @@ impl Host {
     }
 
     /// Records an event in the history. One that cannot be written yet, because another
-    /// writer holds the history or a reader blocks the file, is kept and written with the
-    /// next one, so supervision never waits on it.
+    /// writer holds the history or a reader blocks the file, is kept and tried again on later
+    /// ticks, so supervision never waits on it.
     fn note(&mut self, message: &str) {
         if self.pending.len() == PENDING_LIMIT {
             self.pending.remove(0);
         }
         self.pending.push(message.to_string());
+        self.write_pending();
+    }
+
+    fn write_pending(&mut self) {
         while let Some(next) = self.pending.first() {
-            match files::append_event(&self.layout, &self.name, next) {
-                Ok(()) => {
-                    self.pending.remove(0);
-                }
-                Err(error) => {
+            if let Err(error) = files::append_event(&self.layout, &self.name, next) {
+                if self.unwritten.is_none() {
                     self.log_line(&format!("Activity history not updated yet: {error:#}"));
-                    break;
                 }
+                self.unwritten = Some(Retry::after(self.unwritten, Instant::now()));
+                return;
             }
+            self.pending.remove(0);
         }
+        self.unwritten = None;
     }
 
     fn report(&mut self, state: ServiceState, exit_code: ServiceExitCode, wait_hint: Duration) {
@@ -506,5 +570,16 @@ mod tests {
             delays.push(retry.delay.as_millis());
         }
         assert_eq!(delays, [500, 1000, 2000, 2000, 2000, 2000]);
+    }
+
+    #[test]
+    fn a_retry_is_due_once_its_time_comes() {
+        let now = Instant::now();
+        let first = Retry::after(None, now);
+        assert_eq!(first, Retry::first(now));
+        assert_eq!(Retry::after(Some(first), now), first.next(now));
+        assert!(!Retry::due(None, now));
+        assert!(!Retry::due(Some(first), now));
+        assert!(Retry::due(Some(first), now + POLL));
     }
 }

@@ -2025,3 +2025,180 @@ fn a_running_workload_whose_definition_cannot_be_read_is_neither_job_nor_service
     drop(held);
     assert_eq!(split().unwrap().0, ["job"]);
 }
+
+#[test]
+fn a_final_state_held_back_by_a_reader_is_saved_before_the_host_exits() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let mut job = machine.workload("final", "exit");
+    job.kind = Kind::Job;
+    job.success_exit_codes = vec![3];
+    job.environment.insert("K3UP_EXIT_CODE".into(), "3".into());
+    assert!(machine.put(job).ok);
+    let state = machine.data.join("state").join("final.json");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&state)
+        .unwrap();
+    machine.ok(Command::Start {
+        name: "final".into(),
+    });
+    machine.until_logged("final", "State not saved yet");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(machine.sc("query", "final").contains("RUNNING"));
+    drop(held);
+    let done = machine.until("final", |status| status.state == State::Completed);
+    assert_eq!(done.last_exit, Some(3));
+    assert_eq!(
+        done.reason,
+        "Process exited with code 3, counted as success"
+    );
+    assert!(!machine.log("final").contains("Exited without saving"));
+}
+
+#[test]
+fn an_event_held_back_by_a_reader_is_recorded_once_released() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(machine.put(machine.workload("quiet", "pulse")).ok);
+    let events = machine.data.join("events").join("quiet.jsonl");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+        .open(&events)
+        .unwrap();
+    machine.ok(Command::Start {
+        name: "quiet".into(),
+    });
+    machine.until("quiet", |status| status.state == State::Running);
+    machine.until_logged("quiet", "Activity history not updated yet");
+    let started = || {
+        machine
+            .ok(Command::Events {
+                name: Some("quiet".into()),
+                after: None,
+            })
+            .events
+            .iter()
+            .any(|event| event.message == "Process started")
+    };
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!started());
+    drop(held);
+    let released = Instant::now();
+    while !started() {
+        assert!(
+            released.elapsed() < Duration::from_secs(5),
+            "{}",
+            machine.log("quiet")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn a_definition_with_an_upper_case_extension_is_checked_too() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let workloads = machine.data.join("workloads");
+    let upper = workloads.join("X.TOML");
+    let text = files::definition_text(&machine.workload("X", "pulse"), None).unwrap();
+    std::fs::write(&upper, text).unwrap();
+    icacls(&upper, &["/setowner", "*S-1-5-32-544"]);
+    icacls(&upper, &["/grant", "*S-1-5-32-545:M"]);
+    let error = format!("{:#}", setup::prepare(&machine.data).unwrap_err());
+    assert!(error.contains(&format!("  {}", upper.display())), "{error}");
+    assert!(k3up::win32::writable_by_others(&upper).unwrap());
+    assert_eq!(files::names(&workloads, "toml").unwrap(), ["X"]);
+    let listed = machine.ok(Command::List).workloads;
+    let names: Vec<&str> = listed
+        .iter()
+        .map(|status| status.workload.name.as_str())
+        .collect();
+    assert_eq!(names, ["X"]);
+}
+
+#[test]
+fn recovery_commands_and_dependencies_set_outside_k3up_survive_a_failed_change() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let web = machine.workload("recovery", "pulse");
+    assert!(machine.put(web.clone()).ok);
+    let service = machine.service("recovery");
+    let output = std::process::Command::new("sc.exe")
+        .args(["failure", &service, "reset=", "3600"])
+        .args(["actions=", "run/5000/restart/10000"])
+        .args(["command=", "cmd /c echo x"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    machine.sc_config("recovery", &["depend=", "Tcpip"]);
+    let failure = machine.sc("qfailure", "recovery");
+    assert!(failure.contains("cmd /c echo x"), "{failure}");
+    let config = machine.sc("qc", "recovery");
+    assert!(config.contains("Tcpip"), "{config}");
+
+    scm::FAIL_AFTER_ACCOUNT
+        .lock()
+        .unwrap()
+        .push(service.clone());
+    let failed = machine.apply(std::slice::from_ref(&web), false);
+    scm::FAIL_AFTER_ACCOUNT
+        .lock()
+        .unwrap()
+        .retain(|name| *name != service);
+    assert!(!failed.ok);
+    assert!(
+        failed
+            .message
+            .starts_with("Saving failed and every change was undone: "),
+        "{}",
+        failed.message
+    );
+    assert_eq!(machine.sc("qfailure", "recovery"), failure);
+    assert_eq!(machine.sc("qc", "recovery"), config);
+}
+
+#[test]
+fn a_dependency_added_outside_k3up_is_removed_while_running() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let web = machine.workload("depends", "pulse");
+    assert!(machine.put(web.clone()).ok);
+    let config = machine.sc("qc", "depends");
+    machine.ok(Command::Start {
+        name: "depends".into(),
+    });
+    let before = machine.until("depends", |status| status.state == State::Running);
+    machine.sc_config("depends", &["depend=", "Tcpip"]);
+    assert!(machine.sc("qc", "depends").contains("Tcpip"));
+
+    let applied = machine.apply(std::slice::from_ref(&web), false);
+    assert_eq!(
+        applied.message,
+        "Update depends: service settings differ (dependencies)"
+    );
+    assert_eq!(machine.sc("qc", "depends"), config);
+    let after = machine.get("depends");
+    assert_eq!(after.state, State::Running);
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(
+        machine.apply(std::slice::from_ref(&web), false).message,
+        "No changes"
+    );
+}
