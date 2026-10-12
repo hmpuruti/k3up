@@ -429,9 +429,10 @@ pub fn writable_by_others(path: &Path) -> Result<bool> {
 }
 
 /// Whether an account other than SYSTEM, Administrators and TrustedInstaller may change
-/// `path`, or rename, delete or re-permission a folder above it. `None` when the permissions
-/// of `path` cannot be read. A folder whose permissions cannot be read counts as unchanged,
-/// so the answer never rests on a guess.
+/// `path`, or rename, delete or re-permission a folder above it. A path that doesn't exist yet
+/// is judged by the nearest folder that does, since whoever may add to that folder can create
+/// it. `None` when the permissions of that path cannot be read. A folder whose permissions
+/// cannot be read counts as unchanged, so the answer never rests on a guess.
 pub fn changeable_by_others(path: &Path) -> Option<bool> {
     let read = |path: &Path| {
         Pinned::open(path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL)
@@ -439,11 +440,15 @@ pub fn changeable_by_others(path: &Path) -> Option<bool> {
             .security()
             .ok()
     };
-    if !read(path)?.protected() {
+    let existing = path
+        .ancestors()
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())?;
+    if !read(existing)?.protected() {
         return Some(true);
     }
     Some(
-        path.ancestors()
+        existing
+            .ancestors()
             .skip(1)
             .any(|folder| read(folder).is_some_and(|security| !security.keeps_children_in_place())),
     )

@@ -678,6 +678,29 @@ fn a_program_users_may_change_is_created_with_a_warning() {
 }
 
 #[test]
+fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let mut workload = machine.workload("later", "run");
+    let missing = open_folder(&machine).join("not-yet").join("tool.exe");
+    workload.executable = missing.to_string_lossy().into();
+    let exposed: Vec<PathBuf> = exposure::exposed_paths(&workload)
+        .into_iter()
+        .map(|exposure| exposure.path)
+        .collect();
+    assert_eq!(exposed, [missing]);
+
+    workload.executable = machine
+        .data
+        .join("not-yet")
+        .join("tool.exe")
+        .to_string_lossy()
+        .into();
+    assert!(exposure::exposed_paths(&workload).is_empty());
+}
+
+#[test]
 fn only_scripts_users_may_change_are_warned_about() {
     let Some(machine) = Machine::start() else {
         return;
