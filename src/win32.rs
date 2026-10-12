@@ -37,8 +37,8 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         CreateDirectoryW, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+        FILE_SHARE_READ, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     },
     System::{
         Com::CoTaskMemFree,
@@ -345,7 +345,8 @@ fn collect_entries(
     for entry in listing {
         let entry = entry.with_context(|| format!("Read {}", folder.path().display()))?;
         let path = entry.path();
-        // Listing a folder opens it for reading, so folders share reads.
+        // Windows checks sharing only for handles that ask for data access, so this one asks
+        // to read. Listing a folder opens it for reading, so folders share reads.
         let share = if held.contains(&path) {
             SHARE_NO_DELETE
         } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
@@ -355,7 +356,7 @@ fn collect_entries(
         };
         let pinned = match Pinned::open(
             &path,
-            READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+            FILE_READ_DATA | READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
             share,
         ) {
             Ok(pinned) => pinned,
