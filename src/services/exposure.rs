@@ -8,6 +8,8 @@ pub enum Use {
     Program,
     Argument,
     Folder,
+    /// A folder on the PATH the process searches for commands it runs by bare name.
+    SearchPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,8 +100,41 @@ fn normalised(path: &Path) -> PathBuf {
     result
 }
 
-/// Every path the workload's process runs or may load code from, once each.
-pub fn inspected(workload: &Workload, exists: impl Fn(&Path) -> bool) -> Vec<Exposure> {
+/// The folders the process searches for a command given by bare name: the workload's own
+/// PATH when it sets one, otherwise `machine_path`, which LocalSystem inherits. Relative
+/// entries resolve against the working folder, as the search does.
+pub fn search_folders(workload: &Workload, machine_path: Option<String>) -> Vec<PathBuf> {
+    let own = workload
+        .environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone());
+    let folder = Path::new(&workload.working_directory);
+    own.or(machine_path)
+        .unwrap_or_default()
+        .split(';')
+        .map(|entry| entry.trim().trim_matches('"'))
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let path = Path::new(entry);
+            if path.is_absolute() {
+                Some(normalised(path))
+            } else if folder.is_absolute() {
+                Some(normalised(&folder.join(path)))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Every path the workload's process runs or may load code from, once each. `machine_path`
+/// is the PATH LocalSystem inherits when the workload sets none.
+pub fn inspected(
+    workload: &Workload,
+    exists: impl Fn(&Path) -> bool,
+    machine_path: Option<String>,
+) -> Vec<Exposure> {
     let program = Exposure {
         path: workload.executable.clone().into(),
         what: Use::Program,
@@ -118,10 +153,17 @@ pub fn inspected(workload: &Workload, exists: impl Fn(&Path) -> bool) -> Vec<Exp
         path: workload.working_directory.clone().into(),
         what: Use::Folder,
     };
+    let searched = search_folders(workload, machine_path)
+        .into_iter()
+        .map(|path| Exposure {
+            path,
+            what: Use::SearchPath,
+        });
     let mut found: Vec<Exposure> = vec![];
     for candidate in std::iter::once(program)
         .chain(arguments)
         .chain(std::iter::once(folder))
+        .chain(searched)
     {
         if candidate.path.is_absolute() && found.iter().all(|seen| seen.path != candidate.path) {
             found.push(candidate);
@@ -137,7 +179,7 @@ pub fn inspected(workload: &Workload, exists: impl Fn(&Path) -> bool) -> Vec<Exp
 pub fn exposed_paths(workload: &Workload) -> Vec<Exposure> {
     #[cfg(windows)]
     {
-        inspected(workload, |path| path.exists())
+        inspected(workload, |path| path.exists(), crate::win32::machine_path())
             .into_iter()
             .filter(|exposure| crate::win32::changeable_by_others(&exposure.path))
             .collect()
@@ -279,7 +321,7 @@ mod tests {
             args: vec![text(&script), text(&program), text(&folder)],
             ..Default::default()
         };
-        let found = inspected(&workload, |_| true);
+        let found = inspected(&workload, |_| true, None);
         let paths: Vec<_> = found
             .iter()
             .map(|exposure| (exposure.path.clone(), exposure.what))
@@ -303,12 +345,42 @@ mod tests {
     }
 
     #[test]
+    fn search_folders_come_from_the_workloads_path_or_the_machines() {
+        let folder = absolute("work");
+        let bin = absolute("bin");
+        let tools = absolute("tools");
+        let separator = std::path::MAIN_SEPARATOR;
+        let mut workload = Workload {
+            name: "web".into(),
+            working_directory: text(&folder),
+            ..Default::default()
+        };
+        let machine = Some(format!("{};;\"{}\"", text(&bin), text(&tools)));
+        assert_eq!(
+            search_folders(&workload, machine.clone()),
+            [bin.clone(), tools.clone()]
+        );
+
+        workload.environment.insert(
+            "Path".into(),
+            format!("{};local{separator}bin", text(&tools)),
+        );
+        assert_eq!(
+            search_folders(&workload, machine),
+            [tools, folder.join("local").join("bin")]
+        );
+        let found = inspected(&workload, |_| false, None);
+        assert!(found.iter().any(|exposure| exposure.what == Use::SearchPath
+            && exposure.path == folder.join("local").join("bin")));
+    }
+
+    #[test]
     fn a_definition_the_caller_cannot_read_has_nothing_to_inspect() {
         let hidden = Workload {
             name: "web".into(),
             ..Default::default()
         };
-        assert!(inspected(&hidden, |_| true).is_empty());
+        assert!(inspected(&hidden, |_| true, None).is_empty());
         assert!(exposed_paths(&hidden).is_empty());
     }
 }

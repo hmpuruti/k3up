@@ -129,7 +129,10 @@ impl Machine {
             args: ["--exact", "fixture", "--ignored", "--nocapture"]
                 .map(String::from)
                 .to_vec(),
-            environment: BTreeMap::from([("K3UP_FIXTURE".into(), mode.into())]),
+            environment: BTreeMap::from([
+                ("K3UP_FIXTURE".into(), mode.into()),
+                ("PATH".into(), system_path()),
+            ]),
             stop_timeout_secs: 1,
             restart_delay_secs: 1,
             ..Default::default()
@@ -617,6 +620,16 @@ fn the_command_line_talks_to_services_in_process() {
     assert!(machine.cli_response(&["list"]).workloads.is_empty());
 }
 
+/// A PATH of folders only administrators can change, so tests see only the warnings they set
+/// up, whatever the runner's machine PATH holds.
+fn system_path() -> String {
+    system_cmd()
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn system_cmd() -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").unwrap())
         .join("System32")
@@ -653,6 +666,8 @@ fn a_program_users_may_change_is_created_with_a_warning() {
         &program.to_string_lossy(),
         "--cwd",
         &data,
+        "--env",
+        &format!("PATH={}", system_path()),
         "--",
         "/c",
         "exit",
@@ -698,6 +713,8 @@ fn a_start_that_fails_after_the_create_still_warns() {
             &program.to_string_lossy(),
             "--cwd",
             &data,
+            "--env",
+            &format!("PATH={}", system_path()),
             "--start",
             "--",
             "/c",
@@ -794,6 +811,22 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
     assert_eq!(exposed, [chained]);
     std::fs::remove_dir(&front).unwrap();
     std::fs::remove_dir(&middle).unwrap();
+
+    // A bare command is searched for on the workload's PATH, here through a folder users control.
+    workload.executable = system_cmd().to_string_lossy().into();
+    workload.args = vec!["/c".into(), "helper.exe".into()];
+    let searched = open.join("bin");
+    workload.environment.insert(
+        "PATH".into(),
+        format!("{};{}", searched.display(), system_path()),
+    );
+    assert_eq!(
+        exposure::exposed_paths(&workload),
+        [exposure::Exposure {
+            path: searched,
+            what: exposure::Use::SearchPath,
+        }]
+    );
 }
 
 #[test]
@@ -820,6 +853,8 @@ fn only_scripts_users_may_change_are_warned_about() {
                 &cmd,
                 "--cwd",
                 &data,
+                "--env",
+                &format!("PATH={}", system_path()),
                 "--",
                 "/c",
                 &script.to_string_lossy(),
@@ -841,6 +876,7 @@ fn only_scripts_users_may_change_are_warned_about() {
         executable: cmd.clone(),
         working_directory: data.clone(),
         args: vec![format!("--script={}", open.display())],
+        environment: BTreeMap::from([("PATH".into(), system_path())]),
         ..Default::default()
     };
     assert_eq!(

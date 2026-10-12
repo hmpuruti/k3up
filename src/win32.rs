@@ -726,7 +726,18 @@ impl Hive {
     }
 }
 
-/// A string value, or `None` when the key or the value is missing or not a string.
+/// The machine-wide PATH, which services running as LocalSystem inherit. RegGetValueW expands
+/// its `%VARIABLES%` because it is read as a plain string. `None` when it can't be read.
+pub fn machine_path() -> Option<String> {
+    registry_string(
+        Hive::LocalMachine,
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        "Path",
+    )
+}
+
+/// A string value, or `None` when the key or the value is missing or not a string. An
+/// expandable string comes back expanded.
 pub fn registry_string(hive: Hive, key: &str, value: &str) -> Option<String> {
     let key = wide(key.as_ref());
     let value = wide(value.as_ref());
