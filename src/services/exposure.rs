@@ -6,6 +6,8 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Use {
     Program,
+    /// The program's own folder, where Windows looks first for the DLLs the program loads.
+    ProgramFolder,
     Argument,
     Folder,
     /// A folder on the PATH the process searches for commands it runs by bare name.
@@ -109,43 +111,19 @@ pub struct Inherited {
 }
 
 impl Inherited {
-    /// What services running as LocalSystem on this machine start with.
+    /// What services running as LocalSystem on this machine start with, worked out without
+    /// trusting the caller's environment.
     #[cfg(windows)]
     pub fn local_system() -> Self {
-        const MACHINE: [&str; 14] = [
-            "ALLUSERSPROFILE",
-            "CommonProgramFiles",
-            "CommonProgramFiles(x86)",
-            "CommonProgramW6432",
-            "ComSpec",
-            "ProgramData",
-            "ProgramFiles",
-            "ProgramFiles(x86)",
-            "ProgramW6432",
-            "PUBLIC",
-            "SystemDrive",
-            "SystemRoot",
-            "windir",
-            "OS",
-        ];
-        let mut variables: Vec<(String, String)> = MACHINE
-            .iter()
-            .filter_map(|name| Some((name.to_string(), std::env::var(name).ok()?)))
-            .collect();
-        if let Ok(root) = std::env::var("SystemRoot") {
-            let profile = format!(r"{root}\System32\config\systemprofile");
-            variables.extend([
-                ("USERPROFILE".into(), profile.clone()),
-                ("APPDATA".into(), format!(r"{profile}\AppData\Roaming")),
-                ("LOCALAPPDATA".into(), format!(r"{profile}\AppData\Local")),
-                ("TEMP".into(), format!(r"{root}\TEMP")),
-                ("TMP".into(), format!(r"{root}\TEMP")),
-            ]);
-        }
-        Self {
-            path: crate::win32::machine_path(),
-            variables,
-        }
+        let variables = crate::win32::local_system_variables();
+        let lookup = |name: &str| {
+            variables
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        let path = crate::win32::machine_path().map(|path| expand(&path, lookup));
+        Self { path, variables }
     }
 }
 
@@ -230,6 +208,10 @@ pub fn inspected(
         path: workload.executable.clone().into(),
         what: Use::Program,
     };
+    let program_folder = program.path.parent().map(|folder| Exposure {
+        path: folder.to_path_buf(),
+        what: Use::ProgramFolder,
+    });
     let args: Vec<String> = workload
         .args
         .iter()
@@ -253,6 +235,7 @@ pub fn inspected(
         });
     let mut found: Vec<Exposure> = vec![];
     for candidate in std::iter::once(program)
+        .chain(program_folder)
         .chain(arguments)
         .chain(std::iter::once(folder))
         .chain(searched)
@@ -422,11 +405,12 @@ mod tests {
             paths,
             [
                 (program, Use::Program),
+                (std::env::temp_dir(), Use::ProgramFolder),
                 (script.clone(), Use::Argument),
                 (folder, Use::Argument),
             ]
         );
-        let lines = warning_lines(&workload, &found[1..2]);
+        let lines = warning_lines(&workload, &found[2..3]);
         assert_eq!(
             lines,
             [format!(

@@ -673,9 +673,13 @@ fn a_program_users_may_change_is_created_with_a_warning() {
         "exit",
         "0",
     ]);
+    let folder = program.parent().unwrap();
     assert_eq!(
         warnings(&created.message),
-        [exposure::warning_line("open", &program)]
+        [
+            exposure::warning_line("open", &program),
+            exposure::warning_line("open", folder),
+        ]
     );
 
     let (success, health) = machine.cli(&["health"]);
@@ -683,8 +687,9 @@ fn a_program_users_may_change_is_created_with_a_warning() {
     let health: serde_json::Value = serde_json::from_str(&health).unwrap();
     assert_eq!(health["status"], "warning");
     let expected = format!(
-        "open runs as SYSTEM using {}, which users who aren't administrators can change",
-        program.display()
+        "open runs as SYSTEM using {}, {}, which users who aren't administrators can change",
+        program.display(),
+        folder.display()
     );
     assert!(
         health["warnings"]
@@ -730,7 +735,10 @@ fn a_start_that_fails_after_the_create_still_warns() {
     assert!(!response.ok);
     assert_eq!(
         warnings(&response.message),
-        [exposure::warning_line("failing", &program)],
+        [
+            exposure::warning_line("failing", &program),
+            exposure::warning_line("failing", program.parent().unwrap()),
+        ],
         "{}",
         response.message
     );
@@ -758,7 +766,10 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
         .into_iter()
         .map(|exposure| exposure.path)
         .collect();
-    assert_eq!(exposed, [missing]);
+    assert_eq!(
+        exposed,
+        [missing.clone(), missing.parent().unwrap().to_path_buf()]
+    );
 
     workload.executable = machine
         .data
@@ -777,7 +788,7 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
         .into_iter()
         .map(|exposure| exposure.path)
         .collect();
-    assert_eq!(exposed, [through_link]);
+    assert_eq!(exposed, [through_link, link.clone()]);
     std::fs::remove_dir(&link).unwrap();
 
     // A link higher up leads into a folder users control, though the last folder is protected.
@@ -792,7 +803,10 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
         .into_iter()
         .map(|exposure| exposure.path)
         .collect();
-    assert_eq!(exposed, [nested]);
+    assert_eq!(
+        exposed,
+        [nested.clone(), nested.parent().unwrap().to_path_buf()]
+    );
     std::fs::remove_dir(&hop).unwrap();
 
     // A protected link leads through a second link that sits in a folder users control.
@@ -808,7 +822,7 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
         .into_iter()
         .map(|exposure| exposure.path)
         .collect();
-    assert_eq!(exposed, [chained]);
+    assert_eq!(exposed, [chained, front.clone()]);
     std::fs::remove_dir(&front).unwrap();
     std::fs::remove_dir(&middle).unwrap();
 

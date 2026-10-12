@@ -44,8 +44,9 @@ use windows_sys::Win32::{
         Com::CoTaskMemFree,
         Registry::{
             HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_BINARY,
-            REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ, RegCloseKey,
-            RegCreateKeyExW, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, RegSetValueExW,
+            REG_OPTION_NON_VOLATILE, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_BINARY, RRF_RT_REG_EXPAND_SZ,
+            RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegGetValueW,
+            RegSetKeyValueW, RegSetValueExW,
         },
         Threading::{
             CreateMutexW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
@@ -53,7 +54,9 @@ use windows_sys::Win32::{
         },
     },
     UI::Shell::{
-        FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
+        FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+        FOLDERID_ProgramFilesCommon, FOLDERID_ProgramFilesCommonX86, FOLDERID_ProgramFilesX86,
+        FOLDERID_Public, FOLDERID_Windows, SHGetKnownFolderPath,
     },
 };
 
@@ -628,6 +631,52 @@ pub fn local_app_data() -> Result<PathBuf> {
     known_folder(&FOLDERID_LocalAppData)
 }
 
+/// The folder variables a LocalSystem process starts with, worked out from the machine's
+/// known folders rather than from this process's environment, which the caller controls.
+pub fn local_system_variables() -> Vec<(String, String)> {
+    let text = |id| {
+        known_folder(id)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+    };
+    let Some(windows) = text(&FOLDERID_Windows) else {
+        return vec![];
+    };
+    let profile = format!(r"{windows}\System32\config\systemprofile");
+    let mut variables: Vec<(String, String)> = vec![
+        ("SystemRoot".into(), windows.clone()),
+        ("windir".into(), windows.clone()),
+        ("SystemDrive".into(), windows.chars().take(2).collect()),
+        ("ComSpec".into(), format!(r"{windows}\System32\cmd.exe")),
+        ("OS".into(), "Windows_NT".into()),
+        ("USERPROFILE".into(), profile.clone()),
+        ("APPDATA".into(), format!(r"{profile}\AppData\Roaming")),
+        ("LOCALAPPDATA".into(), format!(r"{profile}\AppData\Local")),
+        ("TEMP".into(), format!(r"{windows}\TEMP")),
+        ("TMP".into(), format!(r"{windows}\TEMP")),
+    ];
+    let folders: [(&[&str], &windows_sys::core::GUID); 6] = [
+        (&["ProgramData", "ALLUSERSPROFILE"], &FOLDERID_ProgramData),
+        (&["ProgramFiles", "ProgramW6432"], &FOLDERID_ProgramFiles),
+        (&["ProgramFiles(x86)"], &FOLDERID_ProgramFilesX86),
+        (
+            &["CommonProgramFiles", "CommonProgramW6432"],
+            &FOLDERID_ProgramFilesCommon,
+        ),
+        (
+            &["CommonProgramFiles(x86)"],
+            &FOLDERID_ProgramFilesCommonX86,
+        ),
+        (&["PUBLIC"], &FOLDERID_Public),
+    ];
+    for (names, id) in folders {
+        if let Some(path) = text(id) {
+            variables.extend(names.iter().map(|name| (name.to_string(), path.clone())));
+        }
+    }
+    variables
+}
+
 /// Whether a process with this id runs. One this account may not open counts as running.
 pub fn process_alive(pid: u32) -> bool {
     if pid == 0 {
@@ -726,19 +775,25 @@ impl Hive {
     }
 }
 
-/// The machine-wide PATH, which services running as LocalSystem inherit. RegGetValueW expands
-/// its `%VARIABLES%` because it is read as a plain string. `None` when it can't be read.
+/// The machine-wide PATH, which services running as LocalSystem inherit, with its
+/// `%VARIABLES%` left as written: expanding them here would use this process's environment,
+/// which the caller controls. `None` when it can't be read.
 pub fn machine_path() -> Option<String> {
-    registry_string(
+    registry_text(
         Hive::LocalMachine,
         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
         "Path",
+        RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
     )
 }
 
 /// A string value, or `None` when the key or the value is missing or not a string. An
 /// expandable string comes back expanded.
 pub fn registry_string(hive: Hive, key: &str, value: &str) -> Option<String> {
+    registry_text(hive, key, value, RRF_RT_REG_SZ)
+}
+
+fn registry_text(hive: Hive, key: &str, value: &str, flags: u32) -> Option<String> {
     let key = wide(key.as_ref());
     let value = wide(value.as_ref());
     let mut bytes = 0u32;
@@ -748,7 +803,7 @@ pub fn registry_string(hive: Hive, key: &str, value: &str) -> Option<String> {
             hive.handle(),
             key.as_ptr(),
             value.as_ptr(),
-            RRF_RT_REG_SZ,
+            flags,
             ptr::null_mut(),
             ptr::null_mut(),
             &mut bytes,
@@ -764,7 +819,7 @@ pub fn registry_string(hive: Hive, key: &str, value: &str) -> Option<String> {
             hive.handle(),
             key.as_ptr(),
             value.as_ptr(),
-            RRF_RT_REG_SZ,
+            flags,
             ptr::null_mut(),
             buffer.as_mut_ptr().cast(),
             &mut bytes,
