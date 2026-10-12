@@ -787,6 +787,17 @@ pub fn machine_path() -> Option<String> {
     )
 }
 
+/// A machine-wide environment variable as stored, with its `%VARIABLES%` left as written.
+/// Services running as LocalSystem start with these. `None` when it isn't set.
+pub fn machine_variable(name: &str) -> Option<String> {
+    registry_text(
+        Hive::LocalMachine,
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        name,
+        RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+    )
+}
+
 /// A string value, or `None` when the key or the value is missing or not a string. An
 /// expandable string comes back expanded.
 pub fn registry_string(hive: Hive, key: &str, value: &str) -> Option<String> {

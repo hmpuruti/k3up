@@ -154,6 +154,22 @@ fn normalised(path: &Path) -> PathBuf {
 pub struct Inherited {
     pub path: Option<String>,
     pub variables: Vec<(String, String)>,
+    /// Reads any other machine-wide variable as stored, such as a custom `%TOOLS%`.
+    pub machine: Option<fn(&str) -> Option<String>>,
+}
+
+impl Inherited {
+    /// A variable as a LocalSystem process starts with it: a known folder, or else the
+    /// machine-wide value, expanded once with the known folders as Windows does.
+    fn value(&self, name: &str) -> Option<String> {
+        let known = |name: &str| {
+            self.variables
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        known(name).or_else(|| Some(expand(&(self.machine?)(name)?, known)))
+    }
 }
 
 impl Inherited {
@@ -161,15 +177,14 @@ impl Inherited {
     /// trusting the caller's environment.
     #[cfg(windows)]
     pub fn local_system() -> Self {
-        let variables = crate::win32::local_system_variables();
-        let lookup = |name: &str| {
-            variables
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.clone())
+        let mut inherited = Self {
+            path: None,
+            variables: crate::win32::local_system_variables(),
+            machine: Some(crate::win32::machine_variable),
         };
-        let path = crate::win32::machine_path().map(|path| expand(&path, lookup));
-        Self { path, variables }
+        inherited.path =
+            crate::win32::machine_path().map(|path| expand(&path, |name| inherited.value(name)));
+        inherited
     }
 }
 
@@ -361,24 +376,33 @@ fn variable(workload: &Workload, inherited: &Inherited, name: &str) -> Option<St
     workload
         .environment
         .iter()
-        .chain(inherited.variables.iter().map(|(key, value)| (key, value)))
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.clone())
+        .or_else(|| inherited.value(name))
 }
 
-/// The folders the process searches for a command given by bare name: the workload's own
-/// PATH when it sets one, otherwise `machine_path`, which LocalSystem inherits. Relative
-/// entries resolve against the working folder, as the search does.
-pub fn search_folders(workload: &Workload, machine_path: Option<String>) -> Vec<PathBuf> {
-    let own = workload
-        .environment
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
-        .map(|(_, value)| value.clone());
-    let folder = Path::new(&workload.working_directory);
-    own.or(machine_path)
+/// The variables an interpreter reads to find modules or libraries it loads by name, such as
+/// Python's `PYTHONPATH`. Their folders matter only when the workload runs that interpreter.
+fn module_variables(program: &str) -> &'static [&'static str] {
+    let stem = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
         .unwrap_or_default()
-        .split(';')
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "python" | "python3" | "pythonw" | "py" => &["PYTHONPATH"],
+        "node" => &["NODE_PATH"],
+        "perl" => &["PERL5LIB", "PERLLIB"],
+        "ruby" => &["RUBYLIB"],
+        "powershell" | "pwsh" => &["PSModulePath"],
+        _ => &[],
+    }
+}
+
+/// The folders in a `;`-separated list such as PATH, with relative entries resolved against
+/// the working folder.
+fn folders_in(list: &str, folder: &Path) -> Vec<PathBuf> {
+    list.split(';')
         .map(|entry| entry.trim().trim_matches('"'))
         .filter(|entry| !entry.is_empty())
         .filter_map(|entry| {
@@ -392,6 +416,21 @@ pub fn search_folders(workload: &Workload, machine_path: Option<String>) -> Vec<
             }
         })
         .collect()
+}
+
+/// The folders the process searches for a command given by bare name: the workload's own
+/// PATH when it sets one, otherwise `machine_path`, which LocalSystem inherits. Relative
+/// entries resolve against the working folder, as the search does.
+pub fn search_folders(workload: &Workload, machine_path: Option<String>) -> Vec<PathBuf> {
+    let own = workload
+        .environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone());
+    folders_in(
+        &own.or(machine_path).unwrap_or_default(),
+        Path::new(&workload.working_directory),
+    )
 }
 
 /// Every path the workload's process runs or may load code from, once each. Arguments are
@@ -459,10 +498,22 @@ pub fn inspected(
         path: workload.working_directory.clone().into(),
         what: Use::Folder,
     };
-    let searched = searched_folders.into_iter().map(|path| Exposure {
-        path,
-        what: Use::SearchPath,
-    });
+    let module_folders = module_variables(&workload.executable)
+        .iter()
+        .filter_map(|name| variable(workload, inherited, name))
+        .flat_map(|list| folders_in(&list, Path::new(&workload.working_directory)));
+    // A machine PATH entry may name a variable K3 Up couldn't expand; its folder is unknown.
+    let searched = searched_folders
+        .into_iter()
+        .chain(module_folders)
+        .map(|path| Exposure {
+            what: if unresolved(&path.to_string_lossy()) {
+                Use::Unresolved
+            } else {
+                Use::SearchPath
+            },
+            path,
+        });
     let mut found: Vec<Exposure> = vec![];
     for candidate in std::iter::once(program)
         .chain(program_folder)
@@ -749,6 +800,7 @@ mod tests {
         let inherited = Inherited {
             path: None,
             variables: vec![("PUBLIC".into(), text(&public))],
+            machine: None,
         };
         let arguments = |workload: &Workload| -> Vec<PathBuf> {
             inspected(workload, |_| false, &inherited)
@@ -858,6 +910,7 @@ mod tests {
         let inherited = Inherited {
             path: Some(text(&bin)),
             variables: vec![],
+            machine: None,
         };
         let found = commands_found(
             &workload,
@@ -900,6 +953,57 @@ mod tests {
     }
 
     #[test]
+    fn machine_variables_and_module_paths_are_followed() {
+        // The registry finds values whatever the case of their names.
+        fn machine(name: &str) -> Option<String> {
+            match name.to_ascii_uppercase().as_str() {
+                "TOOLS" => Some("%ROOT%\\tools".into()),
+                "PYTHONPATH" => Some("%ROOT%\\site".into()),
+                _ => None,
+            }
+        }
+        let root = text(&absolute("root"));
+        let inherited = Inherited {
+            path: None,
+            variables: vec![("ROOT".into(), root.clone())],
+            machine: Some(machine),
+        };
+        assert_eq!(inherited.value("tools"), Some(format!("{root}\\tools")));
+        assert_eq!(inherited.value("MISSING"), None);
+
+        let python = Workload {
+            name: "py".into(),
+            executable: text(&absolute("python.exe")),
+            working_directory: text(&absolute("work")),
+            args: vec!["-m".into(), "helper".into()],
+            ..Default::default()
+        };
+        let searched: Vec<_> = inspected(&python, |_| false, &inherited)
+            .into_iter()
+            .filter(|exposure| exposure.what == Use::SearchPath)
+            .map(|exposure| exposure.path)
+            .collect();
+        assert!(
+            searched.contains(&PathBuf::from(format!("{root}\\site"))),
+            "{searched:?}"
+        );
+
+        let mut tool = python.clone();
+        tool.executable = text(&absolute("tool.exe"));
+        let unknown = Inherited {
+            path: Some("%NOT_SET%\\bin".into()),
+            ..inherited.clone()
+        };
+        let found = inspected(&tool, |_| false, &unknown);
+        assert!(
+            found
+                .iter()
+                .any(|exposure| exposure.what == Use::Unresolved)
+        );
+        assert!(!found.iter().any(|exposure| exposure.path.ends_with("site")));
+    }
+
+    #[test]
     fn a_definition_the_caller_cannot_read_has_nothing_to_inspect() {
         let hidden = Workload {
             name: "web".into(),
@@ -913,6 +1017,7 @@ mod tests {
                 &Inherited {
                     path: Some(std::env::temp_dir().display().to_string()),
                     variables: vec![],
+                    machine: None,
                 },
             )
             .is_empty()
