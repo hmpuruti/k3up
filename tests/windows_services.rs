@@ -223,20 +223,20 @@ impl Machine {
         })
     }
 
-    fn cli_output(&self, arguments: &[&str]) -> std::process::Output {
-        std::process::Command::new(CLI)
+    fn cli_command(&self, arguments: &[&str]) -> std::process::Command {
+        let mut command = std::process::Command::new(CLI);
+        command
             .arg("--data-dir")
             .arg(&self.data)
             .arg("--json")
             .args(arguments)
             .env("K3UP_SERVICE_PREFIX", &self.prefix)
-            .env("K3UP_HOST", HOST)
-            .output()
-            .unwrap()
+            .env("K3UP_HOST", HOST);
+        command
     }
 
     fn cli(&self, arguments: &[&str]) -> (bool, String) {
-        let output = self.cli_output(arguments);
+        let output = self.cli_command(arguments).output().unwrap();
         (
             output.status.success(),
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -689,21 +689,24 @@ fn a_start_that_fails_after_the_create_still_warns() {
     let program = open_folder(&machine).join("cmd.exe");
     std::fs::copy(system_cmd(), &program).unwrap();
     let data = machine.data.to_string_lossy().into_owned();
-    let output = machine.cli_output(&[
-        "create",
-        "failing",
-        "--exe",
-        &program.to_string_lossy(),
-        "--cwd",
-        &data,
-        "--never-restart",
-        "--start",
-        "--wait",
-        "--",
-        "/c",
-        "exit",
-        "1",
-    ]);
+    // The service is created for a host that isn't there, so the start always fails.
+    let output = machine
+        .cli_command(&[
+            "create",
+            "failing",
+            "--exe",
+            &program.to_string_lossy(),
+            "--cwd",
+            &data,
+            "--start",
+            "--",
+            "/c",
+            "exit",
+            "0",
+        ])
+        .env("K3UP_HOST", machine.data.join("missing-host.exe"))
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     let response: Response = serde_json::from_str(&stdout).unwrap();
