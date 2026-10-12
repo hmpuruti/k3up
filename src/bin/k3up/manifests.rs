@@ -30,9 +30,7 @@ pub fn validate(file: &Path) -> Result<Response> {
 
 pub fn apply(client: &Client, file: &Path, dry_run: bool) -> Result<Response> {
     let manifest = read(file)?;
-    let workloads = manifest.workloads.clone();
-    let response = client.send(Command::Apply { manifest, dry_run })?;
-    Ok(crate::workloads::warn_exposed(client, &workloads, response))
+    client.send(Command::Apply { manifest, dry_run })
 }
 
 pub fn export(client: &Client, output: Option<PathBuf>, folder: Option<&str>) -> Result<Response> {

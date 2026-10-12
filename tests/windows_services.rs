@@ -281,7 +281,7 @@ fn a_service_runs_with_a_process_and_writes_its_log() {
     };
     let created = machine.put(machine.workload("pulse", "pulse"));
     assert!(created.ok, "{}", created.message);
-    assert_eq!(created.message, "Create pulse");
+    assert_eq!(first_line(&created.message), "Create pulse");
     assert!(machine.sc("query", "pulse").contains("STOPPED"));
 
     let started = machine.ok(Command::Start {
@@ -642,6 +642,12 @@ fn open_folder(machine: &Machine) -> PathBuf {
     std::fs::create_dir(&open).unwrap();
     icacls(&open, &["/grant", "*S-1-5-32-545:(OI)(CI)M"]);
     open
+}
+
+/// What a save did, without the warnings it may list after it: the runner's own folders,
+/// where the test program lives, may let users change them.
+fn first_line(message: &str) -> &str {
+    message.lines().next().unwrap_or_default()
 }
 
 fn warnings(message: &str) -> Vec<&str> {
@@ -1012,7 +1018,7 @@ fn the_host_runs_only_definitions_k3up_signed() {
 
     // Applying the same definition again signs it again.
     let applied = machine.put(machine.workload("signed", "pulse"));
-    assert_eq!(applied.message, "Update signed");
+    assert_eq!(first_line(&applied.message), "Update signed");
     machine.ok(Command::Start {
         name: "signed".into(),
     });
@@ -2160,7 +2166,7 @@ fn a_new_service_that_fails_to_start_is_still_applied() {
     let status = machine.get("boothost");
     assert_eq!(status.state, State::Failed, "{status:?}");
     assert!(status.reason.starts_with("Failed to start: "), "{status:?}");
-    assert_eq!(apply().message, "No changes");
+    assert_eq!(first_line(&apply().message), "No changes");
 }
 
 #[test]
@@ -2374,7 +2380,7 @@ fn names_that_differ_only_in_case_change_nothing() {
         workload: Box::new(renamed),
         create_only: true,
     });
-    assert_eq!(created.message, expected);
+    assert_eq!(first_line(&created.message), expected);
     assert_eq!(machine.sc("qc", "web"), config);
     assert_eq!(std::fs::read(workloads.join("web.toml")).unwrap(), saved);
     assert_eq!(files::names(&workloads, "toml").unwrap(), ["web"]);
@@ -2382,7 +2388,7 @@ fn names_that_differ_only_in_case_change_nothing() {
     let mut web = machine.workload("web", "pulse");
     web.description = "Front".into();
     let updated = machine.put(web);
-    assert_eq!(updated.message, "Update web");
+    assert_eq!(first_line(&updated.message), "Update web");
 }
 
 #[test]

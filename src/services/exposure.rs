@@ -293,6 +293,35 @@ fn is_code(path: &Path) -> bool {
         .is_some_and(|extension| CODE.contains(&extension.to_ascii_lowercase().as_str()))
 }
 
+/// The positions of arguments PowerShell decodes before running them, given after
+/// `-EncodedCommand`, `-EncodedArguments` or any abbreviation PowerShell accepts. Their
+/// content can't be read as paths.
+fn encoded_payloads(program: &str, args: &[String]) -> Vec<usize> {
+    let powershell = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            stem.eq_ignore_ascii_case("powershell") || stem.eq_ignore_ascii_case("pwsh")
+        });
+    if !powershell {
+        return vec![];
+    }
+    args.iter()
+        .enumerate()
+        .filter(|(_, arg)| {
+            let switch = arg.trim_start_matches(['-', '/']).to_ascii_lowercase();
+            arg.starts_with(['-', '/'])
+                && !switch.is_empty()
+                && (switch == "ec"
+                    || switch == "ea"
+                    || "encodedcommand".starts_with(&switch)
+                    || (switch.len() >= 8 && "encodedarguments".starts_with(&switch)))
+        })
+        .map(|(index, _)| index + 1)
+        .filter(|index| *index < args.len())
+        .collect()
+}
+
 fn runs_commands(program: &str) -> bool {
     Path::new(program)
         .file_stem()
@@ -390,9 +419,14 @@ pub fn inspected(
         .map(|arg| expand(arg, |name| variable(workload, inherited, name)))
         .collect();
     let interpreter = runs_commands(&workload.executable);
+    let encoded = encoded_payloads(&workload.executable, &args);
     let unresolved_args = args
         .iter()
-        .filter(|arg| unresolved(arg) || (interpreter && is_command(arg)))
+        .enumerate()
+        .filter(|(index, arg)| {
+            unresolved(arg) || (interpreter && is_command(arg)) || encoded.contains(index)
+        })
+        .map(|(_, arg)| arg)
         .map(|arg| Exposure {
             path: arg.into(),
             what: Use::Unresolved,
@@ -839,6 +873,30 @@ mod tests {
             .map(|exposure| exposure.path)
             .collect();
         assert_eq!(folders, [work, bin]);
+    }
+
+    #[test]
+    fn encoded_powershell_commands_are_always_reported() {
+        let payload = "SQBuAHYAbwBrAGUA".to_string();
+        let args = |switch: &str| vec!["-NoProfile".to_string(), switch.into(), payload.clone()];
+        for switch in [
+            "-EncodedCommand",
+            "-enc",
+            "-e",
+            "-EC",
+            "/encodedcommand",
+            "-EncodedArguments",
+        ] {
+            assert_eq!(encoded_payloads("pwsh.exe", &args(switch)), [2], "{switch}");
+        }
+        for switch in ["-ExecutionPolicy", "-File", "-enco_x"] {
+            assert!(
+                encoded_payloads("powershell.exe", &args(switch)).is_empty(),
+                "{switch}"
+            );
+        }
+        assert!(encoded_payloads("tool.exe", &args("-enc")).is_empty());
+        assert!(encoded_payloads("powershell.exe", &["-enc".into()]).is_empty());
     }
 
     #[test]

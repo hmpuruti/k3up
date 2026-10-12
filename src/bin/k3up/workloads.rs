@@ -43,16 +43,32 @@ pub fn create(client: &Client, request: Create) -> Result<Response> {
         workload: Box::new(workload.clone()),
         create_only: true,
     })?;
-    if !response.ok {
+    if !response.ok || !request.start {
         return Ok(response);
     }
-    let warnings = exposure_warnings(client, &[workload]);
-    let outcome = if request.start {
-        start(client, &request.name, request.wait, request.timeout)
-    } else {
-        Ok(response)
-    };
-    with_warnings(outcome, &warnings)
+    // The save listed its warnings; they follow the start's outcome, even a failed one.
+    let warnings = warning_lines_in(&response.message);
+    with_warnings(
+        start(client, &request.name, request.wait, request.timeout),
+        &warnings,
+    )
+}
+
+/// The warning lines a save added to its message.
+fn warning_lines_in(message: &str) -> Vec<String> {
+    message
+        .lines()
+        .filter(|line| line.starts_with("Warning: "))
+        .map(String::from)
+        .collect()
+}
+
+fn without_warnings(message: &str) -> String {
+    message
+        .lines()
+        .filter(|line| !line.starts_with("Warning: "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// In services mode, a warning line for each path of `workloads` that users who aren't
@@ -168,8 +184,7 @@ fn save_edit(
     // Labels apply to a running workload at once, unless a restart was asked for anyway.
     let relabel = current.workload.only_labels_differ(&workload);
     if !live || (relabel && !restart_running) {
-        let saved = put(client, workload.clone())?;
-        return Ok(warn_exposed(client, &[workload], saved));
+        return put(client, workload);
     }
     if !restart_running {
         bail!(
@@ -178,15 +193,15 @@ fn save_edit(
         );
     }
     checked(client.send(Command::Stop { name: name.clone() })?)?;
-    let saved = put(client, workload.clone());
+    let saved = put(client, workload);
     let started = client.send(Command::Start { name: name.clone() });
     let saved = saved?;
     if !saved.ok {
         return Ok(saved);
     }
-    let warnings = exposure_warnings(client, &[workload]);
+    let warnings = warning_lines_in(&saved.message);
     let restarted = started.and_then(checked).map(|started| Response {
-        message: format!("{}\nStarted {name} again", saved.message),
+        message: format!("{}\nStarted {name} again", without_warnings(&saved.message)),
         ..started
     });
     with_warnings(restarted, &warnings)

@@ -81,8 +81,35 @@ impl Backend {
         &self.settings
     }
 
+    /// A save that succeeds also lists the paths of the saved workloads that users who aren't
+    /// administrators may change, whichever client asked, since the workloads run as SYSTEM.
     pub fn handle(&self, command: Command) -> Result<Response> {
-        self.execute(command).map_err(explain_denied)
+        let saved: Vec<Workload> = match &command {
+            Command::Put { workload, .. } => vec![(**workload).clone()],
+            Command::Apply { manifest, .. } => manifest.workloads.clone(),
+            _ => vec![],
+        };
+        let response = self.execute(command).map_err(explain_denied)?;
+        let warnings: Vec<String> = if response.ok {
+            saved
+                .iter()
+                .flat_map(|workload| {
+                    super::exposure::warning_lines(
+                        workload,
+                        &super::exposure::exposed_paths(workload),
+                    )
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        if warnings.is_empty() {
+            return Ok(response);
+        }
+        Ok(Response {
+            message: format!("{}\n{}", response.message, warnings.join("\n")),
+            ..response
+        })
     }
 
     fn execute(&self, command: Command) -> Result<Response> {
