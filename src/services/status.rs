@@ -353,7 +353,29 @@ pub fn ensure_supported(workload: &Workload) -> Result<()> {
     if workload.readiness_tcp.is_some() {
         bail!("TCP readiness checks are not supported for Windows services yet");
     }
+    if let Some((first, second)) = case_clash(workload.environment.keys()) {
+        bail!(
+            "The environment of {} sets both {first} and {second}; Windows treats names that differ only in case as the same variable",
+            workload.name
+        );
+    }
     Ok(())
+}
+
+/// Two names that are the same variable on Windows, where only one of them would reach the
+/// process.
+fn case_clash<'a>(names: impl Iterator<Item = &'a String>) -> Option<(&'a str, &'a str)> {
+    let mut seen: Vec<&str> = vec![];
+    for name in names {
+        if let Some(earlier) = seen
+            .iter()
+            .find(|earlier| earlier.eq_ignore_ascii_case(name))
+        {
+            return Some((earlier, name));
+        }
+        seen.push(name);
+    }
+    None
 }
 
 /// `alive` tells whether a host process still runs.
@@ -780,6 +802,23 @@ mod tests {
                 .to_string(),
             r"The service for web runs as .\someone, set outside K3 Up. K3 Up can't restore that account if this change fails. Change it back to LocalSystem in services.msc, or remove and re-create the workload"
         );
+    }
+
+    #[test]
+    fn environment_names_that_differ_only_in_case_are_refused() {
+        let mut workload = web();
+        workload
+            .environment
+            .insert("PATH".into(), r"C:\Windows\System32".into());
+        workload
+            .environment
+            .insert("TEMP".into(), r"C:\Temp".into());
+        assert!(ensure_supported(&workload).is_ok());
+        workload
+            .environment
+            .insert("Path".into(), r"C:\Users\Public".into());
+        let error = ensure_supported(&workload).unwrap_err().to_string();
+        assert!(error.contains("PATH") && error.contains("Path"), "{error}");
     }
 
     #[test]
