@@ -203,6 +203,39 @@ fn expand_between(text: &str, mark: char, lookup: &impl Fn(&str) -> Option<Strin
     expanded
 }
 
+/// Programs that run commands or code given as an argument. Their command strings follow
+/// parsing rules K3 Up can't fully reproduce, so such strings are always warned about.
+const INTERPRETERS: [&str; 14] = [
+    "bash",
+    "cmd",
+    "cscript",
+    "node",
+    "perl",
+    "php",
+    "powershell",
+    "pwsh",
+    "py",
+    "python",
+    "python3",
+    "ruby",
+    "sh",
+    "wscript",
+];
+
+fn runs_commands(program: &str) -> bool {
+    Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| INTERPRETERS.contains(&stem.to_ascii_lowercase().as_str()))
+}
+
+/// An argument that holds a command rather than a single word: it has spaces or shell
+/// symbols. Separate arguments such as `-File C:\x.ps1` are words, not commands.
+fn is_command(arg: &str) -> bool {
+    arg.chars()
+        .any(|c| c.is_whitespace() || "&|<>^();`$".contains(c))
+}
+
 /// Whether `text` still refers to a variable once expanded: an unknown `%NAME%` or `!NAME!`, a
 /// cmd modifier such as `%NAME:~0,3%`, or PowerShell's `$env:NAME`. Its path can't be known
 /// until the process runs.
@@ -285,9 +318,10 @@ pub fn inspected(
         .iter()
         .map(|arg| expand(arg, |name| variable(workload, inherited, name)))
         .collect();
+    let interpreter = runs_commands(&workload.executable);
     let unresolved_args = args
         .iter()
-        .filter(|arg| unresolved(arg))
+        .filter(|arg| unresolved(arg) || (interpreter && is_command(arg)))
         .map(|arg| Exposure {
             path: arg.into(),
             what: Use::Unresolved,
@@ -644,6 +678,41 @@ mod tests {
             warning_lines(&workload, &[unresolved[0].clone()]),
             [unresolved_line("web", Path::new("!MISSING!\\job.cmd"))]
         );
+    }
+
+    #[test]
+    fn command_strings_given_to_interpreters_are_always_reported() {
+        let workload = |program: &str, args: &[&str]| Workload {
+            name: "web".into(),
+            executable: text(&absolute(program)),
+            working_directory: text(&absolute("work")),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            ..Default::default()
+        };
+        let unresolved = |workload: &Workload| -> Vec<PathBuf> {
+            inspected(workload, |_| false, &Inherited::default())
+                .into_iter()
+                .filter(|exposure| exposure.what == Use::Unresolved)
+                .map(|exposure| exposure.path)
+                .collect()
+        };
+        assert_eq!(
+            unresolved(&workload("cmd.exe", &["/c", "call job.cmd ^& next"])),
+            [PathBuf::from("call job.cmd ^& next")]
+        );
+        assert_eq!(
+            unresolved(&workload("PowerShell.EXE", &["-Command", "& $script"])),
+            [PathBuf::from("& $script")]
+        );
+        let words = [
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "job.ps1",
+        ];
+        assert!(unresolved(&workload("powershell.exe", &words)).is_empty());
+        assert!(unresolved(&workload("tool.exe", &["a b"])).is_empty());
     }
 
     #[test]
