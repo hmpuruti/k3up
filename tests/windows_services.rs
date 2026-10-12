@@ -66,6 +66,10 @@ struct Machine {
     data: PathBuf,
     prefix: String,
     backend: Backend,
+    /// This test program, copied where only administrators can change it, as a real program
+    /// would be installed. The runner's build folder lets users change it, which every save
+    /// would warn about.
+    fixture: PathBuf,
 }
 
 impl Machine {
@@ -80,6 +84,11 @@ impl Machine {
         }
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let dir = protected_temp_dir();
+        let bin = dir.path().join("bin");
+        k3up::win32::create_dir_with(&bin, k3up::win32::PRIVATE_DIR_SDDL).unwrap();
+        let fixture = bin.join("fixture.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &fixture).unwrap();
+        k3up::win32::set_owner_to_administrators(&fixture).unwrap();
         let data = dir.path().join("data");
         setup::prepare(&data).unwrap();
         let prefix = format!(
@@ -100,6 +109,7 @@ impl Machine {
             data,
             prefix,
             backend,
+            fixture,
         })
     }
 
@@ -124,7 +134,7 @@ impl Machine {
     fn workload(&self, name: &str, mode: &str) -> Workload {
         Workload {
             name: name.into(),
-            executable: std::env::current_exe().unwrap().to_string_lossy().into(),
+            executable: self.fixture.to_string_lossy().into(),
             working_directory: self.data.to_string_lossy().into(),
             args: ["--exact", "fixture", "--ignored", "--nocapture"]
                 .map(String::from)
@@ -556,7 +566,7 @@ fn the_command_line_talks_to_services_in_process() {
     let Some(machine) = Machine::start() else {
         return;
     };
-    let exe = std::env::current_exe().unwrap();
+    let exe = machine.fixture.clone();
     let data = machine.data.to_string_lossy().into_owned();
     machine.cli_response(&[
         "create",
