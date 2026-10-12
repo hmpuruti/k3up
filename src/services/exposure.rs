@@ -31,22 +31,64 @@ pub fn path_arguments(
     exists: impl Fn(&Path) -> bool,
 ) -> Vec<PathBuf> {
     args.iter()
-        .filter_map(|arg| {
-            let value = arg.split_once('=').map(|(_, value)| value);
-            let candidates: Vec<(PathBuf, bool)> = [Some(arg.as_str()), value]
-                .into_iter()
-                .flatten()
-                .filter_map(|text| {
-                    Some((resolved(Path::new(text), folder)?, looks_like_path(text)))
-                })
-                .collect();
-            candidates
+        .flat_map(|arg| {
+            let whole = path_in(arg, folder, &exists);
+            if whole.as_ref().is_some_and(|path| exists(path)) {
+                return whole.into_iter().collect();
+            }
+            // A command string such as `/c "call ..\job.cmd && next.cmd"` holds several
+            // commands, which a shell runs one word at a time.
+            let words = words(arg);
+            if words.len() < 2 {
+                return whole.into_iter().collect();
+            }
+            words
                 .iter()
-                .find(|(path, _)| exists(path))
-                .or_else(|| candidates.iter().find(|(_, path_like)| *path_like))
-                .map(|(path, _)| path.clone())
+                .filter_map(|word| path_in(word, folder, &exists))
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// The path `text` names, whole or after `=`: one that exists, or else one that clearly
+/// looks like a path.
+fn path_in(text: &str, folder: &Path, exists: &impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let value = text.split_once('=').map(|(_, value)| value);
+    let candidates: Vec<(PathBuf, bool)> = [Some(text), value]
+        .into_iter()
+        .flatten()
+        .filter_map(|text| Some((resolved(Path::new(text), folder)?, looks_like_path(text))))
+        .collect();
+    candidates
+        .iter()
+        .find(|(path, _)| exists(path))
+        .or_else(|| candidates.iter().find(|(_, path_like)| *path_like))
+        .map(|(path, _)| path.clone())
+}
+
+/// Splits a command string into words as a shell would: at spaces and at the command
+/// separators `& | < > ( )`, keeping quoted text together and dropping the quotes.
+fn words(text: &str) -> Vec<String> {
+    let mut words = vec![];
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    for c in text.chars() {
+        match (quote, c) {
+            (Some(open), _) if c == open => quote = None,
+            (Some(_), _) => word.push(c),
+            (None, '"' | '\'') => quote = Some(c),
+            (None, c) if c.is_whitespace() || "&|<>()".contains(c) => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            (None, c) => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
 }
 
 /// Extensions of files that run or load code.
@@ -362,6 +404,29 @@ mod tests {
             ]
         );
         assert!(path_arguments(&["job.ps1".into()], Path::new("work"), |_| true).is_empty());
+    }
+
+    #[test]
+    fn command_strings_are_split_into_the_words_a_shell_runs() {
+        let separator = std::path::MAIN_SEPARATOR;
+        let root = absolute("k3up-words");
+        let folder = root.join("cwd").join("work");
+        let script = root.join("open").join("job.cmd");
+        let second = folder.join("next.cmd");
+        let spaced = root.join("Program Files").join("app.toml");
+        let existing = [script.clone(), second.clone(), spaced.clone()];
+        let exists = |path: &Path| existing.iter().any(|known| known == path);
+        let call = format!("call ..{separator}..{separator}open{separator}job.cmd && next.cmd");
+        assert_eq!(
+            path_arguments(&["-c".into(), call], &folder, exists),
+            [script, second]
+        );
+        // A path with a space that exists as written is taken whole, not split.
+        assert_eq!(path_arguments(&[text(&spaced)], &folder, exists), [spaced]);
+        assert_eq!(
+            words(r#"call "C:\a b\x.cmd" & 'y.ps1'|z>out.txt"#),
+            ["call", r"C:\a b\x.cmd", "y.ps1", "z", "out.txt"]
+        );
     }
 
     #[test]

@@ -884,6 +884,9 @@ fn only_scripts_users_may_change_are_warned_about() {
         warnings(&relative),
         [exposure::warning_line("relative", &open)]
     );
+    // The whole command string is one argument; cmd runs the script inside it.
+    let called = create("called", Path::new(r"call ..\open\job.cmd"));
+    assert_eq!(warnings(&called), [exposure::warning_line("called", &open)]);
 
     let option = Workload {
         name: "option".into(),
