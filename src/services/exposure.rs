@@ -390,11 +390,27 @@ fn module_variables(program: &str) -> &'static [&'static str] {
         .unwrap_or_default()
         .to_ascii_lowercase();
     match stem.as_str() {
-        "python" | "python3" | "pythonw" | "py" => &["PYTHONPATH"],
+        "python" | "python3" | "pythonw" | "py" => &["PYTHONPATH", "PYTHONHOME"],
         "node" => &["NODE_PATH"],
         "perl" => &["PERL5LIB", "PERLLIB"],
         "ruby" => &["RUBYLIB"],
         "powershell" | "pwsh" => &["PSModulePath"],
+        _ => &[],
+    }
+}
+
+/// Variables holding command-line options an interpreter reads before the program, some of
+/// which load code, such as Node's `--require`. They can load code in ways K3 Up can't follow.
+fn option_variables(program: &str) -> &'static [&'static str] {
+    let stem = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "node" => &["NODE_OPTIONS"],
+        "perl" => &["PERL5OPT"],
+        "ruby" => &["RUBYOPT"],
         _ => &[],
     }
 }
@@ -498,6 +514,25 @@ pub fn inspected(
         path: workload.working_directory.clone().into(),
         what: Use::Folder,
     };
+    let options: Vec<(String, String)> = option_variables(&workload.executable)
+        .iter()
+        .filter_map(|name| Some((name.to_string(), variable(workload, inherited, name)?)))
+        .filter(|(_, value)| !value.trim().is_empty())
+        .collect();
+    // Paths an option names are checked, and the option itself is always reported.
+    let option_paths: Vec<Exposure> = options
+        .iter()
+        .flat_map(|(_, value)| words(value))
+        .filter_map(|word| path_in(&word, Path::new(&workload.working_directory), &exists))
+        .map(|path| Exposure {
+            path,
+            what: Use::Argument,
+        })
+        .chain(options.iter().map(|(name, value)| Exposure {
+            path: format!("{name}={value}").into(),
+            what: Use::Unresolved,
+        }))
+        .collect();
     let module_folders = module_variables(&workload.executable)
         .iter()
         .filter_map(|name| variable(workload, inherited, name))
@@ -519,6 +554,7 @@ pub fn inspected(
         .chain(program_folder)
         .chain(arguments)
         .chain(script_folders)
+        .chain(option_paths)
         .chain(unresolved_args)
         .chain(std::iter::once(folder))
         .chain(searched)
@@ -1001,6 +1037,40 @@ mod tests {
                 .any(|exposure| exposure.what == Use::Unresolved)
         );
         assert!(!found.iter().any(|exposure| exposure.path.ends_with("site")));
+    }
+
+    #[test]
+    fn interpreter_option_variables_are_always_reported() {
+        let preload = absolute("preload.js");
+        let mut node = Workload {
+            name: "web".into(),
+            executable: text(&absolute("node.exe")),
+            working_directory: text(&absolute("work")),
+            ..Default::default()
+        };
+        assert!(
+            !inspected(&node, |_| false, &Inherited::default())
+                .iter()
+                .any(|exposure| exposure.what == Use::Unresolved)
+        );
+        let option = format!("--require={}", text(&preload));
+        node.environment
+            .insert("NODE_OPTIONS".into(), option.clone());
+        let found = inspected(&node, |path| path == preload, &Inherited::default());
+        assert!(found.contains(&Exposure {
+            path: preload.clone(),
+            what: Use::Argument,
+        }));
+        assert!(found.contains(&Exposure {
+            path: format!("NODE_OPTIONS={option}").into(),
+            what: Use::Unresolved,
+        }));
+        node.executable = text(&absolute("tool.exe"));
+        assert!(
+            !inspected(&node, |_| false, &Inherited::default())
+                .iter()
+                .any(|exposure| exposure.what == Use::Unresolved)
+        );
     }
 
     #[test]
