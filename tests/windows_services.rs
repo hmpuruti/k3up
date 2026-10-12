@@ -698,6 +698,18 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
         .to_string_lossy()
         .into();
     assert!(exposure::exposed_paths(&workload).is_empty());
+
+    // A link in a protected folder that leads to a missing folder users can create.
+    let link = machine.data.join("later-link");
+    std::os::windows::fs::symlink_dir(open_folder(&machine).join("gone"), &link).unwrap();
+    let through_link = link.join("tool.exe");
+    workload.executable = through_link.to_string_lossy().into();
+    let exposed: Vec<PathBuf> = exposure::exposed_paths(&workload)
+        .into_iter()
+        .map(|exposure| exposure.path)
+        .collect();
+    assert_eq!(exposed, [through_link]);
+    std::fs::remove_dir(&link).unwrap();
 }
 
 #[test]

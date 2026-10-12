@@ -434,6 +434,11 @@ pub fn writable_by_others(path: &Path) -> Result<bool> {
 /// it. `None` when the permissions of that path cannot be read. A folder whose permissions
 /// cannot be read counts as unchanged, so the answer never rests on a guess.
 pub fn changeable_by_others(path: &Path) -> Option<bool> {
+    changeable_within(path, 8)
+}
+
+/// `hops` bounds how many links are followed, so a loop of links ends.
+fn changeable_within(path: &Path, hops: u8) -> Option<bool> {
     let read = |path: &Path| {
         Pinned::open(path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL)
             .ok()?
@@ -443,6 +448,23 @@ pub fn changeable_by_others(path: &Path) -> Option<bool> {
     let existing = path
         .ancestors()
         .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())?;
+    // A link, even one whose target is missing, is also judged by where it leads: that is
+    // where the program would be created.
+    if is_reparse_point(existing).unwrap_or(false) {
+        if hops == 0 {
+            return Some(true);
+        }
+        let Ok(target) = std::fs::read_link(existing) else {
+            return Some(true);
+        };
+        let target = existing
+            .parent()
+            .map_or(target.clone(), |parent| parent.join(&target));
+        let rest = path.strip_prefix(existing).unwrap_or(Path::new(""));
+        if changeable_within(&target.join(rest), hops - 1) == Some(true) {
+            return Some(true);
+        }
+    }
     if !read(existing)?.protected() {
         return Some(true);
     }
