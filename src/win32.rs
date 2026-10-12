@@ -15,17 +15,21 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
-        ERROR_SUCCESS, HANDLE, LocalFree, STILL_ACTIVE, WAIT_ABANDONED, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        ERROR_SHARING_VIOLATION, ERROR_SUCCESS, HANDLE, LocalFree, STILL_ACTIVE, WAIT_ABANDONED,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
         Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
-            GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
+            GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT, SE_REGISTRY_KEY, SetSecurityInfo,
         },
-        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetTokenInformation,
-        INHERIT_ONLY_ACE, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+        Cryptography::{
+            BCRYPT_HMAC_SHA256_ALG_HANDLE, BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+            BCryptHash,
+        },
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorDacl,
+        GetTokenInformation, INHERIT_ONLY_ACE, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
         TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
         UNPROTECTED_DACL_SECURITY_INFORMATION, WinBuiltinAdministratorsSid, WinCreatorOwnerSid,
@@ -39,8 +43,9 @@ use windows_sys::Win32::{
     System::{
         Com::CoTaskMemFree,
         Registry::{
-            HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW,
-            RegGetValueW, RegSetKeyValueW,
+            HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_BINARY,
+            REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ, RegCloseKey,
+            RegCreateKeyExW, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, RegSetValueExW,
         },
         Threading::{
             CreateMutexW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
@@ -295,13 +300,15 @@ fn check_resettable(pinned: &Pinned) -> Result<()> {
 /// Each entry is opened by name without following a link, and then must resolve to a path
 /// directly inside its folder's own resolved path, so a folder swapped for a link after it
 /// was listed is caught. Every handle denies deletion and renaming until the reset is done,
-/// which also keeps the folders above it in place.
-pub fn reset_contents(dir: &Path) -> Result<()> {
+/// which also keeps the folders above it in place. Files are opened without sharing, so a
+/// program that already has one open, perhaps to write to it later, makes the reset fail
+/// instead. `held` are files this process holds open itself, such as the changes lock.
+pub fn reset_contents(dir: &Path, held: &[PathBuf]) -> Result<()> {
     let folder = Pinned::open(dir, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_NO_DELETE)
         .with_context(|| format!("Open {}", dir.display()))?;
     let mut entries = vec![];
     let mut refused = vec![];
-    collect_entries(&folder, &mut entries, &mut refused)?;
+    collect_entries(&folder, held, &mut entries, &mut refused)?;
     if !refused.is_empty() {
         bail!(
             "Remove these from {} and try again:\n{}",
@@ -328,6 +335,7 @@ const INHERIT_ONLY_SDDL: &str = "O:BAD:";
 /// not followed.
 fn collect_entries(
     folder: &Pinned,
+    held: &[PathBuf],
     entries: &mut Vec<Pinned>,
     refused: &mut Vec<String>,
 ) -> Result<()> {
@@ -335,15 +343,30 @@ fn collect_entries(
     let listing = std::fs::read_dir(folder.path())
         .with_context(|| format!("Read {}", folder.path().display()))?;
     for entry in listing {
-        let path = entry
-            .with_context(|| format!("Read {}", folder.path().display()))?
-            .path();
-        let pinned = Pinned::open(
+        let entry = entry.with_context(|| format!("Read {}", folder.path().display()))?;
+        let path = entry.path();
+        // Listing a folder opens it for reading, so folders share reads.
+        let share = if held.contains(&path) {
+            SHARE_NO_DELETE
+        } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            FILE_SHARE_READ
+        } else {
+            0
+        };
+        let pinned = match Pinned::open(
             &path,
             READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
-            SHARE_NO_DELETE,
-        )
-        .with_context(|| format!("Open {}", path.display()))?;
+            share,
+        ) {
+            Ok(pinned) => pinned,
+            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => {
+                bail!(
+                    "{} is open in another program; close it and try again",
+                    path.display()
+                );
+            }
+            Err(error) => return Err(error).with_context(|| format!("Open {}", path.display())),
+        };
         if pinned.final_path()?.parent() != Some(resolved.as_path()) {
             refused.push(format!("  {} moved while it was checked", path.display()));
             continue;
@@ -357,7 +380,7 @@ fn collect_entries(
         if descend {
             let index = entries.len() - 1;
             let mut inside = vec![];
-            collect_entries(&entries[index], &mut inside, refused)?;
+            collect_entries(&entries[index], held, &mut inside, refused)?;
             entries.extend(inside);
         }
     }
@@ -735,6 +758,189 @@ pub fn delete_registry_value(hive: Hive, key: &str, value: &str) -> Result<()> {
         return Err(std::io::Error::from_raw_os_error(status as i32).into());
     }
     Ok(())
+}
+
+/// A binary value, or `None` when the key or the value is missing, unreadable or not binary.
+pub fn registry_binary(hive: Hive, key: &str, value: &str) -> Option<Vec<u8>> {
+    let key = wide(key.as_ref());
+    let value = wide(value.as_ref());
+    let mut bytes = 0u32;
+    // SAFETY: NUL-terminated names; a null buffer asks only for the size.
+    let status = unsafe {
+        RegGetValueW(
+            hive.handle(),
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let mut buffer = vec![0u8; bytes as usize];
+    // SAFETY: the buffer is `bytes` long, as reported by the first call.
+    let status = unsafe {
+        RegGetValueW(
+            hive.handle(),
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    buffer.truncate(bytes as usize);
+    Some(buffer)
+}
+
+/// Opens `key` under HKEY_LOCAL_MACHINE, creating it if needed, gives it the DACL in `sddl`
+/// with inheritance blocked, and returns the binary `value`, writing `create()` there first
+/// when it is missing or not `length` bytes long.
+pub fn protected_registry_binary(
+    key: &str,
+    sddl: &str,
+    value: &str,
+    length: usize,
+    create: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let mut attributes = SecurityAttributes::from_sddl(sddl)?;
+    let name = wide(key.as_ref());
+    let mut handle: HKEY = ptr::null_mut();
+    // SAFETY: the name and attributes outlive the call; the handle is closed below.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            name.as_ptr(),
+            0,
+            ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_ALL_ACCESS,
+            attributes.as_mut_ptr(),
+            &mut handle,
+            ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .with_context(|| format!(r"Create HKLM\{key}"));
+    }
+    let result = protect_key(handle, &attributes)
+        .with_context(|| format!(r"Protect HKLM\{key}"))
+        .and_then(|()| match registry_binary(Hive::LocalMachine, key, value) {
+            Some(found) if found.len() == length => Ok(found),
+            _ => {
+                let data = create()?;
+                set_key_binary(handle, value, &data)
+                    .with_context(|| format!(r"Write HKLM\{key}\{value}"))?;
+                Ok(data)
+            }
+        });
+    // SAFETY: opened above and not used again.
+    unsafe {
+        RegCloseKey(handle);
+    }
+    result
+}
+
+fn protect_key(handle: HKEY, attributes: &SecurityAttributes) -> Result<()> {
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut present = 0;
+    let mut defaulted = 0;
+    // SAFETY: the descriptor lives as long as `attributes`, and the DACL points into it; the
+    // key handle is open with WRITE_DAC.
+    let status = unsafe {
+        if GetSecurityDescriptorDacl(
+            attributes.descriptor(),
+            &mut present,
+            &mut dacl,
+            &mut defaulted,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("Read security descriptor");
+        }
+        if dacl.is_null() {
+            bail!("The security descriptor has no DACL");
+        }
+        SetSecurityInfo(
+            handle as HANDLE,
+            SE_REGISTRY_KEY,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32).into());
+    }
+    Ok(())
+}
+
+fn set_key_binary(handle: HKEY, value: &str, data: &[u8]) -> Result<()> {
+    let value = wide(value.as_ref());
+    // SAFETY: the name and data outlive the call; the key is open with KEY_SET_VALUE.
+    let status = unsafe {
+        RegSetValueExW(
+            handle,
+            value.as_ptr(),
+            0,
+            REG_BINARY,
+            data.as_ptr(),
+            data.len() as u32,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32).into());
+    }
+    Ok(())
+}
+
+/// Bytes from the system's preferred random number generator.
+pub fn random_bytes(length: usize) -> Result<Vec<u8>> {
+    let mut bytes = vec![0u8; length];
+    // SAFETY: the buffer is writable for the length passed.
+    let status = unsafe {
+        BCryptGenRandom(
+            ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        bail!("Generate random bytes (status {status:#x})");
+    }
+    Ok(bytes)
+}
+
+/// HMAC-SHA256 of `message` under `key`, from Windows' own cryptography.
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<[u8; 32]> {
+    let mut output = [0u8; 32];
+    // SAFETY: every buffer is valid for the length passed; the algorithm handle is a
+    // pseudo-handle that needs no opening or closing.
+    let status = unsafe {
+        BCryptHash(
+            BCRYPT_HMAC_SHA256_ALG_HANDLE,
+            key.as_ptr(),
+            key.len() as u32,
+            message.as_ptr(),
+            message.len() as u32,
+            output.as_mut_ptr(),
+            output.len() as u32,
+        )
+    };
+    if status < 0 {
+        bail!("Compute HMAC-SHA256 (status {status:#x})");
+    }
+    Ok(output)
 }
 
 /// Whether this process runs with administrator rights.

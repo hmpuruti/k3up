@@ -2,7 +2,7 @@
 //! files, so the command line works the same in services mode.
 use super::{
     files::{self, Layout},
-    host, scm,
+    host, integrity, scm,
     status::{self, Definition, Drift, Scm, Service},
 };
 use crate::{
@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const DEFAULT_PREFIX: &str = "K3Up_";
+pub const DEFAULT_PREFIX: &str = super::DEFAULT_SERVICE_PREFIX;
 const ELEVATE: &str = "Access denied. Run this from an elevated terminal";
 const STOPPED: &str = "Stopped by request";
 /// How long a stop keeps trying to record itself while another program holds the state file.
@@ -354,7 +354,8 @@ impl Backend {
                 (Some(current), Some(_)) => self.drift(current)?,
                 _ => Drift::default(),
             };
-            let unchanged = current == Some(&spec);
+            // A definition changed outside K3 Up is written again from the manifest.
+            let unchanged = current == Some(&spec) && self.signed(&spec.name);
             if unchanged && service.is_some() && drift.is_empty() {
                 continue;
             }
@@ -416,6 +417,19 @@ impl Backend {
         ))
     }
 
+    /// Whether the definition still has the signature K3 Up gave it.
+    fn signed(&self, name: &str) -> bool {
+        let Ok(key) = integrity::load_key(&self.settings.prefix) else {
+            return false;
+        };
+        let definition = std::fs::read(self.layout.definition(name));
+        let signature = std::fs::read_to_string(self.layout.signature(name));
+        let (Ok(definition), Ok(signature)) = (definition, signature) else {
+            return false;
+        };
+        integrity::verify(&key, name, &definition, &signature).unwrap_or(false)
+    }
+
     /// How the service of an existing workload differs from what its definition asks for, for
     /// example after a change in the Services console.
     fn drift(&self, workload: &Workload) -> Result<Drift> {
@@ -431,6 +445,7 @@ impl Backend {
     /// replaces so that `commit` can undo it.
     fn preflight(&self, plan: Vec<Change>) -> Result<Vec<Step>> {
         refuse_unprotected(&self.layout.workloads())?;
+        integrity::load_key(&self.settings.prefix)?;
         if plan.iter().any(|change| !change.registered) {
             scm::check_create_access()?;
         }
@@ -438,14 +453,8 @@ impl Backend {
             .map(|change| {
                 let name = &change.workload.name;
                 status::check_service_limits(&change.workload)?;
-                let path = self.layout.definition(name);
-                let file = match std::fs::read(&path) {
-                    Ok(bytes) => Some(bytes),
-                    Err(error) if error.kind() == ErrorKind::NotFound => None,
-                    Err(error) => {
-                        return Err(error).with_context(|| format!("Read {}", path.display()));
-                    }
-                };
+                let file = read_if_present(&self.layout.definition(name))?;
+                let signature = read_if_present(&self.layout.signature(name))?;
                 let service = if change.registered {
                     Some(scm::snapshot(&self.service_name(name))?)
                 } else {
@@ -466,6 +475,7 @@ impl Backend {
                 Ok(Step {
                     change,
                     file,
+                    signature,
                     service,
                     instance,
                     written: false,
@@ -488,8 +498,9 @@ impl Backend {
     fn save(&self, step: &mut Step) -> Result<()> {
         let workload = &step.change.workload;
         let instance = step.instance.as_deref();
-        write_definition(&self.layout.definition(&workload.name), workload, instance)?;
+        let key = integrity::load_key(&self.settings.prefix)?;
         step.written = true;
+        write_definition(&self.layout, &key, workload, instance)?;
         let service = self.service_name(&workload.name);
         let registration = self.registration(&service, instance);
         if step.service.is_some() {
@@ -528,13 +539,9 @@ impl Backend {
             None if step.created => scm::delete(&service)?,
             None => {}
         }
-        let path = self.layout.definition(name);
-        match &step.file {
-            Some(bytes) => {
-                files::write_atomic(&path, bytes, crate::win32::set_owner_to_administrators)
-            }
-            None => remove_if_present(&path),
-        }
+        // The previous signature comes back as it was, so an undo never signs anything.
+        restore(&self.layout.definition(name), step.file.as_deref())?;
+        restore(&self.layout.signature(name), step.signature.as_deref())
     }
 
     /// New definitions can opt into starting right away, as they do with the agent. As there,
@@ -588,6 +595,7 @@ impl Backend {
             scm::delete(&service)?;
         }
         remove_if_present(&path)?;
+        remove_if_present(&self.layout.signature(name))?;
         self.event(name, "Definition removed; log retained");
         Ok(Response::success(format!("Removed {name}")))
     }
@@ -727,6 +735,7 @@ struct Change {
 struct Step {
     change: Change,
     file: Option<Vec<u8>>,
+    signature: Option<Vec<u8>>,
     service: Option<scm::Snapshot>,
     instance: Option<String>,
     written: bool,
@@ -785,14 +794,43 @@ fn write_state_patiently(path: &Path, state: &files::HostState) -> Result<()> {
     }
 }
 
-/// Owned by Administrators, which the host requires before it trusts a definition.
-fn write_definition(path: &Path, workload: &Workload, instance: Option<&str>) -> Result<()> {
+/// Owned by Administrators, which the host requires before it trusts a definition, and
+/// signed, which it requires before it runs one. The signature follows the definition, so a
+/// failure in between leaves a definition the host refuses rather than runs.
+fn write_definition(
+    layout: &Layout,
+    key: &[u8],
+    workload: &Workload,
+    instance: Option<&str>,
+) -> Result<()> {
+    let name = &workload.name;
     let text = files::definition_text(workload, instance)?;
+    let signature = integrity::sign(key, name, text.as_bytes())?;
     files::write_atomic(
-        path,
+        &layout.definition(name),
         text.as_bytes(),
         crate::win32::set_owner_to_administrators,
+    )?;
+    files::write_atomic(
+        &layout.signature(name),
+        signature.as_bytes(),
+        crate::win32::set_owner_to_administrators,
     )
+}
+
+fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("Read {}", path.display())),
+    }
+}
+
+fn restore(path: &Path, bytes: Option<&[u8]>) -> Result<()> {
+    match bytes {
+        Some(bytes) => files::write_atomic(path, bytes, crate::win32::set_owner_to_administrators),
+        None => remove_if_present(path),
+    }
 }
 
 /// Names become file and service names, so anything else is refused before it reaches either.

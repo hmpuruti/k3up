@@ -2,7 +2,7 @@
 //! agent.
 use super::{
     files::{self, HostState, Layout},
-    status,
+    integrity, status,
 };
 use crate::{
     model::{State, Workload},
@@ -34,6 +34,10 @@ use windows_service::{
 pub const EXIT_FAILED: u32 = 1;
 pub const EXIT_DEFINITION: u32 = 2;
 pub const EXIT_UNTRUSTED: u32 = 3;
+pub const EXIT_UNSIGNED: u32 = 4;
+/// Shown to every user, after "Refusing to run: ".
+pub const UNSIGNED: &str =
+    "the definition was not written by K3 Up; re-apply it from a trusted manifest";
 
 const POLL: Duration = Duration::from_millis(250);
 const ROTATE_EVERY: Duration = Duration::from_secs(10);
@@ -62,6 +66,7 @@ pub fn explain_exit(code: Option<u32>) -> String {
         Some(EXIT_UNTRUSTED) => {
             "its data folders are not protected, so the host refused to run".into()
         }
+        Some(EXIT_UNSIGNED) => UNSIGNED.into(),
         Some(code) => format!("the host exited with code {code}"),
         None => "the host stopped without giving a reason".into(),
     }
@@ -90,6 +95,7 @@ fn service_main(arguments: Vec<OsString>) {
     let mut host = Host {
         layout: Layout::new(data),
         name: workload.clone(),
+        prefix: prefix_of(&service, workload),
         handle,
         state: HostState {
             instance: instance.clone(),
@@ -114,6 +120,8 @@ enum Ending {
 struct Host {
     layout: Layout,
     name: String,
+    /// What the service's name starts with, which selects the signing key.
+    prefix: Option<String>,
     handle: ServiceStatusHandle,
     state: HostState,
     checkpoint: u32,
@@ -225,16 +233,43 @@ impl Host {
                 ),
             ));
         }
-        crate::win32::open_inside(&definition)
-            .and_then(|file| files::definition_from(file, &definition))
+        let invalid = |error| {
+            Refusal::new(
+                EXIT_DEFINITION,
+                "the definition could not be read or is not valid",
+                error,
+            )
+        };
+        // Opened sharing reads only, so nobody can change the bytes between the check and use.
+        let bytes = crate::win32::open_inside(&definition)
+            .and_then(|file| files::bytes_from(file, &definition))
+            .map_err(invalid)?;
+        self.verify(&bytes)
+            .map_err(|detail| Refusal::new(EXIT_UNSIGNED, UNSIGNED, detail))?;
+        files::definition_from_bytes(&bytes, &definition)
             .and_then(|spec| check(spec, &self.name))
-            .map_err(|error| {
-                Refusal::new(
-                    EXIT_DEFINITION,
-                    "the definition could not be read or is not valid",
-                    error,
-                )
-            })
+            .map_err(invalid)
+    }
+
+    /// Fails unless `definition` carries the signature K3 Up gave it for this workload name.
+    fn verify(&self, definition: &[u8]) -> Result<()> {
+        let prefix = self
+            .prefix
+            .as_deref()
+            .context("The service name does not end with the workload name")?;
+        let key = integrity::load_key(prefix)?;
+        let path = self.layout.signature(&self.name);
+        let signature =
+            crate::win32::open_inside(&path).and_then(|file| files::bytes_from(file, &path))?;
+        let signature = String::from_utf8_lossy(&signature);
+        if !integrity::verify(&key, &self.name, definition, &signature)? {
+            bail!(
+                "{} does not match {}",
+                path.display(),
+                self.layout.definition(&self.name).display()
+            );
+        }
+        Ok(())
     }
 
     fn supervise(&mut self, spec: &Workload, stop: &Receiver<()>) -> Ending {
@@ -534,6 +569,13 @@ fn check(spec: Workload, name: &str) -> Result<Workload> {
     Ok(spec)
 }
 
+/// The part of `service` before `name`, which Windows may report in another case.
+fn prefix_of(service: &str, name: &str) -> Option<String> {
+    let cut = service.len().checked_sub(name.len())?;
+    let (prefix, rest) = (service.get(..cut)?, service.get(cut..)?);
+    (!prefix.is_empty() && rest.eq_ignore_ascii_case(name)).then(|| prefix.to_string())
+}
+
 fn is_protected(path: &Path) -> bool {
     crate::win32::is_protected(path)
 }
@@ -570,6 +612,15 @@ mod tests {
             delays.push(retry.delay.as_millis());
         }
         assert_eq!(delays, [500, 1000, 2000, 2000, 2000, 2000]);
+    }
+
+    #[test]
+    fn the_prefix_is_what_the_service_name_adds_to_the_workload_name() {
+        assert_eq!(prefix_of("K3Up_web", "web").as_deref(), Some("K3Up_"));
+        assert_eq!(prefix_of("k3up_WEB", "web").as_deref(), Some("k3up_"));
+        assert_eq!(prefix_of("web", "web"), None);
+        assert_eq!(prefix_of("K3Up_api", "web"), None);
+        assert_eq!(prefix_of("eb", "web"), None);
     }
 
     #[test]

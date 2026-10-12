@@ -8,7 +8,7 @@ use k3up::{
         Kind, Manifest, Restart, RestartBackoff, RestartLimit, Schedule, State, Status, Workload,
     },
     protocol::{Command, Response},
-    services::{Backend, Settings, exposure, files, scm, setup},
+    services::{Backend, Settings, exposure, files, integrity, scm, setup},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -87,6 +87,7 @@ impl Machine {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         );
+        integrity::ensure_key(&prefix).unwrap();
         let backend = Backend::with(
             &data,
             Settings {
@@ -104,6 +105,20 @@ impl Machine {
 
     fn service(&self, name: &str) -> String {
         format!("{}{name}", self.prefix)
+    }
+
+    /// Signs a definition a test wrote itself, as K3 Up would have.
+    fn sign(&self, name: &str) {
+        let workloads = self.data.join("workloads");
+        let definition = std::fs::read(workloads.join(format!("{name}.toml"))).unwrap();
+        let key = integrity::load_key(&self.prefix).unwrap();
+        let signature = integrity::sign(&key, name, &definition).unwrap();
+        files::write_atomic(
+            &workloads.join(format!("{name}.sig")),
+            signature.as_bytes(),
+            k3up::win32::set_owner_to_administrators,
+        )
+        .unwrap();
     }
 
     fn workload(&self, name: &str, mode: &str) -> Workload {
@@ -242,6 +257,13 @@ impl Drop for Machine {
             let _ = scm::stop(&service.name, Duration::from_secs(60));
             let _ = scm::delete(&service.name);
         }
+        let _ = std::process::Command::new("reg.exe")
+            .args([
+                "delete",
+                &format!(r"HKLM\{}", integrity::key_path(&self.prefix)),
+                "/f",
+            ])
+            .output();
     }
 }
 
@@ -706,6 +728,123 @@ fn only_scripts_users_may_change_are_warned_about() {
     );
 }
 
+const UNSIGNED: &str =
+    "Refusing to run: the definition was not written by K3 Up; re-apply it from a trusted manifest";
+
+impl Machine {
+    /// Starts `name`, expecting its host to refuse the definition as unsigned.
+    fn refused(&self, name: &str) {
+        let response = self.send(Command::Start { name: name.into() });
+        assert!(!response.ok);
+        assert_eq!(
+            response.message,
+            format!("{name} stopped right after starting: {UNSIGNED}")
+        );
+        assert_eq!(
+            scm::specific_exit_code(&self.service(name)).unwrap(),
+            Some(k3up::services::host::EXIT_UNSIGNED)
+        );
+        let status = self.get(name);
+        assert_eq!(status.state, State::Failed);
+        assert_eq!(status.reason, UNSIGNED);
+        for shared in [
+            self.data.join("state").join(format!("{name}.json")),
+            self.data.join("events").join(format!("{name}.jsonl")),
+        ] {
+            let text = std::fs::read_to_string(&shared).unwrap();
+            assert!(!text.contains("K3UP_FIXTURE"), "{text}");
+            assert!(!text.contains("stop_timeout_secs"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn the_host_runs_only_definitions_k3up_signed() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let workloads = machine.data.join("workloads");
+    let definition = workloads.join("signed.toml");
+    let signature = workloads.join("signed.sig");
+    assert!(machine.put(machine.workload("signed", "pulse")).ok);
+    assert!(signature.is_file());
+    machine.ok(Command::Start {
+        name: "signed".into(),
+    });
+    machine.until("signed", |status| status.state == State::Running);
+    machine.ok(Command::Stop {
+        name: "signed".into(),
+    });
+
+    let original = std::fs::read_to_string(&definition).unwrap();
+    let changed = original.replacen("stop_timeout_secs = 1", "stop_timeout_secs = 2", 1);
+    assert_ne!(changed, original);
+    std::fs::write(&definition, &changed).unwrap();
+    machine.refused("signed");
+
+    std::fs::write(&definition, &original).unwrap();
+    std::fs::remove_file(&signature).unwrap();
+    machine.refused("signed");
+
+    // Applying the same definition again signs it again.
+    let applied = machine.put(machine.workload("signed", "pulse"));
+    assert_eq!(applied.message, "Update signed");
+    machine.ok(Command::Start {
+        name: "signed".into(),
+    });
+    machine.until("signed", |status| status.state == State::Running);
+    machine.ok(Command::Stop {
+        name: "signed".into(),
+    });
+}
+
+#[test]
+fn a_signature_is_bound_to_its_workload_name() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let workloads = machine.data.join("workloads");
+    assert!(machine.put(machine.workload("a", "pulse")).ok);
+    assert!(machine.put(machine.workload("b", "pulse")).ok);
+    for extension in ["toml", "sig"] {
+        let bytes = std::fs::read(workloads.join(format!("a.{extension}"))).unwrap();
+        files::write_atomic(
+            &workloads.join(format!("b.{extension}")),
+            &bytes,
+            k3up::win32::set_owner_to_administrators,
+        )
+        .unwrap();
+    }
+    machine.refused("b");
+}
+
+#[test]
+fn repair_refuses_a_file_another_program_holds_open() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let log = machine.data.join("logs").join("held.log");
+    std::fs::write(&log, b"written before").unwrap();
+    k3up::win32::set_owner_to_administrators(&log).unwrap();
+    // FILE_SHARE_READ | FILE_SHARE_WRITE: a writer that lets others write too.
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .share_mode(0x1 | 0x2)
+        .open(&log)
+        .unwrap();
+    let error = format!("{:#}", setup::prepare(&machine.data).unwrap_err());
+    assert_eq!(
+        error,
+        format!(
+            "{} is open in another program; close it and try again",
+            log.display()
+        )
+    );
+    drop(held);
+    setup::prepare(&machine.data).unwrap();
+}
+
 fn elevated() -> bool {
     Machine::start().is_some()
 }
@@ -808,6 +947,7 @@ fn a_broken_definition_never_leaks_into_files_every_user_reads() {
         k3up::win32::set_owner_to_administrators,
     )
     .unwrap();
+    machine.sign("leaky");
     scm::start(&machine.service("leaky")).unwrap();
     let state = scm::wait(&machine.service("leaky"), WAIT, |state| {
         state == k3up::services::status::Scm::Stopped

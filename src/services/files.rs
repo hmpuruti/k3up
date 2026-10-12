@@ -51,6 +51,10 @@ impl Layout {
     pub fn definition(&self, name: &str) -> PathBuf {
         self.workloads().join(format!("{name}.toml"))
     }
+    /// The definition's HMAC, as hex. See `integrity`.
+    pub fn signature(&self, name: &str) -> PathBuf {
+        self.workloads().join(format!("{name}.sig"))
+    }
     pub fn log(&self, name: &str) -> PathBuf {
         self.logs().join(format!("{name}.log"))
     }
@@ -275,10 +279,28 @@ pub fn read_definition_and_instance(path: &Path) -> Result<Option<(Workload, Opt
     parse_definition(&text, path).map(Some)
 }
 
-/// Reads a definition from a file already opened, so the checks made on that handle apply.
-pub fn definition_from(file: File, path: &Path) -> Result<Workload> {
-    let text = read_bounded_from(file).with_context(|| format!("Read {}", path.display()))?;
-    parse_definition(&text, path).map(|(workload, _)| workload)
+/// Reads at most `READ_LIMIT` bytes from a file already opened, so the checks made on that
+/// handle apply to what is read.
+pub fn bytes_from(file: File, path: &Path) -> Result<Vec<u8>> {
+    let read = || -> std::io::Result<Vec<u8>> {
+        if file.metadata()?.len() > READ_LIMIT {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "larger than 1 MB",
+            ));
+        }
+        let mut bytes = vec![];
+        (&file).take(READ_LIMIT).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    read().with_context(|| format!("Read {}", path.display()))
+}
+
+/// Parses a definition from the bytes that were verified.
+pub fn definition_from_bytes(bytes: &[u8], path: &Path) -> Result<Workload> {
+    let text = std::str::from_utf8(bytes)
+        .with_context(|| format!("Invalid definition {}", path.display()))?;
+    parse_definition(text, path).map(|(workload, _)| workload)
 }
 
 fn parse_definition(text: &str, path: &Path) -> Result<(Workload, Option<String>)> {

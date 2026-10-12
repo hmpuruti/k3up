@@ -50,7 +50,8 @@ fn prepare_folders(data: &Path) -> Result<()> {
         (layout.events_dir(), SHARED_DIR_SDDL),
     ] {
         secure_dir(&folder, sddl)?;
-        reset_contents(&folder)?;
+        // `services enable` holds the changes lock while it repairs.
+        reset_contents(&folder, &[layout.changes_lock()])?;
     }
     Ok(())
 }
@@ -131,6 +132,7 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
     refuse_central_agent_service()?;
     let registered = super::registered();
     super::check_registration(super::in_use().as_deref(), data)?;
+    super::integrity::ensure_key(&settings.prefix)?;
     let _lock = lock_if_prepared(data)?;
     let target = install_dir()?;
     if target.exists() {

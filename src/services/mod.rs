@@ -2,6 +2,7 @@
 //! managed through the service manager, with no central agent.
 pub mod exposure;
 pub mod files;
+pub mod integrity;
 pub mod status;
 
 #[cfg(windows)]
@@ -21,6 +22,9 @@ pub use backend::{Backend, DEFAULT_PREFIX, Settings};
 use crate::autostart::Registration;
 use anyhow::Result;
 use std::path::Path;
+
+/// How the names of workload services start, unless tests set their own.
+pub const DEFAULT_SERVICE_PREFIX: &str = "K3Up_";
 
 /// Access rights that let an account change a file or folder, or what it contains:
 /// write data, append data, write extended attributes, delete children, write attributes,
