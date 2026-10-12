@@ -1860,6 +1860,45 @@ fn a_stop_that_cannot_record_itself_fails_and_status_catches_up() {
 }
 
 #[test]
+fn a_stop_while_a_crashed_host_waits_for_recovery_keeps_it_stopped() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(machine.put(machine.workload("held", "pulse")).ok);
+    machine.ok(Command::Start {
+        name: "held".into(),
+    });
+    machine.until("held", |status| status.state == State::Running);
+    let host = scm::query(&machine.service("held"))
+        .unwrap()
+        .unwrap()
+        .host_pid
+        .unwrap();
+    let killed = std::process::Command::new("taskkill.exe")
+        .args(["/F", "/PID", &host.to_string()])
+        .output()
+        .unwrap();
+    assert!(killed.status.success());
+    scm::wait(&machine.service("held"), WAIT, |state| {
+        state == k3up::services::status::Scm::Stopped
+    })
+    .unwrap();
+    // The service manager restarts a crashed host after 5 seconds.
+    machine.ok(Command::Stop {
+        name: "held".into(),
+    });
+    std::thread::sleep(Duration::from_secs(10));
+    let after = scm::query(&machine.service("held")).unwrap().unwrap();
+    assert_eq!(after.scm, k3up::services::status::Scm::Stopped, "{after:?}");
+    assert_eq!(machine.get("held").state, State::Stopped);
+
+    machine.ok(Command::Start {
+        name: "held".into(),
+    });
+    machine.until("held", |status| status.state == State::Running);
+}
+
+#[test]
 fn a_host_that_dies_shows_as_ended_unexpectedly_until_it_is_restarted() {
     let Some(machine) = Machine::start() else {
         return;

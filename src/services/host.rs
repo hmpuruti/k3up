@@ -107,6 +107,20 @@ fn service_main(arguments: Vec<OsString>) {
         unsaved: None,
         stopping: false,
     };
+    // Stopped on request since the host crashed: a restart the service manager had already
+    // queued must not bring the workload back. A hold from an earlier boot no longer counts.
+    let hold = host.layout.hold(&host.name);
+    if let Some(written) = crate::services::files::hold_boot(&hold) {
+        if crate::services::files::same_boot(written, sysinfo::System::boot_time()) {
+            host.report(
+                ServiceState::Stopped,
+                ServiceExitCode::NO_ERROR,
+                Duration::ZERO,
+            );
+            return;
+        }
+        let _ = std::fs::remove_file(&hold);
+    }
     let exit = host.run(&stopped);
     host.flush();
     host.report(ServiceState::Stopped, exit, Duration::ZERO);

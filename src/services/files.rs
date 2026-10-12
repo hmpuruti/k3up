@@ -61,6 +61,11 @@ impl Layout {
     pub fn state(&self, name: &str) -> PathBuf {
         self.states().join(format!("{name}.json"))
     }
+    /// Written when a workload is stopped on request, so a restart the service manager queued
+    /// after a crash runs nothing. It names the boot it belongs to.
+    pub fn hold(&self, name: &str) -> PathBuf {
+        self.workloads().join(format!("{name}.hold"))
+    }
     pub fn events(&self, name: &str) -> PathBuf {
         self.events_dir().join(format!("{name}.jsonl"))
     }
@@ -563,6 +568,17 @@ pub fn read_events(layout: &Layout, name: Option<&str>, after: Option<i64>) -> R
     Ok(events)
 }
 
+/// Whether a hold marker written at `written` belongs to the boot that started at `boot`.
+/// Boot times read at different moments can differ by a second or two.
+pub fn same_boot(written: u64, boot: u64) -> bool {
+    written.abs_diff(boot) <= 5
+}
+
+/// The boot a hold marker belongs to, or `None` when there is no readable marker.
+pub fn hold_boot(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +626,12 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_hold_belongs_to_the_boot_it_names() {
+        assert!(same_boot(1_000, 1_003));
+        assert!(!same_boot(1_000, 2_000));
     }
 
     #[test]

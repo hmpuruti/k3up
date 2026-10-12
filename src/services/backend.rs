@@ -631,6 +631,7 @@ impl Backend {
         }
         remove_if_present(&path)?;
         remove_if_present(&self.layout.signature(name))?;
+        remove_if_present(&self.layout.hold(name))?;
         self.event(name, "Definition removed; log retained");
         Ok(Response::success(format!("Removed {name}")))
     }
@@ -657,6 +658,7 @@ impl Backend {
             scm::create(&workload, &self.registration(&service, instance.as_deref()))?;
             self.event(name, "Windows service created again from the definition");
         }
+        remove_if_present(&self.layout.hold(name))?;
         let requested = Utc::now();
         scm::start(&service)?;
         let state = scm::wait(&service, scm::START_TIMEOUT, |state| {
@@ -695,6 +697,12 @@ impl Backend {
             Definition::Present(workload) => workload.stop_timeout_secs,
             _ => 30,
         };
+        // A crashed host may already be queued for a restart; the hold makes it run nothing.
+        files::write_atomic(
+            &self.layout.hold(name),
+            sysinfo::System::boot_time().to_string().as_bytes(),
+            crate::win32::set_owner_to_administrators,
+        )?;
         scm::stop(&service, Duration::from_secs(timeout + 30))?;
         Ok(())
     }
