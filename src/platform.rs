@@ -32,6 +32,13 @@ pub fn login_data_dir() -> PathBuf {
     }
 }
 
+/// Where this account's own agent keeps its data unless told otherwise, from the shell rather
+/// than K3UP_DATA_DIR or LOCALAPPDATA, which an administrator may have set for services mode.
+#[cfg(windows)]
+pub fn user_agent_dir() -> Result<PathBuf> {
+    Ok(crate::win32::local_app_data()?.join("K3 Up"))
+}
+
 /// The data directory shared by every user, which services mode uses.
 #[cfg(windows)]
 pub fn machine_data_dir() -> PathBuf {
@@ -489,5 +496,39 @@ mod tests {
             stop_leftover(&format!("{pid} 1"), std::time::Duration::ZERO),
             None
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "child process; run by the_user_agent_dir_ignores_overrides"]
+    fn print_user_agent_dir() {
+        println!("[{}]", user_agent_dir().unwrap().display());
+    }
+
+    #[test]
+    fn the_user_agent_dir_ignores_overrides() {
+        let elsewhere = std::env::temp_dir().join("k3up-elsewhere");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::windows_tests::print_user_agent_dir",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("K3UP_DATA_DIR", &elsewhere)
+            .env("LOCALAPPDATA", &elsewhere)
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&output.stdout);
+        let expected = crate::win32::local_app_data().unwrap().join("K3 Up");
+        assert!(
+            printed.contains(&format!("[{}]", expected.display())),
+            "{printed}"
+        );
+        assert!(!expected.starts_with(&elsewhere));
     }
 }

@@ -14,8 +14,9 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE, LocalFree,
-        WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+        ERROR_SUCCESS, HANDLE, LocalFree, STILL_ACTIVE, WAIT_ABANDONED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
@@ -42,10 +43,13 @@ use windows_sys::Win32::{
             RegGetValueW, RegSetKeyValueW,
         },
         Threading::{
-            CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
+            CreateMutexW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+            PROCESS_QUERY_LIMITED_INFORMATION, ReleaseMutex, WaitForSingleObject,
         },
     },
-    UI::Shell::{FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath},
+    UI::Shell::{
+        FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
+    },
 };
 
 mod pinned;
@@ -530,6 +534,30 @@ pub fn program_data() -> Result<PathBuf> {
 
 pub fn program_files() -> Result<PathBuf> {
     known_folder(&FOLDERID_ProgramFiles)
+}
+
+/// This account's local application data folder, whatever LOCALAPPDATA says.
+pub fn local_app_data() -> Result<PathBuf> {
+    known_folder(&FOLDERID_LocalAppData)
+}
+
+/// Whether a process with this id runs. One this account may not open counts as running.
+pub fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: the handle is checked before use and closed below.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return std::io::Error::last_os_error().raw_os_error()
+                == Some(ERROR_ACCESS_DENIED as i32);
+        }
+        let mut code = 0;
+        let read = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        read == 0 || code == STILL_ACTIVE as u32
+    }
 }
 
 /// Asks the shell rather than reading environment variables, which the caller controls.

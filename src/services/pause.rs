@@ -1,14 +1,27 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 /// Stops and starts workload services. A trait so the bookkeeping in `while_stopped` can be
 /// tested without the service manager.
 pub trait Control {
-    fn stop(&mut self, name: &str) -> Result<()>;
+    /// True when this call stopped a running workload, false when it had already stopped.
+    fn stop(&mut self, name: &str) -> Result<bool>;
     fn start(&mut self, name: &str) -> Result<()>;
 }
 
-/// Stops each of `running` in turn, runs `work`, then starts every workload it stopped again,
-/// even when a stop or `work` failed. The error names every failure, starting with the first.
+/// Stopping a job would cut its work short, and starting it again would repeat what it did.
+pub fn refuse_running_jobs(jobs: &[String]) -> Result<()> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "These jobs are running: {}. Wait for them to finish, or stop them, then run `k3up services enable` again",
+        jobs.join(", ")
+    )
+}
+
+/// Stops each of `running` in turn, runs `work`, then starts again every workload this call
+/// stopped, even when a stop or `work` failed. One that had already stopped stays stopped.
+/// The error names every failure, starting with the first.
 pub fn while_stopped(
     control: &mut impl Control,
     running: &[String],
@@ -19,10 +32,11 @@ pub fn while_stopped(
     let mut problems = vec![];
     for name in running {
         match control.stop(name) {
-            Ok(()) => {
+            Ok(true) => {
                 lines.push(format!("Stopped {name}"));
                 stopped.push(name);
             }
+            Ok(false) => {}
             Err(error) => {
                 problems.push(format!("{name} did not stop: {error:#}"));
                 break;
@@ -48,7 +62,7 @@ pub fn while_stopped(
     }
 }
 
-/// Turns services mode on: stops the running workloads, installs the programs, repairs the
+/// Turns services mode on: stops the running services, installs the programs, repairs the
 /// data folders, and only then starts what it stopped, since a host started before the
 /// repair would refuse the folders. A failed install skips the repair. Every stopped workload
 /// is started again whatever failed.
@@ -74,16 +88,17 @@ mod tests {
     struct Fake {
         stop_fails: Vec<&'static str>,
         start_fails: Vec<&'static str>,
+        already_stopped: Vec<&'static str>,
         calls: Vec<String>,
     }
 
     impl Control for Fake {
-        fn stop(&mut self, name: &str) -> Result<()> {
+        fn stop(&mut self, name: &str) -> Result<bool> {
             self.calls.push(format!("stop {name}"));
             if self.stop_fails.contains(&name) {
                 bail!("timed out");
             }
-            Ok(())
+            Ok(!self.already_stopped.contains(&name))
         }
 
         fn start(&mut self, name: &str) -> Result<()> {
@@ -114,6 +129,34 @@ mod tests {
                 "Started b",
                 "Started c"
             ]
+        );
+    }
+
+    #[test]
+    fn a_workload_that_had_already_stopped_is_not_started() {
+        let mut fake = Fake {
+            already_stopped: vec!["b"],
+            ..Default::default()
+        };
+        let lines = while_stopped(&mut fake, &running(), || Ok(vec!["Copied".into()])).unwrap();
+        assert_eq!(
+            fake.calls,
+            ["stop a", "stop b", "stop c", "start a", "start c"]
+        );
+        assert_eq!(
+            lines,
+            ["Stopped a", "Stopped c", "Copied", "Started a", "Started c"]
+        );
+    }
+
+    #[test]
+    fn running_jobs_are_named() {
+        refuse_running_jobs(&[]).unwrap();
+        assert_eq!(
+            refuse_running_jobs(&["backup".into(), "report".into()])
+                .unwrap_err()
+                .to_string(),
+            "These jobs are running: backup, report. Wait for them to finish, or stop them, then run `k3up services enable` again"
         );
     }
 
@@ -170,9 +213,9 @@ mod tests {
     struct Recorder<'a>(&'a std::cell::RefCell<Vec<String>>);
 
     impl Control for Recorder<'_> {
-        fn stop(&mut self, name: &str) -> Result<()> {
+        fn stop(&mut self, name: &str) -> Result<bool> {
             self.0.borrow_mut().push(format!("stop {name}"));
-            Ok(())
+            Ok(true)
         }
 
         fn start(&mut self, name: &str) -> Result<()> {

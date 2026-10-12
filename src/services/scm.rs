@@ -1,14 +1,15 @@
 //! The Windows service manager calls that services mode needs.
 use super::status::{
-    Recovery, Scm, Service, ServiceSettings, description, display_name, instance_of,
-    split_command_line, starts_at_boot,
+    NoPassword, Recovery, Scm, Service, ServiceSettings, description, display_name, instance_of,
+    split_command_line, starts_at_boot, without_password,
 };
 use crate::model::Workload;
 use anyhow::{Context, Result, bail};
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     ptr,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use windows_service::{
@@ -21,9 +22,9 @@ use windows_service::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_SERVICE_ALREADY_RUNNING,
-        ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST,
-        ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
+        ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_PROCESS_ABORTED,
+        ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
+        ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
     },
     System::Services::{
         ChangeServiceConfigW, CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW,
@@ -39,6 +40,11 @@ use windows_sys::Win32::{
 pub const START_TIMEOUT: Duration = Duration::from_secs(30);
 const DELETE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCOUNT: &str = "LocalSystem";
+
+/// Services whose next reconfiguration fails right after the account is switched, so tests
+/// can check the rollback.
+#[doc(hidden)]
+pub static FAIL_AFTER_ACCOUNT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// How the service manager starts a workload's host.
 pub struct Registration<'a> {
@@ -106,6 +112,8 @@ pub fn query(service: &str) -> Result<Option<Service>> {
         scm: scm_state(status.current_state),
         host_pid: status.process_id.filter(|pid| *pid != 0),
         instance: instance_of(&config.executable_path.to_string_lossy()),
+        crashed: status.exit_code
+            == windows_service::service::ServiceExitCode::Win32(ERROR_PROCESS_ABORTED),
     }))
 }
 
@@ -202,6 +210,7 @@ pub fn list(prefix: &str) -> Result<Vec<Service>> {
                 },
                 host_pid: Some(process.dwProcessId).filter(|pid| *pid != 0),
                 instance: None,
+                crashed: process.dwWin32ExitCode == ERROR_PROCESS_ABORTED,
             });
         }
         if done {
@@ -420,7 +429,18 @@ pub fn reconfigure(workload: &Workload, at: &Registration) -> Result<()> {
     handle
         .change_config(&info)
         .with_context(|| format!("Change service {}", at.service))?;
+    fail_if_asked(at.service)?;
     configure(&handle, workload).with_context(|| format!("Configure service {}", at.service))
+}
+
+fn fail_if_asked(service: &str) -> Result<()> {
+    let asked = FAIL_AFTER_ACCOUNT
+        .lock()
+        .is_ok_and(|services| services.iter().any(|name| name == service));
+    if asked {
+        bail!("Configure service {service}: failed on purpose");
+    }
+    Ok(())
 }
 
 /// Fails unless this process may create services.
@@ -429,8 +449,9 @@ pub fn check_create_access() -> Result<()> {
 }
 
 /// What `create` and `reconfigure` set on a service, as the service manager holds it, so a
-/// failed change can be undone. The account is left out: its password cannot be read back.
+/// failed change can be undone. Only an account that needs no password can be put back.
 pub struct Snapshot {
+    account: Option<String>,
     start_type: u32,
     command_line: Vec<u16>,
     display_name: Vec<u16>,
@@ -447,6 +468,9 @@ pub fn snapshot(service: &str) -> Result<Snapshot> {
     let read = || -> Result<Snapshot> {
         let config = handle.query_config()?;
         Ok(Snapshot {
+            account: config
+                .account_name
+                .map(|name| name.to_string_lossy().into_owned()),
             start_type: config.start_type.to_raw(),
             command_line: crate::win32::wide(config.executable_path.as_os_str()),
             display_name: crate::win32::wide(&config.display_name),
@@ -457,6 +481,12 @@ pub fn snapshot(service: &str) -> Result<Snapshot> {
         })
     };
     read().with_context(|| format!("Read service {service}"))
+}
+
+impl Snapshot {
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
 }
 
 /// Calls QueryServiceConfig2W for `level` and hands the filled buffer to `parse`.
@@ -490,9 +520,19 @@ fn query_config2<T>(
     }
 }
 
-/// Puts back the settings `snapshot` recorded.
+/// Puts back the settings `snapshot` recorded, with the account when it needs no password.
 pub fn restore(service: &str, snapshot: &Snapshot) -> Result<()> {
     let handle = require(service, change_access())?;
+    let account = snapshot
+        .account
+        .as_deref()
+        .and_then(|account| Some((account, without_password(account)?)));
+    let name = account.map(|(account, _)| crate::win32::wide(OsStr::new(account)));
+    let empty = [0u16];
+    let password = match account {
+        Some((_, NoPassword::Empty)) => empty.as_ptr(),
+        _ => ptr::null(),
+    };
     // SAFETY: the strings are NUL-terminated and outlive the call; null pointers and
     // SERVICE_NO_CHANGE leave those settings as they are.
     let changed = unsafe {
@@ -505,8 +545,8 @@ pub fn restore(service: &str, snapshot: &Snapshot) -> Result<()> {
             ptr::null(),
             ptr::null_mut(),
             ptr::null(),
-            ptr::null(),
-            ptr::null(),
+            name.as_ref().map_or(ptr::null(), |name| name.as_ptr()),
+            password,
             snapshot.display_name.as_ptr(),
         )
     } != 0;
@@ -562,16 +602,18 @@ pub fn wait(
 }
 
 /// Stops the service and waits until it has. A starting service is stopped once it runs.
-pub fn stop(service: &str, timeout: Duration) -> Result<()> {
+/// True when this call stopped a running host, false when it found the service stopped or it
+/// stopped on its own.
+pub fn stop(service: &str, timeout: Duration) -> Result<bool> {
     let Some(handle) = open(service, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)? else {
-        return Ok(());
+        return Ok(false);
     };
     let deadline = Instant::now() + timeout;
     let mut sent = false;
     loop {
         let state = handle.query_status()?.current_state;
         if state == ServiceState::Stopped {
-            return Ok(());
+            return Ok(sent);
         }
         if !sent && state == ServiceState::Running {
             match handle.stop() {

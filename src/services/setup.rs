@@ -3,15 +3,15 @@ use super::{
     backend::{Backend, DEFAULT_PREFIX, Settings},
     files::{self, Layout},
     host,
-    pause::{Control, install_then_repair},
+    pause::{Control, install_then_repair, refuse_running_jobs},
     scm,
     status::Scm,
 };
-use crate::autostart::LoginAgent;
 use crate::win32::{
     MARKER_SDDL, PRIVATE_DIR_SDDL, ROOT_DIR_SDDL, SHARED_DIR_SDDL, reset_contents, secure_dir,
     set_security,
 };
+use crate::{autostart::LoginAgent, model::Kind};
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     collections::BTreeMap,
@@ -114,8 +114,7 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
             "The K3 Up agent service is installed. Run `k3up agent uninstall-service` first, then enable services mode"
         );
     }
-    let own = LoginAgent::new(PathBuf::new(), crate::platform::login_data_dir());
-    super::refuse_user_agent(own.registration(), own.is_running())?;
+    refuse_user_agent_in(&crate::platform::user_agent_dir()?)?;
     if !crate::win32::ancestors_protected(data) {
         bail!(
             "A folder above {} can be moved or changed by users who aren't administrators, so services mode refuses it",
@@ -132,11 +131,12 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
     }
     let sources = program_sources(&target)?;
     let prefix = settings.prefix.as_str();
-    let running: Vec<String> = scm::list(prefix)?
+    let (jobs, running): (Vec<String>, Vec<String>) = scm::list(prefix)?
         .into_iter()
         .filter(|service| matches!(service.scm, Scm::Running | Scm::Starting))
         .filter_map(|service| Some(service.name.get(prefix.len()..)?.to_string()))
-        .collect();
+        .partition(|name| is_job(data, name));
+    refuse_running_jobs(&jobs)?;
     install_then_repair(
         &mut Services { prefix },
         &running,
@@ -154,6 +154,21 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
         },
     )
     .context("Turning services mode on did not finish")
+}
+
+/// Refuses while this account's own agent, keeping its data in `folder`, runs or starts at
+/// login.
+pub fn refuse_user_agent_in(folder: &Path) -> Result<()> {
+    let own = LoginAgent::new(PathBuf::new(), folder.to_path_buf());
+    super::refuse_user_agent(own.registration(), own.is_running())
+}
+
+/// A definition that cannot be read counts as a service.
+fn is_job(data: &Path, name: &str) -> bool {
+    matches!(
+        files::read_definition(&Layout::new(data).definition(name)),
+        Ok(Some(workload)) if workload.kind == Kind::Job
+    )
 }
 
 /// The machine-wide record and the marker for `data`. Only `enable` and `disable` touch the
@@ -276,7 +291,7 @@ struct Services<'a> {
 }
 
 impl Control for Services<'_> {
-    fn stop(&mut self, name: &str) -> Result<()> {
+    fn stop(&mut self, name: &str) -> Result<bool> {
         scm::stop(&format!("{}{name}", self.prefix), Duration::from_secs(90))
     }
 

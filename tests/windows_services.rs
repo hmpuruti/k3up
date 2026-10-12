@@ -1259,10 +1259,12 @@ fn readers_holding_shared_files_do_not_stall_the_host() {
     assert!(machine.sc("query", "looping").contains("RUNNING"));
 
     let requested = Instant::now();
-    machine.ok(Command::Stop {
+    let stopped = machine.send(Command::Stop {
         name: "looping".into(),
     });
     assert!(requested.elapsed() < Duration::from_secs(30));
+    assert!(!stopped.ok);
+    assert_eq!(stopped.message, state_file_in_use("looping"));
     assert!(machine.sc("query", "looping").contains("STOPPED"));
     drop(held);
     assert!(
@@ -1270,6 +1272,227 @@ fn readers_holding_shared_files_do_not_stall_the_host() {
             .log("looping")
             .contains("Activity history not updated yet")
     );
+    let status = machine.get("looping");
+    assert_eq!(status.state, State::Stopped, "{status:?}");
+    assert!(!status.desired_running);
+}
+
+fn state_file_in_use(name: &str) -> String {
+    format!(
+        "Stopped {name}, but its state file is in use by another program; `k3up status` may show the old state until it is released"
+    )
+}
+
+#[test]
+fn a_stop_that_cannot_record_itself_fails_and_status_catches_up() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(machine.put(machine.workload("held", "pulse")).ok);
+    machine.ok(Command::Start {
+        name: "held".into(),
+    });
+    machine.until("held", |status| status.state == State::Running);
+    let state = machine.data.join("state").join("held.json");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&state)
+        .unwrap();
+    let output = std::process::Command::new(CLI)
+        .arg("--data-dir")
+        .arg(&machine.data)
+        .args(["--json", "stop", "held"])
+        .env("K3UP_SERVICE_PREFIX", &machine.prefix)
+        .env("K3UP_HOST", HOST)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let response: Response = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response.message, state_file_in_use("held"));
+    assert!(machine.sc("query", "held").contains("STOPPED"));
+    drop(held);
+
+    let status = machine.get("held");
+    assert_eq!(status.state, State::Stopped, "{status:?}");
+    assert_eq!(status.reason, "Stopped (state file was out of date)");
+    assert!(!status.desired_running);
+    assert_eq!(status.pid, None);
+
+    machine.ok(Command::Stop {
+        name: "held".into(),
+    });
+    assert_eq!(machine.get("held").reason, "Stopped by request");
+}
+
+#[test]
+fn a_host_that_dies_shows_as_ended_unexpectedly_until_it_is_restarted() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(machine.put(machine.workload("killed", "pulse")).ok);
+    machine.ok(Command::Start {
+        name: "killed".into(),
+    });
+    machine.until("killed", |status| status.state == State::Running);
+    let host = scm::query(&machine.service("killed"))
+        .unwrap()
+        .unwrap()
+        .host_pid
+        .unwrap();
+    let killed = std::process::Command::new("taskkill.exe")
+        .args(["/F", "/PID", &host.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        killed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&killed.stdout)
+    );
+    let state = scm::wait(&machine.service("killed"), WAIT, |state| {
+        state == k3up::services::status::Scm::Stopped
+    })
+    .unwrap();
+    assert_eq!(state, Some(k3up::services::status::Scm::Stopped));
+    let crashed = machine.get("killed");
+    assert_eq!(crashed.state, State::Backoff, "{crashed:?}");
+    assert!(crashed.desired_running);
+    assert_eq!(
+        crashed.reason,
+        "The K3 Up host ended unexpectedly; the service manager restarts it"
+    );
+    let restarted = machine.until("killed", |status| status.state == State::Running);
+    assert_ne!(
+        scm::query(&machine.service("killed"))
+            .unwrap()
+            .unwrap()
+            .host_pid,
+        Some(host),
+        "{restarted:?}"
+    );
+}
+
+#[test]
+fn an_account_set_outside_k3up_is_put_back_when_a_change_fails() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let web = machine.workload("account", "pulse");
+    assert!(machine.put(web.clone()).ok);
+    let local_system = machine.sc("qc", "account");
+    machine.sc_config(
+        "account",
+        &["obj=", r"NT AUTHORITY\LocalService", "password=", ""],
+    );
+    let drifted = machine.sc("qc", "account");
+    assert!(drifted.contains(r"NT AUTHORITY\LocalService"), "{drifted}");
+
+    let service = machine.service("account");
+    scm::FAIL_AFTER_ACCOUNT
+        .lock()
+        .unwrap()
+        .push(service.clone());
+    let failed = machine.apply(std::slice::from_ref(&web), false);
+    scm::FAIL_AFTER_ACCOUNT
+        .lock()
+        .unwrap()
+        .retain(|name| *name != service);
+    assert!(!failed.ok);
+    assert!(
+        failed
+            .message
+            .starts_with("Saving failed and every change was undone: "),
+        "{}",
+        failed.message
+    );
+    assert!(
+        failed.message.ends_with("failed on purpose"),
+        "{}",
+        failed.message
+    );
+    assert_eq!(machine.sc("qc", "account"), drifted);
+
+    let applied = machine.apply(std::slice::from_ref(&web), false);
+    assert_eq!(
+        applied.message,
+        "Update account: service settings differ (account)"
+    );
+    assert_eq!(machine.sc("qc", "account"), local_system);
+}
+
+#[test]
+fn stopping_reports_whether_it_stopped_a_running_host() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(machine.put(machine.workload("steady", "pulse")).ok);
+    machine.ok(Command::Start {
+        name: "steady".into(),
+    });
+    machine.until("steady", |status| status.state == State::Running);
+    let service = machine.service("steady");
+    assert!(scm::stop(&service, WAIT).unwrap());
+    assert!(!scm::stop(&service, WAIT).unwrap());
+
+    let mut job = machine.workload("finished", "exit");
+    job.kind = Kind::Job;
+    job.environment.insert("K3UP_EXIT_CODE".into(), "0".into());
+    assert!(machine.put(job).ok);
+    machine.ok(Command::Start {
+        name: "finished".into(),
+    });
+    machine.until("finished", |status| status.state == State::Completed);
+    assert!(!scm::stop(&machine.service("finished"), WAIT).unwrap());
+    assert!(!scm::stop(&machine.service("missing"), WAIT).unwrap());
+}
+
+#[test]
+fn a_running_agent_in_the_per_user_folder_is_refused() {
+    use fs2::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let idle = setup::refuse_user_agent_in(dir.path());
+    if let Err(error) = &idle {
+        assert!(!error.to_string().contains("running"), "{error}");
+    }
+    let lock = std::fs::File::create(dir.path().join("agent.lock")).unwrap();
+    lock.lock_exclusive().unwrap();
+    let error = setup::refuse_user_agent_in(dir.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("Your own K3 Up agent "), "{error}");
+    assert!(error.contains("is running"), "{error}");
+}
+
+#[test]
+fn reserved_names_and_long_descriptions_change_nothing() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let refused = machine.put(machine.workload("Com1", "pulse"));
+    assert!(!refused.ok);
+    assert!(
+        refused.message.ends_with(
+            "Com1 is reserved by Windows and can't be used as a workload name in services mode"
+        ),
+        "{}",
+        refused.message
+    );
+    assert!(!scm::exists(&machine.service("Com1")).unwrap());
+
+    let mut wordy = machine.workload("wordy", "pulse");
+    wordy.description = "d".repeat(9000);
+    let refused = machine.put(wordy.clone());
+    assert!(!refused.ok);
+    assert_eq!(
+        refused.message,
+        "The description for wordy is 9000 characters; Windows allows at most 8191"
+    );
+    assert!(!scm::exists(&machine.service("wordy")).unwrap());
+    assert!(!machine.data.join("workloads").join("wordy.toml").exists());
+
+    wordy.description = "d".repeat(8191);
+    assert!(machine.put(wordy).ok);
 }
 
 #[test]

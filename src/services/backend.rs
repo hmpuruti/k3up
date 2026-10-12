@@ -21,6 +21,8 @@ use std::{
 pub const DEFAULT_PREFIX: &str = "K3Up_";
 const ELEVATE: &str = "Access denied. Run this from an elevated terminal";
 const STOPPED: &str = "Stopped by request";
+/// How long a stop keeps trying to record itself while another program holds the state file.
+const STATE_WAIT: Duration = Duration::from_secs(2);
 
 /// Where the services' host program is and how their names start.
 #[derive(Debug, Clone)]
@@ -138,11 +140,14 @@ impl Backend {
             Command::Stop { name } => {
                 let _lock = self.lock_known(&name)?;
                 self.stop(&name)?;
+                self.record_stop(&name)?;
                 Ok(Response::success(format!("Stopped {name}")))
             }
             Command::Restart { name } => {
                 let _lock = self.lock_known(&name)?;
                 self.stop(&name)?;
+                // The host started next writes its own report.
+                let _ = self.record_stop(&name);
                 self.start(&name)?;
                 Ok(Response {
                     workloads: vec![self.get(&name)?],
@@ -279,6 +284,7 @@ impl Backend {
                     definition,
                     services.get(name),
                     files::read_state(&self.layout.state(name)),
+                    crate::win32::process_alive,
                 )
             })
             .collect())
@@ -296,6 +302,7 @@ impl Backend {
             definition,
             service.as_ref(),
             files::read_state(&self.layout.state(name)),
+            crate::win32::process_alive,
         ))
     }
 
@@ -424,6 +431,7 @@ impl Backend {
         plan.into_iter()
             .map(|change| {
                 let name = &change.workload.name;
+                status::check_service_limits(&change.workload)?;
                 let path = self.layout.definition(name);
                 let file = match std::fs::read(&path) {
                     Ok(bytes) => Some(bytes),
@@ -446,6 +454,9 @@ impl Backend {
                     name,
                     &files::definition_text(&change.workload, instance.as_deref())?,
                 )?;
+                if let Some(account) = service.as_ref().and_then(scm::Snapshot::account) {
+                    status::refuse_unrestorable_account(name, account)?;
+                }
                 Ok(Step {
                     change,
                     file,
@@ -636,14 +647,12 @@ impl Backend {
             _ => 30,
         };
         scm::stop(&service, Duration::from_secs(timeout + 30))?;
-        // The service has stopped; a reader holding the state file only leaves the old
-        // report in place, which must not turn the stop into a failure.
-        let _ = self.record_stop(name);
         Ok(())
     }
 
     /// A host that already ended, after a failure or a stop outside K3 Up, left its last
-    /// state behind; the request to stop replaces it.
+    /// state behind; the request to stop replaces it. Any user may hold the state file open,
+    /// which keeps the old report in place.
     fn record_stop(&self, name: &str) -> Result<()> {
         let path = self.layout.state(name);
         let instance = scm::query(&self.service_name(name))?.and_then(|found| found.instance);
@@ -658,9 +667,13 @@ impl Backend {
         state.pid = None;
         state.reason = STOPPED.into();
         state.updated_at = Utc::now();
-        files::write_state(&path, &state)?;
+        let written = write_state_patiently(&path, &state);
         self.event(name, STOPPED);
-        Ok(())
+        written.map_err(|_| {
+            anyhow!(
+                "Stopped {name}, but its state file is in use by another program; `k3up status` may show the old state until it is released"
+            )
+        })
     }
 
     fn metrics(&self) -> Result<crate::metrics::Metrics> {
@@ -750,6 +763,16 @@ fn remove_if_present(path: &Path) -> Result<()> {
             Err(error).with_context(|| format!("Delete {}", path.display()))
         }
         _ => Ok(()),
+    }
+}
+
+fn write_state_patiently(path: &Path, state: &files::HostState) -> Result<()> {
+    let deadline = Instant::now() + STATE_WAIT;
+    loop {
+        match files::write_state(path, state) {
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            written => return written,
+        }
     }
 }
 
