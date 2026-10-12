@@ -656,10 +656,13 @@ impl Backend {
     fn record_stop(&self, name: &str) -> Result<()> {
         let path = self.layout.state(name);
         let instance = scm::query(&self.service_name(name))?.and_then(|found| found.instance);
-        let mut state = files::read_state(&path)
+        let read = files::read_state(&path);
+        // A file held open without sharing cannot be read, and may still report a live host.
+        let unread = read.is_none() && path.exists();
+        let mut state = read
             .filter(|state| state.instance == instance)
             .unwrap_or_default();
-        if state.state == State::Stopped {
+        if state.state == State::Stopped && !unread {
             return Ok(());
         }
         state.instance = instance;
