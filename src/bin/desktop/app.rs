@@ -303,13 +303,21 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    if enabled {
-                        login.register()
-                    } else {
-                        login.unregister()
+                    if !enabled {
+                        return login
+                            .unregister()
+                            .map(|()| false)
+                            .map_err(|error| format!("{error:#}"));
                     }
-                    .map(|()| enabled)
-                    .map_err(|error| format!("{error:#}"))
+                    login.register().map_err(|error| format!("{error:#}"))?;
+                    // `services enable` may have published services mode since the app opened.
+                    if k3up::services::machine_mode_on() {
+                        return Err(k3up::autostart::back_out(&login, true).map_or_else(
+                            |error| format!("{error:#}"),
+                            |()| "Services mode is on, so the login item was removed".into(),
+                        ));
+                    }
+                    Ok(true)
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))

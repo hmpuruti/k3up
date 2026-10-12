@@ -100,6 +100,93 @@ fn normalised(path: &Path) -> PathBuf {
     result
 }
 
+/// What a LocalSystem process inherits that decides where its paths lead: the machine PATH,
+/// and the values of variables such as `%PUBLIC%` that a shell expands in its arguments.
+#[derive(Debug, Clone, Default)]
+pub struct Inherited {
+    pub path: Option<String>,
+    pub variables: Vec<(String, String)>,
+}
+
+impl Inherited {
+    /// What services running as LocalSystem on this machine start with.
+    #[cfg(windows)]
+    pub fn local_system() -> Self {
+        const MACHINE: [&str; 14] = [
+            "ALLUSERSPROFILE",
+            "CommonProgramFiles",
+            "CommonProgramFiles(x86)",
+            "CommonProgramW6432",
+            "ComSpec",
+            "ProgramData",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "PUBLIC",
+            "SystemDrive",
+            "SystemRoot",
+            "windir",
+            "OS",
+        ];
+        let mut variables: Vec<(String, String)> = MACHINE
+            .iter()
+            .filter_map(|name| Some((name.to_string(), std::env::var(name).ok()?)))
+            .collect();
+        if let Ok(root) = std::env::var("SystemRoot") {
+            let profile = format!(r"{root}\System32\config\systemprofile");
+            variables.extend([
+                ("USERPROFILE".into(), profile.clone()),
+                ("APPDATA".into(), format!(r"{profile}\AppData\Roaming")),
+                ("LOCALAPPDATA".into(), format!(r"{profile}\AppData\Local")),
+                ("TEMP".into(), format!(r"{root}\TEMP")),
+                ("TMP".into(), format!(r"{root}\TEMP")),
+            ]);
+        }
+        Self {
+            path: crate::win32::machine_path(),
+            variables,
+        }
+    }
+}
+
+/// Replaces each `%NAME%` that `lookup` knows, as cmd.exe expands it, ignoring case. Unknown
+/// names are left as written.
+pub fn expand(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut expanded = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('%') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
+            break;
+        };
+        let name = &after[..end];
+        expanded.push_str(&rest[..start]);
+        match (!name.is_empty()).then(|| lookup(name)).flatten() {
+            Some(value) => {
+                expanded.push_str(&value);
+                rest = &after[end + 1..];
+            }
+            None => {
+                expanded.push('%');
+                rest = after;
+            }
+        }
+    }
+    expanded.push_str(rest);
+    expanded
+}
+
+/// A variable as the workload's process sees it: its own environment first, then what it
+/// inherits.
+fn variable(workload: &Workload, inherited: &Inherited, name: &str) -> Option<String> {
+    workload
+        .environment
+        .iter()
+        .chain(inherited.variables.iter().map(|(key, value)| (key, value)))
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
 /// The folders the process searches for a command given by bare name: the workload's own
 /// PATH when it sets one, otherwise `machine_path`, which LocalSystem inherits. Relative
 /// entries resolve against the working folder, as the search does.
@@ -128,12 +215,12 @@ pub fn search_folders(workload: &Workload, machine_path: Option<String>) -> Vec<
         .collect()
 }
 
-/// Every path the workload's process runs or may load code from, once each. `machine_path`
-/// is the PATH LocalSystem inherits when the workload sets none.
+/// Every path the workload's process runs or may load code from, once each. Arguments are
+/// read after expanding `%NAME%` variables, as a shell such as cmd.exe would.
 pub fn inspected(
     workload: &Workload,
     exists: impl Fn(&Path) -> bool,
-    machine_path: Option<String>,
+    inherited: &Inherited,
 ) -> Vec<Exposure> {
     // A definition the caller may not read arrives with its paths left empty.
     if workload.executable.is_empty() {
@@ -143,21 +230,22 @@ pub fn inspected(
         path: workload.executable.clone().into(),
         what: Use::Program,
     };
-    let arguments = path_arguments(
-        &workload.args,
-        Path::new(&workload.working_directory),
-        exists,
-    )
-    .into_iter()
-    .map(|path| Exposure {
-        path,
-        what: Use::Argument,
-    });
+    let args: Vec<String> = workload
+        .args
+        .iter()
+        .map(|arg| expand(arg, |name| variable(workload, inherited, name)))
+        .collect();
+    let arguments = path_arguments(&args, Path::new(&workload.working_directory), exists)
+        .into_iter()
+        .map(|path| Exposure {
+            path,
+            what: Use::Argument,
+        });
     let folder = Exposure {
         path: workload.working_directory.clone().into(),
         what: Use::Folder,
     };
-    let searched = search_folders(workload, machine_path)
+    let searched = search_folders(workload, inherited.path.clone())
         .into_iter()
         .map(|path| Exposure {
             path,
@@ -183,7 +271,7 @@ pub fn inspected(
 pub fn exposed_paths(workload: &Workload) -> Vec<Exposure> {
     #[cfg(windows)]
     {
-        inspected(workload, |path| path.exists(), crate::win32::machine_path())
+        inspected(workload, |path| path.exists(), &Inherited::local_system())
             .into_iter()
             .filter(|exposure| crate::win32::changeable_by_others(&exposure.path))
             .collect()
@@ -325,7 +413,7 @@ mod tests {
             args: vec![text(&script), text(&program), text(&folder)],
             ..Default::default()
         };
-        let found = inspected(&workload, |_| true, None);
+        let found = inspected(&workload, |_| true, &Inherited::default());
         let paths: Vec<_> = found
             .iter()
             .map(|exposure| (exposure.path.clone(), exposure.what))
@@ -374,9 +462,51 @@ mod tests {
             search_folders(&workload, machine),
             [tools, folder.join("local").join("bin")]
         );
-        let found = inspected(&workload, |_| false, None);
+        let found = inspected(&workload, |_| false, &Inherited::default());
         assert!(found.iter().any(|exposure| exposure.what == Use::SearchPath
             && exposure.path == folder.join("local").join("bin")));
+    }
+
+    #[test]
+    fn variables_expand_as_cmd_expands_them() {
+        let lookup = |name: &str| match name.to_ascii_uppercase().as_str() {
+            "PUBLIC" => Some("P".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(expand("%PUBLIC%\\job.cmd", lookup), "P\\job.cmd");
+        assert_eq!(expand("%public%/a/%Public%", lookup), "P/a/P");
+        assert_eq!(expand("%UNKNOWN%\\x%PUBLIC%", lookup), "%UNKNOWN%\\xP");
+        assert_eq!(expand("100% sure %EMPTY%.", lookup), "100% sure .");
+        assert_eq!(expand("%%PUBLIC%", lookup), "%P");
+        assert_eq!(expand("plain", lookup), "plain");
+    }
+
+    #[test]
+    fn arguments_are_read_after_expansion_with_the_workloads_own_values_first() {
+        let public = absolute("public");
+        let own = absolute("own");
+        let mut workload = Workload {
+            name: "web".into(),
+            executable: text(&absolute("cmd.exe")),
+            working_directory: text(&absolute("work")),
+            args: vec!["-c".into(), "%PUBLIC%/job.cmd".into()],
+            ..Default::default()
+        };
+        let inherited = Inherited {
+            path: None,
+            variables: vec![("PUBLIC".into(), text(&public))],
+        };
+        let arguments = |workload: &Workload| -> Vec<PathBuf> {
+            inspected(workload, |_| false, &inherited)
+                .into_iter()
+                .filter(|exposure| exposure.what == Use::Argument)
+                .map(|exposure| exposure.path)
+                .collect()
+        };
+        assert_eq!(arguments(&workload), [public.join("job.cmd")]);
+        workload.environment.insert("Public".into(), text(&own));
+        assert_eq!(arguments(&workload), [own.join("job.cmd")]);
     }
 
     #[test]
@@ -385,12 +515,15 @@ mod tests {
             name: "web".into(),
             ..Default::default()
         };
-        assert!(inspected(&hidden, |_| true, None).is_empty());
+        assert!(inspected(&hidden, |_| true, &Inherited::default()).is_empty());
         assert!(
             inspected(
                 &hidden,
                 |_| true,
-                Some(std::env::temp_dir().display().to_string())
+                &Inherited {
+                    path: Some(std::env::temp_dir().display().to_string()),
+                    variables: vec![],
+                },
             )
             .is_empty()
         );
