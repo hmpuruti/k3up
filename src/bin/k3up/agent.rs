@@ -102,6 +102,7 @@ pub fn install(client: &Client) -> Result<Response> {
     login.register()?;
     login.start()?;
     let info = wait_until_answering(client)?;
+    back_out_if_services_mode(client, &login, true)?;
     Ok(Response {
         message: format!(
             "Agent registered to start at login and running (pid {})",
@@ -147,6 +148,9 @@ pub fn start(client: &Client) -> Result<Response> {
         login.launch()?;
     }
     let info = wait_until_answering(client)?;
+    if managed(client) {
+        back_out_if_services_mode(client, &login, false)?;
+    }
     Ok(Response {
         message: format!(
             "Agent running (pid {})",
@@ -159,6 +163,26 @@ pub fn start(client: &Client) -> Result<Response> {
 pub fn stop(client: &Client, timeout: u64) -> Result<Response> {
     let login = login_for_data(client);
     Ok(Response::success(shutdown(client, &login, timeout)?))
+}
+
+/// `services enable` may have published services mode while this agent was starting. The
+/// agent then stops again, so its workloads never run beside the services.
+fn back_out_if_services_mode(client: &Client, login: &LoginAgent, registered: bool) -> Result<()> {
+    if !services_mode() {
+        return Ok(());
+    }
+    if registered {
+        login.unregister()?;
+    }
+    shutdown(client, login, 60)?;
+    bail!(
+        "Services mode was turned on while the agent was starting, so the agent was stopped{}. Run workloads as Windows services with `k3up apply`",
+        if registered {
+            " and its login item removed"
+        } else {
+            ""
+        }
+    )
 }
 
 fn shutdown(client: &Client, login: &LoginAgent, timeout: u64) -> Result<String> {

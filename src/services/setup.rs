@@ -149,6 +149,9 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
         },
         || {
             prepare_folders(data)?;
+            // `agent install` may have run since the first check; this is the last moment
+            // before services mode is published.
+            refuse_user_agent_in(&crate::platform::user_agent_dir()?)?;
             super::record(&mut Records(data), registered.is_some())?;
             Ok(vec![format!("Services mode is on for {}", data.display())])
         },
