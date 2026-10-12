@@ -16,10 +16,11 @@ pub struct Exposure {
     pub what: Use,
 }
 
-/// Arguments that name an existing file or folder, either whole or as the value of an option
-/// such as `--config=C:\app\config.ps1`. A relative path is resolved against `folder`, as
-/// Windows resolves it for the process. One that resolves to `folder` or a folder above it is
-/// left out, since those are inspected anyway.
+/// Arguments that name a file or folder, either whole or as the value of an option such as
+/// `--config=C:\app\config.ps1`: any that exists, and any that clearly looks like a path even
+/// though it doesn't exist yet, since someone could create it before the next start. A
+/// relative path is resolved against `folder`, as Windows resolves it for the process. One that
+/// resolves to `folder` or a folder above it is left out, since those are inspected anyway.
 pub fn path_arguments(
     args: &[String],
     folder: &Path,
@@ -28,13 +29,46 @@ pub fn path_arguments(
     args.iter()
         .filter_map(|arg| {
             let value = arg.split_once('=').map(|(_, value)| value);
-            [Some(arg.as_str()), value]
+            let candidates: Vec<(PathBuf, bool)> = [Some(arg.as_str()), value]
                 .into_iter()
                 .flatten()
-                .filter_map(|text| resolved(Path::new(text), folder))
-                .find(|path| exists(path))
+                .filter_map(|text| {
+                    Some((resolved(Path::new(text), folder)?, looks_like_path(text)))
+                })
+                .collect();
+            candidates
+                .iter()
+                .find(|(path, _)| exists(path))
+                .or_else(|| candidates.iter().find(|(_, path_like)| *path_like))
+                .map(|(path, _)| path.clone())
         })
         .collect()
+}
+
+/// Extensions of files that run or load code.
+const CODE: [&str; 16] = [
+    "bat", "cmd", "com", "dll", "exe", "jar", "js", "pl", "ps1", "psm1", "py", "pyw", "rb", "sh",
+    "vbs", "wsf",
+];
+
+/// Whether `text` names a path even if nothing is there yet: an absolute path, one with a
+/// folder separator, or a file name with a code extension. Switches such as `-File` and `/c`
+/// and URLs are not paths.
+fn looks_like_path(text: &str) -> bool {
+    if text.contains("://") {
+        return false;
+    }
+    if Path::new(text).is_absolute() {
+        return true;
+    }
+    if text.is_empty() || text.starts_with(['-', '/']) {
+        return false;
+    }
+    text.contains(['\\', '/'])
+        || Path::new(text)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| CODE.contains(&extension.to_ascii_lowercase().as_str()))
 }
 
 fn resolved(path: &Path, folder: &Path) -> Option<PathBuf> {
@@ -162,7 +196,14 @@ mod tests {
         ];
         assert_eq!(
             path_arguments(&args, &absolute("work"), exists),
-            [script, config, folder]
+            [
+                script,
+                config,
+                folder,
+                absolute("work").join("relative").join("job.ps1"),
+                absolute("missing.ps1"),
+                absolute("missing.log"),
+            ]
         );
     }
 
@@ -195,9 +236,35 @@ mod tests {
         ];
         assert_eq!(
             path_arguments(&args, &folder, exists),
-            [above, bare, option]
+            [
+                above,
+                bare,
+                option,
+                folder.join("missing.ps1"),
+                folder.join("logs").join("missing.log"),
+            ]
         );
         assert!(path_arguments(&["job.ps1".into()], Path::new("work"), |_| true).is_empty());
+    }
+
+    #[test]
+    fn switches_urls_and_plain_words_are_not_paths() {
+        for text in [
+            "-File",
+            "https://example.com/a.ps1",
+            "relative.txt",
+            "web",
+            "",
+        ] {
+            assert!(!looks_like_path(text), "{text}");
+        }
+        // On Windows a leading slash starts a switch; elsewhere it starts an absolute path.
+        if cfg!(windows) {
+            assert!(!looks_like_path("/c") && !looks_like_path("/S"));
+        }
+        for text in ["scripts\\job.cmd", "scripts/job.cmd", "job.PS1", "tool.exe"] {
+            assert!(looks_like_path(text), "{text}");
+        }
     }
 
     #[test]
