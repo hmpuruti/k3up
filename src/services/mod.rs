@@ -1,5 +1,6 @@
 //! Services mode: on Windows, each workload is its own Windows service, run by k3up-host and
 //! managed through the service manager, with no central agent.
+pub mod exposure;
 pub mod files;
 pub mod status;
 

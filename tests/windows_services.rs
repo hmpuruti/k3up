@@ -8,7 +8,7 @@ use k3up::{
         Kind, Manifest, Restart, RestartBackoff, RestartLimit, Schedule, State, Status, Workload,
     },
     protocol::{Command, Response},
-    services::{Backend, Settings, files, scm, setup},
+    services::{Backend, Settings, exposure, files, scm, setup},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -589,6 +589,121 @@ fn the_command_line_talks_to_services_in_process() {
     machine.cli_response(&["stop", "cli"]);
     machine.cli_response(&["remove", "cli"]);
     assert!(machine.cli_response(&["list"]).workloads.is_empty());
+}
+
+fn system_cmd() -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32")
+        .join("cmd.exe")
+}
+
+/// A folder beside the data directory in which users may change everything.
+fn open_folder(machine: &Machine) -> PathBuf {
+    let open = machine.data.parent().unwrap().join("open");
+    std::fs::create_dir(&open).unwrap();
+    icacls(&open, &["/grant", "*S-1-5-32-545:(OI)(CI)M"]);
+    open
+}
+
+fn warnings(message: &str) -> Vec<&str> {
+    message
+        .lines()
+        .filter(|line| line.starts_with("Warning: "))
+        .collect()
+}
+
+#[test]
+fn a_program_users_may_change_is_created_with_a_warning() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let program = open_folder(&machine).join("cmd.exe");
+    std::fs::copy(system_cmd(), &program).unwrap();
+    let data = machine.data.to_string_lossy().into_owned();
+    let created = machine.cli_response(&[
+        "create",
+        "open",
+        "--exe",
+        &program.to_string_lossy(),
+        "--cwd",
+        &data,
+        "--",
+        "/c",
+        "exit",
+        "0",
+    ]);
+    assert_eq!(
+        warnings(&created.message),
+        [exposure::warning_line("open", &program)]
+    );
+
+    let (success, health) = machine.cli(&["health"]);
+    assert!(success, "{health}");
+    let health: serde_json::Value = serde_json::from_str(&health).unwrap();
+    assert_eq!(health["status"], "warning");
+    let expected = format!(
+        "open runs as SYSTEM using {}, which users who aren't administrators can change",
+        program.display()
+    );
+    assert!(
+        health["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["kind"] == "program" && warning["message"] == expected.as_str()),
+        "{health}"
+    );
+}
+
+#[test]
+fn only_scripts_users_may_change_are_warned_about() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let protected = machine.data.parent().unwrap().join("protected");
+    k3up::win32::create_dir_with(&protected, k3up::win32::PRIVATE_DIR_SDDL).unwrap();
+    let kept = protected.join("job.cmd");
+    std::fs::write(&kept, "exit 0").unwrap();
+    k3up::win32::set_owner_to_administrators(&kept).unwrap();
+    let open = open_folder(&machine).join("job.cmd");
+    std::fs::write(&open, "exit 0").unwrap();
+
+    let cmd = system_cmd().to_string_lossy().into_owned();
+    let data = machine.data.to_string_lossy().into_owned();
+    let create = |name: &str, script: &Path| {
+        machine
+            .cli_response(&[
+                "create",
+                name,
+                "--exe",
+                &cmd,
+                "--cwd",
+                &data,
+                "--",
+                "/c",
+                &script.to_string_lossy(),
+            ])
+            .message
+    };
+    let quiet = create("quiet", &kept);
+    assert!(warnings(&quiet).is_empty(), "{quiet}");
+    let warned = create("warned", &open);
+    assert_eq!(warnings(&warned), [exposure::warning_line("warned", &open)]);
+
+    let option = Workload {
+        name: "option".into(),
+        executable: cmd.clone(),
+        working_directory: data.clone(),
+        args: vec![format!("--script={}", open.display())],
+        ..Default::default()
+    };
+    assert_eq!(
+        exposure::exposed_paths(&option),
+        [exposure::Exposure {
+            path: open.clone(),
+            what: exposure::Use::Argument,
+        }]
+    );
 }
 
 fn elevated() -> bool {

@@ -8,6 +8,7 @@ use k3up::{
     client::Client,
     model::{Kind, Manifest, Missed, Schedule, State, Status, Workload},
     protocol::{Command, Response},
+    services::exposure,
 };
 use std::{
     io::Write,
@@ -39,13 +40,33 @@ pub fn create(client: &Client, request: Create) -> Result<Response> {
     apply_flags(&mut workload, &request.flags)?;
     workload.validate()?;
     let response = client.send(Command::Put {
-        workload: Box::new(workload),
+        workload: Box::new(workload.clone()),
         create_only: true,
     })?;
     if !response.ok || !request.start {
-        return Ok(response);
+        return Ok(warn_exposed(client, &[workload], response));
     }
-    start(client, &request.name, request.wait, request.timeout)
+    let started = start(client, &request.name, request.wait, request.timeout)?;
+    Ok(warn_exposed(client, &[workload], started))
+}
+
+/// In services mode, adds a warning line for each path of `workloads` that users who aren't
+/// administrators may change, since the workloads run as SYSTEM.
+pub fn warn_exposed(client: &Client, workloads: &[Workload], response: Response) -> Response {
+    if !response.ok || !k3up::services::active(&client.data_dir) {
+        return response;
+    }
+    let lines: Vec<String> = workloads
+        .iter()
+        .flat_map(|workload| exposure::warning_lines(workload, &exposure::exposed_paths(workload)))
+        .collect();
+    if lines.is_empty() {
+        return response;
+    }
+    Response {
+        message: format!("{}\n{}", response.message, lines.join("\n")),
+        ..response
+    }
 }
 
 pub struct Edit {
@@ -66,9 +87,7 @@ pub struct Edit {
 }
 
 pub fn edit(client: &Client, request: Edit) -> Result<Response> {
-    let name = request.name.clone();
-    let current = get(client, &name)?;
-    let live = current.pid.is_some() || current.desired_running;
+    let current = get(client, &request.name)?;
     let mut workload = current.workload.clone();
     if request.clear_env {
         workload.environment.clear();
@@ -105,15 +124,27 @@ pub fn edit(client: &Client, request: Edit) -> Result<Response> {
         workload.args = request.args;
     }
     workload.validate()?;
+    let response = save_edit(client, &current, workload.clone(), request.restart_running)?;
+    Ok(warn_exposed(client, &[workload], response))
+}
+
+fn save_edit(
+    client: &Client,
+    current: &Status,
+    workload: Workload,
+    restart_running: bool,
+) -> Result<Response> {
+    let name = current.workload.name.clone();
+    let live = current.pid.is_some() || current.desired_running;
     if workload == current.workload {
         return Ok(Response::success("No changes"));
     }
     // Labels apply to a running workload at once, unless a restart was asked for anyway.
     let relabel = current.workload.only_labels_differ(&workload);
-    if !live || (relabel && !request.restart_running) {
+    if !live || (relabel && !restart_running) {
         return put(client, workload);
     }
-    if !request.restart_running {
+    if !restart_running {
         bail!(
             "'{name}' is {}. Stop it first, or pass --restart-running to stop it, apply the change and start it again",
             current.state

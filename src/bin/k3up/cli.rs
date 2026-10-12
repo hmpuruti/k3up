@@ -583,7 +583,9 @@ Report machine vitals, warnings and the workloads that need attention.
 
 Warnings use the same thresholds as the desktop app: memory above 85%, swap more than half
 used, less than 10% of the data volume free, or CPU at 90% or more for the whole of the last
-60 seconds. Workloads in the failed, backoff or blocked state need attention, and are listed
+60 seconds. In Windows services mode, a workload whose program, script or working folder
+users who aren't administrators can change is a warning of kind \"program\", since it runs as
+SYSTEM. Workloads in the failed, backoff or blocked state need attention, and are listed
 with their reason and last exit code.
 
 The status is \"ok\" when there are no warnings and nothing needs attention, and \"warning\"

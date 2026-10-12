@@ -404,6 +404,27 @@ pub fn writable_by_others(path: &Path) -> Result<bool> {
     Ok(pinned.security()?.others_may_change())
 }
 
+/// Whether an account other than SYSTEM, Administrators and TrustedInstaller may change
+/// `path`, or rename, delete or re-permission a folder above it. `None` when the permissions
+/// of `path` cannot be read. A folder whose permissions cannot be read counts as unchanged,
+/// so the answer never rests on a guess.
+pub fn changeable_by_others(path: &Path) -> Option<bool> {
+    let read = |path: &Path| {
+        Pinned::open(path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL)
+            .ok()?
+            .security()
+            .ok()
+    };
+    if !read(path)?.protected() {
+        return Some(true);
+    }
+    Some(
+        path.ancestors()
+            .skip(1)
+            .any(|folder| read(folder).is_some_and(|security| !security.keeps_children_in_place())),
+    )
+}
+
 /// Opens a file to read it, without following a link, and only if it resolves to a path
 /// directly inside its folder as that folder resolves, so a link swapped in for the folder
 /// is caught. Others may read but not change or delete the file while it is open.

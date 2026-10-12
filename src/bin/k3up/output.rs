@@ -56,6 +56,12 @@ fn print_response(response: Response, json: bool) -> Result<bool> {
         println!("{text}");
     } else if !response.workloads.is_empty() {
         print_workloads(&response.workloads);
+        // `create --start` and `edit --restart-running` show the workload, not the message.
+        for line in response.message.lines() {
+            if line.starts_with("Warning: ") {
+                eprintln!("{line}");
+            }
+        }
     } else if !response.events.is_empty() {
         for event in response.events {
             println!(

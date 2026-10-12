@@ -5,12 +5,16 @@ use crate::{
 use anyhow::{Result, bail};
 use k3up::{
     client::Client,
-    health::{Report, Verdict},
+    health::{Report, Verdict, Warning, program_warning},
     metrics::{Metrics, WorkloadUsage},
     model::Status,
     protocol::{Command, Response},
+    services::exposure,
 };
-use std::time::{Duration, Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 /// The agent's first sample needs a CPU baseline, so a fresh agent may have none yet.
 /// Asking switches the agent to fast sampling, so a stale sample is replaced within seconds.
@@ -217,13 +221,30 @@ fn spread(values: impl Iterator<Item = f64>) -> (f64, f64, f64) {
 pub fn health(client: &Client, strict: bool) -> Result<Outcome> {
     let metrics = fresh_metrics(client, true)?;
     let statuses = checked(client.send(Command::List)?)?.workloads;
-    let report = k3up::health::assess(&metrics, &statuses);
+    let programs = if k3up::services::active(&client.data_dir) {
+        program_warnings(&statuses)
+    } else {
+        vec![]
+    };
+    let report = k3up::health::assess(&metrics, &statuses, programs);
     let ok = !strict || report.status == Verdict::Ok;
     Ok(Outcome::Custom {
         text: health_lines(&report, &metrics),
         json: serde_json::to_value(&report)?,
         ok,
     })
+}
+
+/// Users without administrator rights get no definitions, so there is nothing to inspect.
+fn program_warnings(statuses: &[Status]) -> Vec<Warning> {
+    statuses
+        .iter()
+        .filter_map(|status| {
+            let exposed = exposure::exposed_paths(&status.workload);
+            let paths: Vec<&Path> = exposed.iter().map(|found| found.path.as_path()).collect();
+            (!paths.is_empty()).then(|| program_warning(&status.workload.name, &paths))
+        })
+        .collect()
 }
 
 fn health_lines(report: &Report, metrics: &Metrics) -> String {
