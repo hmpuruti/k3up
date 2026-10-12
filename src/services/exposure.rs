@@ -9,6 +9,8 @@ pub enum Use {
     /// The program's own folder, where Windows looks first for the DLLs the program loads.
     ProgramFolder,
     Argument,
+    /// An argument still holding a variable K3 Up can't expand, so its path can't be checked.
+    Unresolved,
     Folder,
     /// A folder on the PATH the process searches for commands it runs by bare name.
     SearchPath,
@@ -169,14 +171,19 @@ impl Inherited {
     }
 }
 
-/// Replaces each `%NAME%` that `lookup` knows, as cmd.exe expands it, ignoring case. Unknown
-/// names are left as written.
+/// Replaces each `%NAME%`, and then each delayed `!NAME!`, that `lookup` knows, as cmd.exe
+/// expands them, ignoring case. Unknown names are left as written.
 pub fn expand(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let once = expand_between(text, '%', &lookup);
+    expand_between(&once, '!', &lookup)
+}
+
+fn expand_between(text: &str, mark: char, lookup: &impl Fn(&str) -> Option<String>) -> String {
     let mut expanded = String::new();
     let mut rest = text;
-    while let Some(start) = rest.find('%') {
+    while let Some(start) = rest.find(mark) {
         let after = &rest[start + 1..];
-        let Some(end) = after.find('%') else {
+        let Some(end) = after.find(mark) else {
             break;
         };
         let name = &after[..end];
@@ -187,13 +194,32 @@ pub fn expand(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
                 rest = &after[end + 1..];
             }
             None => {
-                expanded.push('%');
+                expanded.push(mark);
                 rest = after;
             }
         }
     }
     expanded.push_str(rest);
     expanded
+}
+
+/// Whether `text` still refers to a variable once expanded: an unknown `%NAME%` or `!NAME!`, a
+/// cmd modifier such as `%NAME:~0,3%`, or PowerShell's `$env:NAME`. Its path can't be known
+/// until the process runs.
+pub fn unresolved(text: &str) -> bool {
+    let between = |mark: char| {
+        let mut parts = text.split(mark).skip(1);
+        let mut found = false;
+        while let (Some(name), Some(_)) = (parts.next(), parts.clone().next()) {
+            if !name.is_empty() && !name.contains(char::is_whitespace) {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    let lower = text.to_ascii_lowercase();
+    between('%') || between('!') || lower.contains("$env:") || lower.contains("${env:")
 }
 
 /// A variable as the workload's process sees it: its own environment first, then what it
@@ -259,6 +285,13 @@ pub fn inspected(
         .iter()
         .map(|arg| expand(arg, |name| variable(workload, inherited, name)))
         .collect();
+    let unresolved_args = args
+        .iter()
+        .filter(|arg| unresolved(arg))
+        .map(|arg| Exposure {
+            path: arg.into(),
+            what: Use::Unresolved,
+        });
     let arguments = path_arguments(&args, Path::new(&workload.working_directory), exists)
         .into_iter()
         .map(|path| Exposure {
@@ -279,10 +312,12 @@ pub fn inspected(
     for candidate in std::iter::once(program)
         .chain(program_folder)
         .chain(arguments)
+        .chain(unresolved_args)
         .chain(std::iter::once(folder))
         .chain(searched)
     {
-        if candidate.path.is_absolute() && found.iter().all(|seen| seen.path != candidate.path) {
+        let checkable = candidate.what == Use::Unresolved || candidate.path.is_absolute();
+        if checkable && found.iter().all(|seen| seen.path != candidate.path) {
             found.push(candidate);
         }
     }
@@ -298,7 +333,10 @@ pub fn exposed_paths(workload: &Workload) -> Vec<Exposure> {
     {
         inspected(workload, |path| path.exists(), &Inherited::local_system())
             .into_iter()
-            .filter(|exposure| crate::win32::changeable_by_others(&exposure.path))
+            .filter(|exposure| {
+                exposure.what == Use::Unresolved
+                    || crate::win32::changeable_by_others(&exposure.path)
+            })
             .collect()
     }
     #[cfg(not(windows))]
@@ -315,10 +353,20 @@ pub fn warning_line(name: &str, path: &Path) -> String {
     )
 }
 
+pub fn unresolved_line(name: &str, text: &Path) -> String {
+    format!(
+        "Warning: {name} runs as SYSTEM and uses {}, which K3 Up can't resolve to a path to check. Make sure only administrators can change what it names.",
+        text.display()
+    )
+}
+
 pub fn warning_lines(workload: &Workload, exposed: &[Exposure]) -> Vec<String> {
     exposed
         .iter()
-        .map(|exposure| warning_line(&workload.name, &exposure.path))
+        .map(|exposure| match exposure.what {
+            Use::Unresolved => unresolved_line(&workload.name, &exposure.path),
+            _ => warning_line(&workload.name, &exposure.path),
+        })
         .collect()
 }
 
@@ -556,6 +604,46 @@ mod tests {
         assert_eq!(arguments(&workload), [public.join("job.cmd")]);
         workload.environment.insert("Public".into(), text(&own));
         assert_eq!(arguments(&workload), [own.join("job.cmd")]);
+    }
+
+    #[test]
+    fn delayed_variables_expand_and_unknown_ones_stay_unresolved() {
+        let lookup = |name: &str| (name.eq_ignore_ascii_case("OPEN")).then(|| "O".to_string());
+        assert_eq!(expand("!OPEN!\\job.cmd", lookup), "O\\job.cmd");
+        assert_eq!(expand("%OPEN%!open!", lookup), "OO");
+        for text in [
+            "%MISSING%\\job.cmd",
+            "!MISSING!\\job.cmd",
+            "%OPEN:~0,3%\\job.cmd",
+            "$env:OPEN\\job.ps1",
+            "${env:OPEN}\\job.ps1",
+        ] {
+            assert!(unresolved(&expand(text, lookup)), "{text}");
+        }
+        for text in ["100% sure", "Hi! Bye!", "plain", "O\\job.cmd"] {
+            assert!(!unresolved(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn unresolved_arguments_are_always_reported() {
+        let workload = Workload {
+            name: "web".into(),
+            executable: text(&absolute("cmd.exe")),
+            working_directory: text(&absolute("work")),
+            args: vec!["-c".into(), "!MISSING!\\job.cmd".into()],
+            ..Default::default()
+        };
+        let found = inspected(&workload, |_| false, &Inherited::default());
+        let unresolved: Vec<_> = found
+            .iter()
+            .filter(|exposure| exposure.what == Use::Unresolved)
+            .collect();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(
+            warning_lines(&workload, &[unresolved[0].clone()]),
+            [unresolved_line("web", Path::new("!MISSING!\\job.cmd"))]
+        );
     }
 
     #[test]
