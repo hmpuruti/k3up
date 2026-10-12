@@ -3,15 +3,15 @@ use super::{
     backend::{Backend, DEFAULT_PREFIX, Settings},
     files::{self, Layout},
     host,
-    pause::{Control, install_then_repair, refuse_running_jobs},
+    pause::{Control, install_then_repair, refuse_running_jobs, role, split_running},
     scm,
     status::Scm,
 };
+use crate::autostart::LoginAgent;
 use crate::win32::{
     MARKER_SDDL, PRIVATE_DIR_SDDL, ROOT_DIR_SDDL, SHARED_DIR_SDDL, reset_contents, secure_dir,
     set_security,
 };
-use crate::{autostart::LoginAgent, model::Kind};
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     collections::BTreeMap,
@@ -109,11 +109,7 @@ fn refuse_tampered(layout: &Layout) -> Result<()> {
 
 pub fn enable(data: &Path) -> Result<Vec<String>> {
     let settings = Settings::from_env()?;
-    if scm::exists(CENTRAL_AGENT)? {
-        bail!(
-            "The K3 Up agent service is installed. Run `k3up agent uninstall-service` first, then enable services mode"
-        );
-    }
+    refuse_central_agent_service()?;
     refuse_user_agent_in(&crate::platform::user_agent_dir()?)?;
     if !crate::win32::ancestors_protected(data) {
         bail!(
@@ -122,8 +118,10 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
         );
     }
     let _setup = setup_lock(&settings.prefix, SETUP_WAIT)?;
+    // `agent install-service` may have finished while this command waited for the lock.
+    refuse_central_agent_service()?;
     let registered = super::registered();
-    super::check_registration(registered.as_deref(), data)?;
+    super::check_registration(super::in_use().as_deref(), data)?;
     let _lock = lock_if_prepared(data)?;
     let target = install_dir()?;
     if target.exists() {
@@ -131,11 +129,7 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
     }
     let sources = program_sources(&target)?;
     let prefix = settings.prefix.as_str();
-    let (jobs, running): (Vec<String>, Vec<String>) = scm::list(prefix)?
-        .into_iter()
-        .filter(|service| matches!(service.scm, Scm::Running | Scm::Starting))
-        .filter_map(|service| Some(service.name.get(prefix.len()..)?.to_string()))
-        .partition(|name| is_job(data, name));
+    let (jobs, running) = running_workloads(data, prefix)?;
     refuse_running_jobs(&jobs)?;
     install_then_repair(
         &mut Services { prefix },
@@ -166,12 +160,38 @@ pub fn refuse_user_agent_in(folder: &Path) -> Result<()> {
     super::refuse_user_agent(own.registration(), own.is_running())
 }
 
-/// A definition that cannot be read counts as a service.
-fn is_job(data: &Path, name: &str) -> bool {
-    matches!(
-        files::read_definition(&Layout::new(data).definition(name)),
-        Ok(Some(workload)) if workload.kind == Kind::Job
-    )
+fn refuse_central_agent_service() -> Result<()> {
+    if scm::exists(CENTRAL_AGENT)? {
+        bail!(
+            "The K3 Up agent service is installed. Run `k3up agent uninstall-service` first, then enable services mode"
+        );
+    }
+    Ok(())
+}
+
+/// The workloads in `data` whose services run or are starting, as jobs and services. Refuses
+/// when a definition can't be read, since that workload may be a job.
+pub fn running_workloads(data: &Path, prefix: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let layout = Layout::new(data);
+    let running = scm::list(prefix)?
+        .into_iter()
+        .filter(|service| matches!(service.scm, Scm::Running | Scm::Starting))
+        .filter_map(|service| Some(service.name.get(prefix.len()..)?.to_string()))
+        .map(|name| {
+            let role = role(&files::read_definition(&layout.definition(&name)));
+            (name, role)
+        })
+        .collect();
+    split_running(running)
+}
+
+/// Takes the setup lock for the legacy central agent service, so that it and `services
+/// enable` never both finish, and refuses it while services mode is on.
+pub fn central_agent_lock() -> Result<crate::win32::HeldMutex> {
+    let prefix = Settings::from_env()?.prefix;
+    let held = setup_lock(&prefix, SETUP_WAIT)?;
+    super::refuse_central_agent(super::machine_mode_on(), !scm::list(&prefix)?.is_empty())?;
+    Ok(held)
 }
 
 /// The machine-wide record and the marker for `data`. Only `enable` and `disable` touch the
@@ -197,6 +217,16 @@ impl super::Records for Records<'_> {
 
     fn mark(&mut self) -> Result<()> {
         mark(self.0)
+    }
+
+    fn unmark(&mut self) -> Result<()> {
+        let marker = Layout::new(self.0).marker();
+        match std::fs::remove_file(&marker) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("Delete {}", marker.display()))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -354,12 +384,13 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 pub fn disable(data: &Path) -> Result<String> {
     let settings = Settings::from_env()?;
     let _setup = setup_lock(&settings.prefix, SETUP_WAIT)?;
-    if let Some(registered) = super::registered() {
-        super::check_registration(Some(data), &registered).map_err(|_| {
+    let registered = super::registered();
+    if let Some(used) = super::in_use() {
+        super::check_registration(Some(data), &used).map_err(|_| {
             anyhow!(
                 "Services mode uses {}. Turn it off there with --data-dir \"{}\"",
-                registered.display(),
-                registered.display()
+                used.display(),
+                used.display()
             )
         })?;
     }
@@ -375,14 +406,7 @@ pub fn disable(data: &Path) -> Result<String> {
             names.join("\n")
         );
     }
-    let marker = Layout::new(data).marker();
-    match std::fs::remove_file(&marker) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(error).with_context(|| format!("Delete {}", marker.display()));
-        }
-        _ => {}
-    }
-    unregister()?;
+    super::unrecord(&mut Records(data), registered.is_some())?;
     Ok(format!(
         "Services mode is off. Definitions, logs and history are kept in {}",
         data.display()

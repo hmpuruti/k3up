@@ -164,17 +164,43 @@ pub fn registered() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Whether services mode is on anywhere on this machine: recorded in the registry, or, for a
-/// directory set up before that record existed, marked in the default machine directory.
+/// Whether services mode is on anywhere on this machine.
 pub fn machine_mode_on() -> bool {
+    in_use().is_some()
+}
+
+/// The data directory services mode is on for: the one recorded in the registry, or, for an
+/// installation set up before that record existed, the default machine directory when it
+/// holds a trusted marker.
+pub fn in_use() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        registered().is_some() || active(&crate::platform::machine_data_dir())
+        let default = crate::platform::machine_data_dir();
+        let marked = active(&default);
+        current(registered(), &default, marked)
     }
     #[cfg(not(windows))]
     {
-        false
+        None
     }
+}
+
+pub fn current(
+    registered: Option<std::path::PathBuf>,
+    default: &Path,
+    default_marked: bool,
+) -> Option<std::path::PathBuf> {
+    registered.or_else(|| default_marked.then(|| default.to_path_buf()))
+}
+
+/// Refuses the legacy central agent service while workloads run as their own services.
+pub fn refuse_central_agent(services_mode: bool, workload_services: bool) -> Result<()> {
+    if services_mode || workload_services {
+        anyhow::bail!(
+            "Services mode is on; the central agent service can't be installed alongside it"
+        );
+    }
+    Ok(())
 }
 
 /// Refuses services mode for `requested` while it is on for another directory.
@@ -206,6 +232,7 @@ pub trait Records {
     fn register(&mut self) -> Result<()>;
     fn unregister(&mut self) -> Result<()>;
     fn mark(&mut self) -> Result<()>;
+    fn unmark(&mut self) -> Result<()>;
 }
 
 /// Writes the registry value before the marker, so that a marked directory is always one
@@ -225,6 +252,27 @@ pub fn record(records: &mut impl Records, registered: bool) -> Result<()> {
         Ok(()) => Err(error),
         Err(undo) => Err(anyhow::anyhow!(
             "{error:#}\nRemoving the services mode record from the registry failed too: {undo:#}"
+        )),
+    }
+}
+
+/// Removes the registry value before the marker, the reverse of `record`, so that a failure
+/// never leaves a registered directory that ordinary commands no longer recognise. When the
+/// marker cannot be removed, the value is put back.
+pub fn unrecord(records: &mut impl Records, registered: bool) -> Result<()> {
+    if registered {
+        records.unregister()?;
+    }
+    let Err(error) = records.unmark() else {
+        return Ok(());
+    };
+    if !registered {
+        return Err(error);
+    }
+    match records.register() {
+        Ok(()) => Err(error),
+        Err(undo) => Err(anyhow::anyhow!(
+            "{error:#}\nPutting the services mode record back in the registry failed too: {undo:#}"
         )),
     }
 }
@@ -444,6 +492,10 @@ mod tests {
         fn mark(&mut self) -> Result<()> {
             self.call("mark")
         }
+
+        fn unmark(&mut self) -> Result<()> {
+            self.call("unmark")
+        }
     }
 
     fn recorded(fail: &[&'static str], registered: bool) -> (Vec<&'static str>, Option<String>) {
@@ -488,6 +540,91 @@ mod tests {
             recorded(&["mark"], true),
             (vec!["mark"], Some("mark failed".into()))
         );
+    }
+
+    fn unrecorded(fail: &[&'static str], registered: bool) -> (Vec<&'static str>, Option<String>) {
+        let mut fake = FakeRecords {
+            fail: fail.to_vec(),
+            ..Default::default()
+        };
+        let result = unrecord(&mut fake, registered);
+        (fake.calls, result.err().map(|error| error.to_string()))
+    }
+
+    #[test]
+    fn the_registry_value_is_removed_before_the_marker() {
+        assert_eq!(unrecorded(&[], true), (vec!["unregister", "unmark"], None));
+        assert_eq!(
+            unrecorded(&["unregister"], true),
+            (vec!["unregister"], Some("unregister failed".into()))
+        );
+        assert_eq!(
+            unrecorded(&["unmark"], true),
+            (
+                vec!["unregister", "unmark", "register"],
+                Some("unmark failed".into())
+            )
+        );
+        assert_eq!(
+            unrecorded(&["unmark", "register"], true),
+            (
+                vec!["unregister", "unmark", "register"],
+                Some(
+                    "unmark failed\nPutting the services mode record back in the registry failed too: register failed"
+                        .into()
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn a_directory_without_a_registry_value_only_loses_its_marker() {
+        assert_eq!(unrecorded(&[], false), (vec!["unmark"], None));
+        assert_eq!(
+            unrecorded(&["unmark"], false),
+            (vec!["unmark"], Some("unmark failed".into()))
+        );
+    }
+
+    #[test]
+    fn a_marked_default_directory_counts_as_registered() {
+        let base = std::env::temp_dir();
+        let default = base.join("K3 Up");
+        let other = base.join("Other");
+        assert_eq!(current(None, &default, false), None);
+        assert_eq!(current(None, &default, true), Some(default.clone()));
+        assert_eq!(
+            current(Some(other.clone()), &default, true),
+            Some(other.clone())
+        );
+
+        let legacy = current(None, &default, true);
+        let registered = current(Some(default.clone()), &default, false);
+        let refused = |registration: &Option<PathBuf>| {
+            check_registration(registration.as_deref(), &other)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(refused(&legacy), refused(&registered));
+        check_registration(legacy.as_deref(), &default).unwrap();
+        // Enabling the default directory then writes the registry value, which migrates it.
+        assert_eq!(recorded(&[], false), (vec!["register", "mark"], None));
+    }
+
+    #[test]
+    fn the_central_agent_service_is_refused_in_services_mode() {
+        refuse_central_agent(false, false).unwrap();
+        for (services_mode, workload_services) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                refuse_central_agent(services_mode, workload_services)
+                    .unwrap_err()
+                    .to_string(),
+                "Services mode is on; the central agent service can't be installed alongside it"
+            );
+        }
+        if cfg!(not(windows)) {
+            assert_eq!(in_use(), None);
+        }
     }
 
     #[test]

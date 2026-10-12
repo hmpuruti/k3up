@@ -34,11 +34,14 @@ fn fixture() {
                 .and_then(|code| code.parse().ok())
                 .unwrap_or(1),
         ),
-        "pulse" => loop {
-            println!("tick");
-            std::io::stdout().flush().unwrap();
-            std::thread::sleep(Duration::from_millis(200));
-        },
+        "pulse" => {
+            println!("pid {}", std::process::id());
+            loop {
+                println!("tick");
+                std::io::stdout().flush().unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
         _ => panic!("Fixture requires K3UP_FIXTURE"),
     }
 }
@@ -1945,4 +1948,80 @@ fn a_command_line_or_account_changed_outside_k3up_is_restored() {
         name: "binpath".into(),
     });
     machine.until("binpath", |status| status.state == State::Running);
+}
+
+#[test]
+fn a_state_file_held_while_the_workload_starts_is_written_once_released() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(machine.put(machine.workload("late", "pulse")).ok);
+    let state = machine.data.join("state").join("late.json");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&state)
+        .unwrap();
+    machine.ok(Command::Start {
+        name: "late".into(),
+    });
+    machine.until_logged("late", "pid ");
+    let pid = machine
+        .log("late")
+        .lines()
+        .filter_map(|line| line.strip_prefix("pid ")?.trim().parse::<u32>().ok())
+        .next_back();
+    std::thread::sleep(Duration::from_secs(3));
+    let waiting = machine.get("late");
+    assert_eq!(waiting.state, State::Pending, "{waiting:?}");
+    assert_eq!(waiting.pid, None);
+    assert!(machine.log("late").contains("State not saved yet"));
+
+    drop(held);
+    let released = Instant::now();
+    let running = machine.until("late", |status| status.state == State::Running);
+    assert!(
+        released.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        released.elapsed()
+    );
+    assert_eq!(running.pid, pid);
+}
+
+#[test]
+fn a_running_workload_whose_definition_cannot_be_read_is_neither_job_nor_service() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let mut job = machine.workload("job", "pulse");
+    job.kind = Kind::Job;
+    for workload in [job, machine.workload("web", "pulse")] {
+        let name = workload.name.clone();
+        assert!(machine.put(workload).ok);
+        machine.ok(Command::Start { name: name.clone() });
+        machine.until(&name, |status| status.state == State::Running);
+    }
+    let split = || setup::running_workloads(&machine.data, &machine.prefix);
+    assert_eq!(
+        split().unwrap(),
+        (vec!["job".to_string()], vec!["web".to_string()])
+    );
+
+    let definition = machine.data.join("workloads").join("job.toml");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&definition)
+        .unwrap();
+    assert_eq!(
+        split().unwrap_err().to_string(),
+        "Can't read the definition of job to tell whether it is a job; try again when it is readable"
+    );
+    drop(held);
+    assert_eq!(split().unwrap().0, ["job"]);
 }

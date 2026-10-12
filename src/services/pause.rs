@@ -1,3 +1,4 @@
+use crate::model::{Kind, Workload};
 use anyhow::{Result, anyhow, bail};
 
 /// Stops and starts workload services. A trait so the bookkeeping in `while_stopped` can be
@@ -6,6 +7,46 @@ pub trait Control {
     /// True when this call stopped a running workload, false when it had already stopped.
     fn stop(&mut self, name: &str) -> Result<bool>;
     fn start(&mut self, name: &str) -> Result<()>;
+}
+
+/// What a running workload is, as its definition says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Job,
+    Service,
+    /// The definition could not be read or parsed.
+    Unknown,
+}
+
+/// A missing definition counts as a service, since nothing says it is a job.
+pub fn role(definition: &Result<Option<Workload>>) -> Role {
+    match definition {
+        Ok(Some(workload)) if workload.kind == Kind::Job => Role::Job,
+        Ok(_) => Role::Service,
+        Err(_) => Role::Unknown,
+    }
+}
+
+/// Splits running workloads into jobs and services. One whose role is unknown could be a job
+/// that stopping would cut short, so it refuses the whole change.
+pub fn split_running(running: Vec<(String, Role)>) -> Result<(Vec<String>, Vec<String>)> {
+    let unknown: Vec<String> = running
+        .iter()
+        .filter(|(_, role)| *role == Role::Unknown)
+        .map(|(name, _)| {
+            format!(
+                "Can't read the definition of {name} to tell whether it is a job; try again when it is readable"
+            )
+        })
+        .collect();
+    if !unknown.is_empty() {
+        bail!(unknown.join("\n"));
+    }
+    let (jobs, services): (Vec<_>, Vec<_>) = running
+        .into_iter()
+        .partition(|(_, role)| *role == Role::Job);
+    let names = |list: Vec<(String, Role)>| list.into_iter().map(|(name, _)| name).collect();
+    Ok((names(jobs), names(services)))
 }
 
 /// Stopping a job would cut its work short, and starting it again would repeat what it did.
@@ -157,6 +198,48 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "These jobs are running: backup, report. Wait for them to finish, or stop them, then run `k3up services enable` again"
+        );
+    }
+
+    #[test]
+    fn a_definition_that_cannot_be_read_is_neither_job_nor_service() {
+        let workload = |kind| Workload {
+            name: "w".into(),
+            kind,
+            ..Default::default()
+        };
+        assert_eq!(role(&Ok(Some(workload(Kind::Job)))), Role::Job);
+        assert_eq!(role(&Ok(Some(workload(Kind::Service)))), Role::Service);
+        assert_eq!(role(&Ok(None)), Role::Service);
+        assert_eq!(role(&Err(anyhow!("sharing violation"))), Role::Unknown);
+    }
+
+    #[test]
+    fn running_workloads_split_into_jobs_and_services_unless_one_is_unknown() {
+        let running = |roles: &[(&str, Role)]| {
+            roles
+                .iter()
+                .map(|(name, role)| (name.to_string(), *role))
+                .collect::<Vec<_>>()
+        };
+        let (jobs, services) = split_running(running(&[
+            ("backup", Role::Job),
+            ("web", Role::Service),
+            ("api", Role::Service),
+        ]))
+        .unwrap();
+        assert_eq!(jobs, ["backup"]);
+        assert_eq!(services, ["web", "api"]);
+
+        let error = split_running(running(&[
+            ("web", Role::Service),
+            ("backup", Role::Unknown),
+            ("report", Role::Unknown),
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Can't read the definition of backup to tell whether it is a job; try again when it is readable\nCan't read the definition of report to tell whether it is a job; try again when it is readable"
         );
     }
 

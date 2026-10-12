@@ -38,6 +38,7 @@ pub const EXIT_UNTRUSTED: u32 = 3;
 const POLL: Duration = Duration::from_millis(250);
 const ROTATE_EVERY: Duration = Duration::from_secs(10);
 const PENDING_LIMIT: usize = 100;
+const SAVE_RETRY_LIMIT: Duration = Duration::from_secs(2);
 
 static TARGET: OnceLock<(PathBuf, String, Option<String>)> = OnceLock::new();
 define_windows_service!(ffi_main, service_main);
@@ -94,6 +95,7 @@ fn service_main(arguments: Vec<OsString>) {
         },
         checkpoint: 0,
         pending: vec![],
+        unsaved: None,
     };
     let exit = host.run(&stopped);
     host.report(ServiceState::Stopped, exit, Duration::ZERO);
@@ -112,6 +114,32 @@ struct Host {
     checkpoint: u32,
     /// Events not written yet, oldest first.
     pending: Vec<String>,
+    /// Set while the state file holds an older state than `state`.
+    unsaved: Option<Retry>,
+}
+
+/// When to try writing the state file again, and how long to wait after that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Retry {
+    at: Instant,
+    delay: Duration,
+}
+
+impl Retry {
+    fn first(now: Instant) -> Self {
+        Self {
+            at: now + POLL,
+            delay: POLL,
+        }
+    }
+
+    fn next(self, now: Instant) -> Self {
+        let delay = (self.delay * 2).min(SAVE_RETRY_LIMIT);
+        Self {
+            at: now + delay,
+            delay,
+        }
+    }
 }
 
 impl Host {
@@ -257,6 +285,7 @@ impl Host {
                 self.record(State::Stopped, "Stopped by request");
                 return None;
             }
+            self.retry_save();
             let now = Utc::now();
             match process.poll() {
                 Ok(Some(code)) => {
@@ -325,8 +354,21 @@ impl Host {
     }
 
     /// Sleeps for the retry delay. Returns true when a stop request ended the wait.
-    fn pause(&self, delay: Duration, stop: &Receiver<()>) -> bool {
-        !matches!(stop.recv_timeout(delay), Err(RecvTimeoutError::Timeout))
+    fn pause(&mut self, delay: Duration, stop: &Receiver<()>) -> bool {
+        let deadline = Instant::now() + delay;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            if !matches!(
+                stop.recv_timeout(left.min(POLL)),
+                Err(RecvTimeoutError::Timeout)
+            ) {
+                return true;
+            }
+            self.retry_save();
+        }
     }
 
     fn record(&mut self, state: State, reason: impl Into<String>) {
@@ -340,10 +382,28 @@ impl Host {
         self.note(&reason);
     }
 
+    /// A reader holding the state file without sharing makes the write fail. The state is
+    /// then written again on later ticks, since a process that keeps running saves nothing
+    /// more.
     fn save(&mut self) {
         self.state.host_pid = std::process::id();
         self.state.updated_at = Utc::now();
-        let _ = files::write_state(&self.layout.state(&self.name), &self.state);
+        let written = files::write_state(&self.layout.state(&self.name), &self.state);
+        let now = Instant::now();
+        self.unsaved = match (written, self.unsaved) {
+            (Ok(()), _) => None,
+            (Err(error), None) => {
+                self.log_line(&format!("State not saved yet: {error:#}"));
+                Some(Retry::first(now))
+            }
+            (Err(_), Some(retry)) => Some(retry.next(now)),
+        };
+    }
+
+    fn retry_save(&mut self) {
+        if self.unsaved.is_some_and(|retry| Instant::now() >= retry.at) {
+            self.save();
+        }
     }
 
     /// Details for administrators only, in the workload's log.
@@ -427,5 +487,24 @@ impl Refusal {
             reason: reason.into(),
             detail,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_state_write_is_retried_ever_less_often_up_to_a_limit() {
+        let now = Instant::now();
+        let mut retry = Retry::first(now);
+        assert_eq!(retry.at, now + POLL);
+        let mut delays = vec![];
+        for _ in 0..6 {
+            retry = retry.next(now);
+            assert_eq!(retry.at, now + retry.delay);
+            delays.push(retry.delay.as_millis());
+        }
+        assert_eq!(delays, [500, 1000, 2000, 2000, 2000, 2000]);
     }
 }

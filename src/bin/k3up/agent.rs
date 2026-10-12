@@ -171,10 +171,10 @@ fn back_out_if_services_mode(client: &Client, login: &LoginAgent, registered: bo
     if !services_mode() {
         return Ok(());
     }
-    if registered {
-        login.unregister()?;
-    }
-    shutdown(client, login, 60)?;
+    back_out(
+        || shutdown(client, login, 60).map(drop),
+        registered.then_some(|| login.unregister()),
+    )?;
     bail!(
         "Services mode was turned on while the agent was starting, so the agent was stopped{}. Run workloads as Windows services with `k3up apply`",
         if registered {
@@ -182,6 +182,30 @@ fn back_out_if_services_mode(client: &Client, login: &LoginAgent, registered: bo
         } else {
             ""
         }
+    )
+}
+
+/// Stops the agent, then removes the login item, attempting both whatever fails, so the
+/// agent never keeps running beside the services.
+fn back_out(
+    stop: impl FnOnce() -> Result<()>,
+    unregister: Option<impl FnOnce() -> Result<()>>,
+) -> Result<()> {
+    let mut problems = vec![];
+    if let Err(error) = stop() {
+        problems.push(format!("The agent did not stop: {error:#}"));
+    }
+    if let Some(unregister) = unregister
+        && let Err(error) = unregister()
+    {
+        problems.push(format!("The login item was not removed: {error:#}"));
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "Services mode was turned on while the agent was starting, and backing out failed:\n{}",
+        problems.join("\n")
     )
 }
 
@@ -324,5 +348,63 @@ mod tests {
         );
         let beside = check_install(true, true, &own).unwrap_err();
         assert!(beside.to_string().starts_with("Services mode is on"));
+    }
+
+    fn backed_out(
+        stop_fails: bool,
+        unregister: Option<bool>,
+    ) -> (Vec<&'static str>, Option<String>) {
+        let calls = std::cell::RefCell::new(vec![]);
+        let step = &|name: &'static str, fails: bool| -> Result<()> {
+            calls.borrow_mut().push(name);
+            if fails {
+                bail!("{name} failed");
+            }
+            Ok(())
+        };
+        let result = back_out(
+            || step("stop", stop_fails),
+            unregister.map(|fails| move || step("unregister", fails)),
+        );
+        (
+            calls.into_inner(),
+            result.err().map(|error| error.to_string()),
+        )
+    }
+
+    #[test]
+    fn backing_out_stops_the_agent_first_and_attempts_every_step() {
+        assert_eq!(
+            backed_out(false, Some(false)),
+            (vec!["stop", "unregister"], None)
+        );
+        assert_eq!(backed_out(false, None), (vec!["stop"], None));
+        let heading =
+            "Services mode was turned on while the agent was starting, and backing out failed:";
+        assert_eq!(
+            backed_out(true, Some(false)),
+            (
+                vec!["stop", "unregister"],
+                Some(format!("{heading}\nThe agent did not stop: stop failed"))
+            )
+        );
+        assert_eq!(
+            backed_out(false, Some(true)),
+            (
+                vec!["stop", "unregister"],
+                Some(format!(
+                    "{heading}\nThe login item was not removed: unregister failed"
+                ))
+            )
+        );
+        assert_eq!(
+            backed_out(true, Some(true)),
+            (
+                vec!["stop", "unregister"],
+                Some(format!(
+                    "{heading}\nThe agent did not stop: stop failed\nThe login item was not removed: unregister failed"
+                ))
+            )
+        );
     }
 }
