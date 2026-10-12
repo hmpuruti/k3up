@@ -11,6 +11,8 @@ pub enum Use {
     Argument,
     /// An argument still holding a variable K3 Up can't expand, so its path can't be checked.
     Unresolved,
+    /// The folder of a script argument, where interpreters such as Python look for modules.
+    ScriptFolder,
     Folder,
     /// A folder on the PATH the process searches for commands it runs by bare name.
     SearchPath,
@@ -222,6 +224,58 @@ const INTERPRETERS: [&str; 14] = [
     "wscript",
 ];
 
+/// The extensions Windows tries for a command given without one, when PATHEXT isn't set.
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+
+/// The files a shell would run for the bare commands in `args`, such as `helper` or
+/// `helper.exe`: the first match in the working folder and then in `searched`, trying each
+/// PATHEXT extension for a command given without one.
+fn commands_found(
+    workload: &Workload,
+    inherited: &Inherited,
+    args: &[String],
+    searched: &[PathBuf],
+    exists: &impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let extensions: Vec<String> = variable(workload, inherited, "PATHEXT")
+        .unwrap_or_else(|| DEFAULT_PATHEXT.into())
+        .split(';')
+        .map(|extension| extension.trim().to_string())
+        .filter(|extension| !extension.is_empty())
+        .collect();
+    let folders: Vec<PathBuf> = std::iter::once(PathBuf::from(&workload.working_directory))
+        .chain(searched.iter().cloned())
+        .filter(|folder| folder.is_absolute())
+        .collect();
+    args.iter()
+        .flat_map(|arg| words(arg))
+        .filter(|word| !word.starts_with(['-', '/']) && !word.contains(['\\', '/', ':']))
+        .filter_map(|word| {
+            let names: Vec<String> = if Path::new(&word).extension().is_some() {
+                vec![word.clone()]
+            } else {
+                extensions
+                    .iter()
+                    .map(|extension| format!("{word}{extension}"))
+                    .collect()
+            };
+            folders.iter().find_map(|folder| {
+                names
+                    .iter()
+                    .map(|name| folder.join(name))
+                    .find(|path| exists(path))
+            })
+        })
+        .collect()
+}
+
+/// A file that runs or loads code, judged by its extension.
+fn is_code(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| CODE.contains(&extension.to_ascii_lowercase().as_str()))
+}
+
 fn runs_commands(program: &str) -> bool {
     Path::new(program)
         .file_stem()
@@ -326,26 +380,43 @@ pub fn inspected(
             path: arg.into(),
             what: Use::Unresolved,
         });
-    let arguments = path_arguments(&args, Path::new(&workload.working_directory), exists)
-        .into_iter()
-        .map(|path| Exposure {
-            path,
-            what: Use::Argument,
-        });
+    let searched_folders = search_folders(workload, inherited.path.clone());
+    let commands = if interpreter {
+        commands_found(workload, inherited, &args, &searched_folders, &exists)
+    } else {
+        vec![]
+    };
+    let arguments: Vec<Exposure> =
+        path_arguments(&args, Path::new(&workload.working_directory), &exists)
+            .into_iter()
+            .chain(commands)
+            .map(|path| Exposure {
+                path,
+                what: Use::Argument,
+            })
+            .collect();
+    let script_folders: Vec<Exposure> = arguments
+        .iter()
+        .filter(|exposure| is_code(&exposure.path))
+        .filter_map(|exposure| exposure.path.parent())
+        .map(|folder| Exposure {
+            path: folder.to_path_buf(),
+            what: Use::ScriptFolder,
+        })
+        .collect();
     let folder = Exposure {
         path: workload.working_directory.clone().into(),
         what: Use::Folder,
     };
-    let searched = search_folders(workload, inherited.path.clone())
-        .into_iter()
-        .map(|path| Exposure {
-            path,
-            what: Use::SearchPath,
-        });
+    let searched = searched_folders.into_iter().map(|path| Exposure {
+        path,
+        what: Use::SearchPath,
+    });
     let mut found: Vec<Exposure> = vec![];
     for candidate in std::iter::once(program)
         .chain(program_folder)
         .chain(arguments)
+        .chain(script_folders)
         .chain(unresolved_args)
         .chain(std::iter::once(folder))
         .chain(searched)
@@ -713,6 +784,44 @@ mod tests {
         ];
         assert!(unresolved(&workload("powershell.exe", &words)).is_empty());
         assert!(unresolved(&workload("tool.exe", &["a b"])).is_empty());
+    }
+
+    #[test]
+    fn bare_commands_are_found_in_the_working_folder_then_on_the_path() {
+        let work = absolute("work");
+        let bin = absolute("bin");
+        let in_bin = bin.join("helper.CMD");
+        let in_work = work.join("local.exe");
+        let existing = [in_bin.clone(), in_work.clone()];
+        let exists = |path: &Path| existing.iter().any(|known| known == path);
+        let mut workload = Workload {
+            name: "web".into(),
+            executable: text(&absolute("cmd.exe")),
+            working_directory: text(&work),
+            args: vec!["-c".into(), "helper & local.exe && missing".into()],
+            ..Default::default()
+        };
+        workload
+            .environment
+            .insert("PATHEXT".into(), ".EXE;.CMD".into());
+        let inherited = Inherited {
+            path: Some(text(&bin)),
+            variables: vec![],
+        };
+        let found = commands_found(
+            &workload,
+            &inherited,
+            &workload.args,
+            &search_folders(&workload, inherited.path.clone()),
+            &exists,
+        );
+        assert_eq!(found, [in_bin.clone(), in_work]);
+        let folders: Vec<_> = inspected(&workload, exists, &inherited)
+            .into_iter()
+            .filter(|exposure| exposure.what == Use::ScriptFolder)
+            .map(|exposure| exposure.path)
+            .collect();
+        assert_eq!(folders, [work, bin]);
     }
 
     #[test]

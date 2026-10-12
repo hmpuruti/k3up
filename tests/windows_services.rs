@@ -877,12 +877,22 @@ fn only_scripts_users_may_change_are_warned_about() {
     };
     let quiet = create("quiet", &kept);
     assert!(warnings(&quiet).is_empty(), "{quiet}");
+    let open_folder = open.parent().unwrap();
     let warned = create("warned", &open);
-    assert_eq!(warnings(&warned), [exposure::warning_line("warned", &open)]);
+    assert_eq!(
+        warnings(&warned),
+        [
+            exposure::warning_line("warned", &open),
+            exposure::warning_line("warned", open_folder),
+        ]
+    );
     let relative = create("relative", Path::new(r"..\open\job.cmd"));
     assert_eq!(
         warnings(&relative),
-        [exposure::warning_line("relative", &open)]
+        [
+            exposure::warning_line("relative", &open),
+            exposure::warning_line("relative", open_folder),
+        ]
     );
     // The whole command string is one argument; cmd runs the script inside it.
     let called = create("called", Path::new(r"call ..\open\job.cmd"));
@@ -890,6 +900,7 @@ fn only_scripts_users_may_change_are_warned_about() {
         warnings(&called),
         [
             exposure::warning_line("called", &open),
+            exposure::warning_line("called", open_folder),
             exposure::unresolved_line("called", Path::new(r"call ..\open\job.cmd")),
         ]
     );
@@ -904,11 +915,41 @@ fn only_scripts_users_may_change_are_warned_about() {
     };
     assert_eq!(
         exposure::exposed_paths(&option),
-        [exposure::Exposure {
-            path: open.clone(),
-            what: exposure::Use::Argument,
-        }]
+        [
+            exposure::Exposure {
+                path: open.clone(),
+                what: exposure::Use::Argument,
+            },
+            exposure::Exposure {
+                path: open_folder.to_path_buf(),
+                what: exposure::Use::ScriptFolder,
+            },
+        ]
     );
+
+    // A bare command is run from the PATH folder that holds it; the file itself is checked.
+    let shelf = machine.data.parent().unwrap().join("shelf");
+    k3up::win32::create_dir_with(&shelf, k3up::win32::PRIVATE_DIR_SDDL).unwrap();
+    let helper = shelf.join("helper.cmd");
+    std::fs::write(&helper, "exit 0").unwrap();
+    k3up::win32::set_owner_to_administrators(&helper).unwrap();
+    icacls(&helper, &["/grant", "*S-1-5-32-545:M"]);
+    let bare = Workload {
+        name: "bare".into(),
+        executable: cmd.clone(),
+        working_directory: data.clone(),
+        args: vec!["/c".into(), "helper".into()],
+        environment: BTreeMap::from([(
+            "PATH".into(),
+            format!("{};{}", shelf.display(), system_path()),
+        )]),
+        ..Default::default()
+    };
+    let exposed: Vec<PathBuf> = exposure::exposed_paths(&bare)
+        .into_iter()
+        .map(|exposure| exposure.path)
+        .collect();
+    assert_eq!(exposed, [helper]);
 }
 
 const UNSIGNED: &str =

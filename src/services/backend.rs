@@ -33,9 +33,17 @@ pub struct Settings {
 
 impl Settings {
     /// K3UP_SERVICE_PREFIX and K3UP_HOST exist for tests, which need their own service names
-    /// and the freshly built host. Everyone else gets the defaults.
+    /// and the freshly built host. Release builds ignore them: an inherited K3UP_HOST would
+    /// register an unchecked program as a LocalSystem service.
     pub fn from_env() -> Result<Self> {
-        let prefix = std::env::var("K3UP_SERVICE_PREFIX").unwrap_or_else(|_| DEFAULT_PREFIX.into());
+        let test_value = |name: &str| {
+            cfg!(debug_assertions)
+                .then(|| std::env::var_os(name))
+                .flatten()
+        };
+        let prefix = test_value("K3UP_SERVICE_PREFIX")
+            .map(|prefix| prefix.to_string_lossy().into_owned())
+            .unwrap_or_else(|| DEFAULT_PREFIX.into());
         if prefix.is_empty()
             || prefix.len() > 32
             || !prefix
@@ -44,7 +52,7 @@ impl Settings {
         {
             bail!("K3UP_SERVICE_PREFIX must be 1 to 32 ASCII letters, digits or underscores");
         }
-        let host = match std::env::var_os("K3UP_HOST") {
+        let host = match test_value("K3UP_HOST") {
             Some(host) => PathBuf::from(host),
             None => super::setup::install_dir()?.join("k3up-host.exe"),
         };
