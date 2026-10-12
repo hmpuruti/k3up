@@ -232,7 +232,7 @@ impl App {
     fn managed(&self) -> Option<&LoginAgent> {
         self.login
             .as_ref()
-            .filter(|login| login.data_dir() == self.client.data_dir)
+            .filter(|login| k3up::platform::same_dir(login.data_dir(), &self.client.data_dir))
     }
 
     fn link(&self) -> Link {
@@ -268,6 +268,19 @@ impl App {
                     };
                     let started =
                         start.then(|| login.start().map_err(|error| format!("{error:#}")));
+                    // `services enable` may have published services mode meanwhile; the
+                    // agent's workloads must not run beside the services.
+                    if k3up::services::machine_mode_on() {
+                        let undone = k3up::autostart::back_out(&login, registered == Ok(true))
+                            .map_err(|error| format!("{error:#}"));
+                        let reason = undone.err().unwrap_or_else(|| {
+                            "Services mode was turned on, so the agent was stopped".into()
+                        });
+                        return AgentSetup {
+                            registered: Err(reason.clone()),
+                            started: start.then_some(Err(reason)),
+                        };
+                    }
                     AgentSetup {
                         registered,
                         started,
@@ -290,13 +303,21 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    if enabled {
-                        login.register()
-                    } else {
-                        login.unregister()
+                    if !enabled {
+                        return login
+                            .unregister()
+                            .map(|()| false)
+                            .map_err(|error| format!("{error:#}"));
                     }
-                    .map(|()| enabled)
-                    .map_err(|error| format!("{error:#}"))
+                    login.register().map_err(|error| format!("{error:#}"))?;
+                    // `services enable` may have published services mode since the app opened.
+                    if k3up::services::machine_mode_on() {
+                        return Err(k3up::autostart::back_out(&login, true).map_or_else(
+                            |error| format!("{error:#}"),
+                            |()| "Services mode is on, so the login item was removed".into(),
+                        ));
+                    }
+                    Ok(true)
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))

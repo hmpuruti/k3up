@@ -8,7 +8,9 @@ pub mod model;
 pub mod platform;
 pub mod protocol;
 pub mod server;
+pub mod services;
 pub mod store;
+pub mod supervisor;
 pub mod systemd;
 pub mod user_path;
 #[cfg(windows)]

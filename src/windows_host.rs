@@ -88,6 +88,7 @@ fn service_main(_: Vec<OsString>) {
 }
 
 pub fn install(_data: &Path) -> Result<()> {
+    let _setup = crate::services::setup::central_agent_lock()?;
     // A machine service must never execute binaries or configuration from a user-writable folder.
     let data = PathBuf::from(std::env::var_os("ProgramData").context("ProgramData is not set")?)
         .join("K3 Up");
@@ -176,6 +177,8 @@ fn install_into(
 }
 
 pub fn uninstall() -> Result<()> {
+    let prefix = crate::services::Settings::from_env()?.prefix;
+    let _setup = crate::services::setup::setup_lock(&prefix, crate::services::setup::SETUP_WAIT)?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("Run uninstallation from an elevated terminal")?;
     let service = manager.open_service(

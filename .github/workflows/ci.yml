@@ -23,6 +23,10 @@ jobs:
       - run: cargo clippy --locked --all-targets --features desktop -- -D warnings
       # Run every test group even after one fails, so each run reports every failure.
       - run: cargo test --locked --features desktop --no-fail-fast
+        env:
+          # The Windows services tests skip themselves without administrator rights. CI
+          # runners have them, so a skip here is a failure.
+          K3UP_REQUIRE_ELEVATION: "1"
       - run: cargo build --locked --release --features desktop
       - uses: actions/upload-artifact@v4
         with:
@@ -32,6 +36,7 @@ jobs:
             target/release/k3up.exe
             target/release/k3up-agent
             target/release/k3up-agent.exe
+            target/release/k3up-host.exe
             target/release/k3up-desktop
             target/release/k3up-desktop.exe
   minimum-rust:

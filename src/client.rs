@@ -22,6 +22,13 @@ impl Client {
     pub fn send(&self, command: Command) -> Result<Response> {
         let data = std::fs::canonicalize(&self.data_dir)
             .context("Agent data directory does not exist. Start k3up-agent first")?;
+        #[cfg(windows)]
+        if crate::services::check(&self.data_dir)? {
+            let backend = crate::services::Backend::open(&data)?;
+            return Ok(backend
+                .handle(command)
+                .unwrap_or_else(|error| Response::error(format!("{error:#}"))));
+        }
         let request = serde_json::to_vec(&Request {
             version: VERSION,
             command,

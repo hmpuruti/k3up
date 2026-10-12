@@ -15,8 +15,7 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Whether the client's data directory is the one the login item manages.
 fn managed(client: &Client) -> bool {
-    let default = platform::default_data_dir();
-    std::path::absolute(&client.data_dir).ok() == std::path::absolute(&default).ok()
+    platform::same_dir(&client.data_dir, &platform::login_data_dir())
 }
 
 fn login(client: &Client) -> Result<LoginAgent> {
@@ -71,17 +70,34 @@ fn wait_until_stopped(login: &LoginAgent, timeout: u64, request: Result<()>) -> 
     Ok(())
 }
 
-pub fn install(client: &Client) -> Result<Response> {
-    if !managed(client) {
+/// Refuses a new login item while services mode runs the workloads instead: the agent would
+/// run its own workloads beside the services.
+fn check_install(managed: bool, services_mode: bool, data: &Path) -> Result<()> {
+    if !managed {
         bail!(
             "The login item always manages the default data directory. Use `k3up agent start --data-dir {}` to run an agent for another one",
-            client.data_dir.display()
+            data.display()
         );
     }
+    if services_mode {
+        bail!(
+            "Services mode is on, so workloads run as Windows services. Run them there with `k3up apply`, not under your own agent"
+        );
+    }
+    Ok(())
+}
+
+fn services_mode() -> bool {
+    k3up::services::machine_mode_on()
+}
+
+pub fn install(client: &Client) -> Result<Response> {
+    check_install(managed(client), services_mode(), &client.data_dir)?;
     let login = login(client)?;
     login.register()?;
     login.start()?;
     let info = wait_until_answering(client)?;
+    back_out_if_services_mode(client, &login, true)?;
     Ok(Response {
         message: format!(
             "Agent registered to start at login and running (pid {})",
@@ -107,6 +123,9 @@ pub fn uninstall(client: &Client, timeout: u64) -> Result<Response> {
 }
 
 pub fn start(client: &Client) -> Result<Response> {
+    if managed(client) {
+        check_install(true, services_mode(), &client.data_dir)?;
+    }
     let login = login(client)?;
     if login.is_running() {
         let info = wait_until_answering(client)?;
@@ -124,6 +143,9 @@ pub fn start(client: &Client) -> Result<Response> {
         login.launch()?;
     }
     let info = wait_until_answering(client)?;
+    if managed(client) {
+        back_out_if_services_mode(client, &login, false)?;
+    }
     Ok(Response {
         message: format!(
             "Agent running (pid {})",
@@ -136,6 +158,50 @@ pub fn start(client: &Client) -> Result<Response> {
 pub fn stop(client: &Client, timeout: u64) -> Result<Response> {
     let login = login_for_data(client);
     Ok(Response::success(shutdown(client, &login, timeout)?))
+}
+
+/// `services enable` may have published services mode while this agent was starting. The
+/// agent then stops again, so its workloads never run beside the services.
+fn back_out_if_services_mode(client: &Client, login: &LoginAgent, registered: bool) -> Result<()> {
+    if !services_mode() {
+        return Ok(());
+    }
+    back_out(
+        || shutdown(client, login, 60).map(drop),
+        registered.then_some(|| login.unregister()),
+    )?;
+    bail!(
+        "Services mode was turned on while the agent was starting, so the agent was stopped{}. Run workloads as Windows services with `k3up apply`",
+        if registered {
+            " and its login item removed"
+        } else {
+            ""
+        }
+    )
+}
+
+/// Stops the agent, then removes the login item, attempting both whatever fails, so the
+/// agent never keeps running beside the services.
+fn back_out(
+    stop: impl FnOnce() -> Result<()>,
+    unregister: Option<impl FnOnce() -> Result<()>>,
+) -> Result<()> {
+    let mut problems = vec![];
+    if let Err(error) = stop() {
+        problems.push(format!("The agent did not stop: {error:#}"));
+    }
+    if let Some(unregister) = unregister
+        && let Err(error) = unregister()
+    {
+        problems.push(format!("The login item was not removed: {error:#}"));
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "Services mode was turned on while the agent was starting, and backing out failed:\n{}",
+        problems.join("\n")
+    )
 }
 
 fn shutdown(client: &Client, login: &LoginAgent, timeout: u64) -> Result<String> {
@@ -254,5 +320,102 @@ pub fn uninstall_service() -> Result<Response> {
     #[cfg(not(windows))]
     {
         bail!("The machine service is Windows only")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_login_item_stays_with_the_users_own_directory_in_services_mode() {
+        let own = std::env::temp_dir().join("k3up-own");
+        let machine = std::env::temp_dir().join("k3up-machine");
+
+        check_install(true, false, &own).unwrap();
+        let other = check_install(false, false, &machine).unwrap_err();
+        assert!(
+            other
+                .to_string()
+                .starts_with("The login item always manages")
+        );
+        let beside = check_install(true, true, &own).unwrap_err();
+        assert!(beside.to_string().starts_with("Services mode is on"));
+    }
+
+    #[test]
+    fn the_default_directory_is_managed_however_it_is_spelled() {
+        let default = platform::login_data_dir();
+        let text = default.to_string_lossy().into_owned();
+        let trailing = format!("{text}{}", std::path::MAIN_SEPARATOR);
+        assert!(managed(&Client::new(&default)));
+        assert!(managed(&Client::new(&trailing)));
+        assert!(!managed(&Client::new(default.join("other"))));
+        let upper = text.to_uppercase();
+        assert_ne!(upper, text);
+        assert_eq!(managed(&Client::new(&upper)), cfg!(windows));
+        #[cfg(windows)]
+        assert!(managed(&Client::new(format!(
+            r"\\?\{}",
+            text.to_lowercase()
+        ))));
+    }
+
+    fn backed_out(
+        stop_fails: bool,
+        unregister: Option<bool>,
+    ) -> (Vec<&'static str>, Option<String>) {
+        let calls = std::cell::RefCell::new(vec![]);
+        let step = &|name: &'static str, fails: bool| -> Result<()> {
+            calls.borrow_mut().push(name);
+            if fails {
+                bail!("{name} failed");
+            }
+            Ok(())
+        };
+        let result = back_out(
+            || step("stop", stop_fails),
+            unregister.map(|fails| move || step("unregister", fails)),
+        );
+        (
+            calls.into_inner(),
+            result.err().map(|error| error.to_string()),
+        )
+    }
+
+    #[test]
+    fn backing_out_stops_the_agent_first_and_attempts_every_step() {
+        assert_eq!(
+            backed_out(false, Some(false)),
+            (vec!["stop", "unregister"], None)
+        );
+        assert_eq!(backed_out(false, None), (vec!["stop"], None));
+        let heading =
+            "Services mode was turned on while the agent was starting, and backing out failed:";
+        assert_eq!(
+            backed_out(true, Some(false)),
+            (
+                vec!["stop", "unregister"],
+                Some(format!("{heading}\nThe agent did not stop: stop failed"))
+            )
+        );
+        assert_eq!(
+            backed_out(false, Some(true)),
+            (
+                vec!["stop", "unregister"],
+                Some(format!(
+                    "{heading}\nThe login item was not removed: unregister failed"
+                ))
+            )
+        );
+        assert_eq!(
+            backed_out(true, Some(true)),
+            (
+                vec!["stop", "unregister"],
+                Some(format!(
+                    "{heading}\nThe agent did not stop: stop failed\nThe login item was not removed: unregister failed"
+                ))
+            )
+        );
     }
 }

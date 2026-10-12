@@ -29,10 +29,8 @@ pub fn validate(file: &Path) -> Result<Response> {
 }
 
 pub fn apply(client: &Client, file: &Path, dry_run: bool) -> Result<Response> {
-    client.send(Command::Apply {
-        manifest: read(file)?,
-        dry_run,
-    })
+    let manifest = read(file)?;
+    client.send(Command::Apply { manifest, dry_run })
 }
 
 pub fn export(client: &Client, output: Option<PathBuf>, folder: Option<&str>) -> Result<Response> {

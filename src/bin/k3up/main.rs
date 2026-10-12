@@ -6,13 +6,14 @@ mod manifests;
 mod output;
 mod path;
 mod resolve;
+mod services;
 mod systemd;
 mod template;
 mod workloads;
 
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser};
-use cli::{Action, AgentCommand, Args, PathCommand};
+use cli::{Action, AgentCommand, Args, PathCommand, ServicesCommand};
 use k3up::{client::Client, platform, protocol::Response};
 use output::Outcome;
 
@@ -144,15 +145,15 @@ fn run(args: Args) -> Result<Outcome> {
         Action::Template => manifests::template().into(),
         Action::Stats { name, watch } => health::stats(&client, name, watch, args.json)?,
         Action::Health { strict } => health::health(&client, strict)?,
-        Action::Agent(command) => match command {
-            AgentCommand::Install => agent::install(&client)?.into(),
-            AgentCommand::Uninstall { timeout } => agent::uninstall(&client, timeout)?.into(),
-            AgentCommand::Start => agent::start(&client)?.into(),
-            AgentCommand::Stop { timeout } => agent::stop(&client, timeout)?.into(),
-            AgentCommand::Status => agent::status(&client)?,
-            AgentCommand::InstallService => agent::install_service(&client.data_dir)?.into(),
-            AgentCommand::UninstallService => agent::uninstall_service()?.into(),
-        },
+        Action::Agent(command) => agent_command(&client, command)?,
+        Action::Services(command) => {
+            let data = services::data_dir(args.data_dir)?;
+            match command {
+                ServicesCommand::Enable => services::enable(&data)?.into(),
+                ServicesCommand::Disable => services::disable(&data)?.into(),
+                ServicesCommand::Status => services::status(&data)?,
+            }
+        }
         Action::InstallAgent => agent::install_service(&client.data_dir)?.into(),
         Action::UninstallAgent => agent::uninstall_service()?.into(),
         Action::Path(command) => match command {
@@ -167,6 +168,24 @@ fn run(args: Args) -> Result<Outcome> {
         Action::SystemdInstall { file } => systemd::install(&file)?.into(),
     };
     Ok(outcome)
+}
+
+fn agent_command(client: &Client, command: AgentCommand) -> Result<Outcome> {
+    if !matches!(
+        command,
+        AgentCommand::InstallService | AgentCommand::UninstallService
+    ) {
+        services::refuse_agent(&client.data_dir)?;
+    }
+    Ok(match command {
+        AgentCommand::Install => agent::install(client)?.into(),
+        AgentCommand::Uninstall { timeout } => agent::uninstall(client, timeout)?.into(),
+        AgentCommand::Start => agent::start(client)?.into(),
+        AgentCommand::Stop { timeout } => agent::stop(client, timeout)?.into(),
+        AgentCommand::Status => agent::status(client)?,
+        AgentCommand::InstallService => agent::install_service(&client.data_dir)?.into(),
+        AgentCommand::UninstallService => agent::uninstall_service()?.into(),
+    })
 }
 
 fn main() {

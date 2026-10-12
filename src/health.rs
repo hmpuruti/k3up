@@ -5,6 +5,7 @@ use crate::{
 };
 use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 pub const MEMORY_WARNING: f32 = 0.85;
 pub const SWAP_WARNING: f32 = 0.5;
@@ -26,6 +27,8 @@ pub enum WarningKind {
     Memory,
     Swap,
     Disk,
+    /// A services mode workload runs as SYSTEM from a path other users may change.
+    Program,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,8 +151,24 @@ pub fn attention(statuses: &[Status]) -> Vec<Attention> {
         .collect()
 }
 
-pub fn assess(metrics: &Metrics, statuses: &[Status]) -> Report {
-    let warnings = warnings(metrics);
+pub fn program_warning(name: &str, paths: &[&Path]) -> Warning {
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    Warning {
+        kind: WarningKind::Program,
+        message: format!(
+            "{name} runs as SYSTEM using {}, which users who aren't administrators can change",
+            paths.join(", ")
+        ),
+    }
+}
+
+/// `programs` are the workloads' `program_warning`s, which only services mode has.
+pub fn assess(metrics: &Metrics, statuses: &[Status], programs: Vec<Warning>) -> Report {
+    let mut warnings = warnings(metrics);
+    warnings.extend(programs);
     let attention = attention(statuses);
     let status = if warnings.is_empty() && attention.is_empty() {
         Verdict::Ok
@@ -226,7 +245,7 @@ mod tests {
     #[test]
     fn healthy_machine_has_no_warnings() {
         assert!(warnings(&metrics()).is_empty());
-        assert_eq!(assess(&metrics(), &[]).status, Verdict::Ok);
+        assert_eq!(assess(&metrics(), &[], vec![]).status, Verdict::Ok);
     }
 
     #[test]
@@ -283,7 +302,7 @@ mod tests {
             status("waiting", State::Blocked),
             status("done", State::Completed),
         ];
-        let report = assess(&metrics(), &statuses);
+        let report = assess(&metrics(), &statuses, vec![]);
         assert_eq!(report.status, Verdict::Warning);
         let names: Vec<_> = report.attention.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["crashed", "retrying", "waiting"]);
@@ -293,5 +312,37 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["status"], "warning");
         assert_eq!(json["attention"][0]["state"], "failed");
+    }
+
+    #[test]
+    fn a_program_others_may_change_is_a_warning() {
+        let web = std::env::temp_dir().join("web.exe");
+        let job = std::env::temp_dir().join("job.cmd");
+        let work = std::env::temp_dir().join("work");
+        let programs = vec![
+            program_warning("web", &[&web]),
+            program_warning("job", &[&job, &work]),
+        ];
+        let report = assess(&metrics(), &[status("web", State::Running)], programs);
+        assert_eq!(report.status, Verdict::Warning);
+        assert!(report.attention.is_empty());
+        let messages: Vec<_> = report.warnings.iter().map(|w| w.message.clone()).collect();
+        assert_eq!(
+            messages,
+            [
+                format!(
+                    "web runs as SYSTEM using {}, which users who aren't administrators can change",
+                    web.display()
+                ),
+                format!(
+                    "job runs as SYSTEM using {}, {}, which users who aren't administrators can change",
+                    job.display(),
+                    work.display()
+                ),
+            ]
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["status"], "warning");
+        assert_eq!(json["warnings"][0]["kind"], "program");
     }
 }

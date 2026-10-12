@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         run: |
           cargo build --locked --release --features desktop
-          Compress-Archive -Path target/release/k3up.exe, target/release/k3up-agent.exe, target/release/k3up-desktop.exe -DestinationPath ${{ matrix.asset }}
+          Compress-Archive -Path target/release/k3up.exe, target/release/k3up-agent.exe, target/release/k3up-host.exe, target/release/k3up-desktop.exe -DestinationPath ${{ matrix.asset }}
           choco install nsis --no-progress -y
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" "-DVERSION=$version" "-DBINARIES=$pwd\target\release" "-DOUTFILE=$pwd\k3up-setup-x86_64.exe" packaging\windows\installer.nsi

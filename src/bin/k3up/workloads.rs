@@ -8,6 +8,7 @@ use k3up::{
     client::Client,
     model::{Kind, Manifest, Missed, Schedule, State, Status, Workload},
     protocol::{Command, Response},
+    services::exposure,
 };
 use std::{
     io::Write,
@@ -39,13 +40,75 @@ pub fn create(client: &Client, request: Create) -> Result<Response> {
     apply_flags(&mut workload, &request.flags)?;
     workload.validate()?;
     let response = client.send(Command::Put {
-        workload: Box::new(workload),
+        workload: Box::new(workload.clone()),
         create_only: true,
     })?;
     if !response.ok || !request.start {
         return Ok(response);
     }
-    start(client, &request.name, request.wait, request.timeout)
+    // The save listed its warnings; they follow the start's outcome, even a failed one.
+    let warnings = warning_lines_in(&response.message);
+    with_warnings(
+        start(client, &request.name, request.wait, request.timeout),
+        &warnings,
+    )
+}
+
+/// The warning lines a save added to its message.
+fn warning_lines_in(message: &str) -> Vec<String> {
+    message
+        .lines()
+        .filter(|line| line.starts_with("Warning: "))
+        .map(String::from)
+        .collect()
+}
+
+fn without_warnings(message: &str) -> String {
+    message
+        .lines()
+        .filter(|line| !line.starts_with("Warning: "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// In services mode, a warning line for each path of `workloads` that users who aren't
+/// administrators may change, since the workloads run as SYSTEM.
+pub fn exposure_warnings(client: &Client, workloads: &[Workload]) -> Vec<String> {
+    if !k3up::services::active(&client.data_dir) {
+        return vec![];
+    }
+    workloads
+        .iter()
+        .flat_map(|workload| exposure::warning_lines(workload, &exposure::exposed_paths(workload)))
+        .collect()
+}
+
+/// Adds the warnings for a saved definition to the outcome of what followed, so that a start
+/// that failed afterwards still reports them.
+fn with_warnings(outcome: Result<Response>, warnings: &[String]) -> Result<Response> {
+    if warnings.is_empty() {
+        return outcome;
+    }
+    let response = outcome.unwrap_or_else(|error| Response::error(format!("{error:#}")));
+    Ok(appended(response, warnings))
+}
+
+fn appended(response: Response, warnings: &[String]) -> Response {
+    if warnings.is_empty() {
+        return response;
+    }
+    Response {
+        message: format!("{}\n{}", response.message, warnings.join("\n")),
+        ..response
+    }
+}
+
+/// Adds the warnings for `workloads` to a response that saved them.
+pub fn warn_exposed(client: &Client, workloads: &[Workload], response: Response) -> Response {
+    if !response.ok {
+        return response;
+    }
+    appended(response, &exposure_warnings(client, workloads))
 }
 
 pub struct Edit {
@@ -66,9 +129,7 @@ pub struct Edit {
 }
 
 pub fn edit(client: &Client, request: Edit) -> Result<Response> {
-    let name = request.name.clone();
-    let current = get(client, &name)?;
-    let live = current.pid.is_some() || current.desired_running;
+    let current = get(client, &request.name)?;
     let mut workload = current.workload.clone();
     if request.clear_env {
         workload.environment.clear();
@@ -105,15 +166,27 @@ pub fn edit(client: &Client, request: Edit) -> Result<Response> {
         workload.args = request.args;
     }
     workload.validate()?;
+    save_edit(client, &current, workload, request.restart_running)
+}
+
+fn save_edit(
+    client: &Client,
+    current: &Status,
+    workload: Workload,
+    restart_running: bool,
+) -> Result<Response> {
+    let name = current.workload.name.clone();
+    let live = current.pid.is_some() || current.desired_running;
     if workload == current.workload {
-        return Ok(Response::success("No changes"));
+        let unchanged = Response::success("No changes");
+        return Ok(warn_exposed(client, &[workload], unchanged));
     }
     // Labels apply to a running workload at once, unless a restart was asked for anyway.
     let relabel = current.workload.only_labels_differ(&workload);
-    if !live || (relabel && !request.restart_running) {
+    if !live || (relabel && !restart_running) {
         return put(client, workload);
     }
-    if !request.restart_running {
+    if !restart_running {
         bail!(
             "'{name}' is {}. Stop it first, or pass --restart-running to stop it, apply the change and start it again",
             current.state
@@ -126,11 +199,12 @@ pub fn edit(client: &Client, request: Edit) -> Result<Response> {
     if !saved.ok {
         return Ok(saved);
     }
-    let started = checked(started?)?;
-    Ok(Response {
-        message: format!("{}\nStarted {name} again", saved.message),
+    let warnings = warning_lines_in(&saved.message);
+    let restarted = started.and_then(checked).map(|started| Response {
+        message: format!("{}\nStarted {name} again", without_warnings(&saved.message)),
         ..started
-    })
+    });
+    with_warnings(restarted, &warnings)
 }
 
 fn put(client: &Client, workload: Workload) -> Result<Response> {
@@ -401,5 +475,29 @@ pub fn logs(
         }
         after = Some(response.offset.unwrap_or_default());
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warnings_follow_the_outcome_whether_or_not_it_succeeded() {
+        let warnings = ["Warning: one".to_string(), "Warning: two".to_string()];
+        let started = with_warnings(Ok(Response::success("Started web")), &warnings).unwrap();
+        assert!(started.ok);
+        assert_eq!(started.message, "Started web\nWarning: one\nWarning: two");
+
+        let refused = with_warnings(Ok(Response::error("web stopped")), &warnings).unwrap();
+        assert!(!refused.ok);
+        assert_eq!(refused.message, "web stopped\nWarning: one\nWarning: two");
+
+        let failed = with_warnings(Err(anyhow::anyhow!("web failed")), &warnings).unwrap();
+        assert!(!failed.ok);
+        assert_eq!(failed.message, "web failed\nWarning: one\nWarning: two");
+
+        let quiet = with_warnings(Err(anyhow::anyhow!("web failed")), &[]).unwrap_err();
+        assert_eq!(quiet.to_string(), "web failed");
     }
 }

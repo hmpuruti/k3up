@@ -41,6 +41,70 @@ pub enum Registration {
     OtherDirectory,
 }
 
+/// The login agent the desktop app may register and start for `data`. A services mode
+/// directory has none: an agent there could not lock the protected folder, and registering it
+/// would replace the user's own login item.
+pub fn desktop_agent(
+    agent: Option<PathBuf>,
+    data: &std::path::Path,
+    services_mode: bool,
+) -> Option<LoginAgent> {
+    if services_mode {
+        return None;
+    }
+    Some(LoginAgent::new(agent?, data.to_path_buf()))
+}
+
+/// Undoes an agent setup that raced `k3up services enable`: stops the agent first, then
+/// removes its login item if this setup registered it, and reports every step that failed.
+pub fn back_out(login: &LoginAgent, registered: bool) -> Result<()> {
+    back_out_with(
+        || stop_agent(login),
+        || {
+            if registered {
+                login.unregister()
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+fn back_out_with(
+    stop: impl FnOnce() -> Result<()>,
+    unregister: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let failures: Vec<String> = [stop(), unregister()]
+        .into_iter()
+        .filter_map(|step| step.err().map(|error| format!("{error:#}")))
+        .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Stopping the agent after services mode was turned on failed: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn stop_agent(login: &LoginAgent) -> Result<()> {
+    if !login.is_running() {
+        return Ok(());
+    }
+    // A reply may be lost when the agent exits first; only the exit itself counts.
+    let _ = crate::client::Client::new(login.data_dir()).send(crate::protocol::Command::Shutdown);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while login.is_running() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "The agent did not stop within 60 seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(())
+}
+
 /// Starts the agent for the current user at login and on demand.
 ///
 /// macOS uses a launchd LaunchAgent and Linux a systemd user service; both restart the agent
@@ -107,8 +171,21 @@ impl LoginAgent {
     pub fn registration(&self) -> Registration {
         match self.registered_entry() {
             None => Registration::None,
-            Some(entry) if entry.contains(&self.entry_marker()) => Registration::ThisDirectory,
+            Some(entry) if self.names_this_directory(&entry) => Registration::ThisDirectory,
             Some(_) => Registration::OtherDirectory,
+        }
+    }
+
+    fn names_this_directory(&self, entry: &str) -> bool {
+        #[cfg(windows)]
+        {
+            run_entry_data_dir(entry).is_some_and(|recorded| {
+                platform::same_dir(std::path::Path::new(recorded), &self.data)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            entry.contains(&self.entry_marker())
         }
     }
 
@@ -293,102 +370,34 @@ impl LoginAgent {
     }
 
     fn registered_entry(&self) -> Option<String> {
-        use windows_sys::Win32::{
-            Foundation::ERROR_SUCCESS,
-            System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW},
-        };
-        let key = crate::win32::wide(RUN_KEY.as_ref());
-        let value = crate::win32::wide(RUN_VALUE.as_ref());
-        let mut bytes = 0u32;
-        // SAFETY: NUL-terminated names; a null buffer asks only for the size.
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                value.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut bytes,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return None;
-        }
-        let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
-        // SAFETY: the buffer is at least `bytes` long, as reported by the first call.
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                value.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                buffer.as_mut_ptr().cast(),
-                &mut bytes,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return None;
-        }
-        let length = buffer
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(buffer.len());
-        Some(String::from_utf16_lossy(&buffer[..length]))
-    }
-
-    /// Matches `run_entry`, which records the data directory as given.
-    fn entry_marker(&self) -> String {
-        let data = self.data.to_string_lossy();
-        format!("--data-dir \"{}\"", data.trim_end_matches('\\'))
+        crate::win32::registry_string(crate::win32::Hive::CurrentUser, RUN_KEY, RUN_VALUE)
     }
 
     fn install(&self) -> Result<()> {
-        use windows_sys::Win32::{
-            Foundation::ERROR_SUCCESS,
-            System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW},
-        };
-        let key = crate::win32::wide(RUN_KEY.as_ref());
-        let value = crate::win32::wide(RUN_VALUE.as_ref());
-        let data = crate::win32::wide(self.run_entry()?.as_ref());
-        // SAFETY: all buffers are NUL-terminated and outlive the call.
-        let status = unsafe {
-            RegSetKeyValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                value.as_ptr(),
-                REG_SZ,
-                data.as_ptr().cast(),
-                (data.len() * 2) as u32,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(std::io::Error::from_raw_os_error(status as i32))
-                .context("Write login entry");
-        }
-        Ok(())
+        crate::win32::set_registry_string(
+            crate::win32::Hive::CurrentUser,
+            RUN_KEY,
+            RUN_VALUE,
+            &self.run_entry()?,
+        )
+        .context("Write login entry")
     }
 
     fn uninstall(&self) -> Result<()> {
-        use windows_sys::Win32::{
-            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
-            System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyValueW},
-        };
-        let key = crate::win32::wide(RUN_KEY.as_ref());
-        let value = crate::win32::wide(RUN_VALUE.as_ref());
-        // SAFETY: NUL-terminated names that outlive the call.
-        let status = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) };
-        if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
-            return Err(std::io::Error::from_raw_os_error(status as i32))
-                .context("Remove login entry");
-        }
-        Ok(())
+        crate::win32::delete_registry_value(crate::win32::Hive::CurrentUser, RUN_KEY, RUN_VALUE)
+            .context("Remove login entry")
     }
 
     fn start_supervised(&self) -> Result<()> {
         anyhow::bail!("Windows has no per-user agent supervisor")
     }
+}
+
+/// The data directory in a login entry that `run_entry` wrote.
+#[cfg(any(windows, test))]
+fn run_entry_data_dir(entry: &str) -> Option<&str> {
+    let (_, rest) = entry.split_once("--data-dir \"")?;
+    rest.split_once('"').map(|(data, _)| data)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -526,6 +535,69 @@ mod tests {
         let marker = |data: &str| format!("--data-dir {}", crate::systemd::quoted(data));
         assert!(unit.contains(&marker("/srv/k3up")));
         assert!(!unit.contains(&marker("/srv/k3")));
+    }
+
+    #[test]
+    fn windows_login_entries_name_their_data_directory() {
+        let entry = r#""C:\Program Files\K3 Up\k3up-agent.exe" --data-dir "C:\Users\me\AppData\Local\K3 Up""#;
+        assert_eq!(
+            run_entry_data_dir(entry),
+            Some(r"C:\Users\me\AppData\Local\K3 Up")
+        );
+        assert_eq!(run_entry_data_dir(r#""k3up-agent.exe""#), None);
+        assert_eq!(
+            run_entry_data_dir(r#""k3up-agent.exe" --data-dir "C:\K3"#),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_login_entry_matches_its_directory_in_any_case() {
+        let data = std::env::temp_dir().join("K3 Up Login");
+        let login = LoginAgent::new(PathBuf::from(r"C:\k3up-agent.exe"), data.clone());
+        let entry = login.run_entry().unwrap();
+        let upper = LoginAgent::new(
+            PathBuf::new(),
+            PathBuf::from(data.to_string_lossy().to_uppercase()),
+        );
+        assert!(upper.names_this_directory(&entry));
+        let other = LoginAgent::new(PathBuf::new(), data.with_file_name("K3 Up Other"));
+        assert!(!other.names_this_directory(&entry));
+    }
+
+    #[test]
+    fn the_desktop_manages_no_agent_in_services_mode() {
+        let agent = PathBuf::from("/opt/k3up/k3up-agent");
+        let data = Path::new("/srv/k3up");
+        let login = desktop_agent(Some(agent.clone()), data, false).unwrap();
+        assert_eq!(login.data_dir(), data);
+        assert!(desktop_agent(Some(agent), data, true).is_none());
+        assert!(desktop_agent(None, data, false).is_none());
+    }
+
+    #[test]
+    fn backing_out_tries_every_step_and_reports_each_failure() {
+        assert!(back_out_with(|| Ok(()), || Ok(())).is_ok());
+        let error = back_out_with(
+            || anyhow::bail!("stop failed"),
+            || anyhow::bail!("unregister failed"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("stop failed") && error.contains("unregister failed"),
+            "{error}"
+        );
+        let unregistered = std::cell::Cell::new(false);
+        let _ = back_out_with(
+            || anyhow::bail!("stop failed"),
+            || {
+                unregistered.set(true);
+                Ok(())
+            },
+        );
+        assert!(unregistered.get());
     }
 
     #[test]
