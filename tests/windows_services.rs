@@ -710,6 +710,21 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
         .collect();
     assert_eq!(exposed, [through_link]);
     std::fs::remove_dir(&link).unwrap();
+
+    // A link higher up leads into a folder users control, though the last folder is protected.
+    let real = open_folder(&machine).join("deep");
+    std::fs::create_dir_all(real.join("inner")).unwrap();
+    k3up::win32::secure_dir(&real.join("inner"), k3up::win32::PRIVATE_DIR_SDDL).unwrap();
+    let hop = machine.data.join("hop");
+    std::os::windows::fs::symlink_dir(&real, &hop).unwrap();
+    let nested = hop.join("inner").join("tool.exe");
+    workload.executable = nested.to_string_lossy().into();
+    let exposed: Vec<PathBuf> = exposure::exposed_paths(&workload)
+        .into_iter()
+        .map(|exposure| exposure.path)
+        .collect();
+    assert_eq!(exposed, [nested]);
+    std::fs::remove_dir(&hop).unwrap();
 }
 
 #[test]

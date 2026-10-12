@@ -431,49 +431,64 @@ pub fn writable_by_others(path: &Path) -> Result<bool> {
 /// Whether an account other than SYSTEM, Administrators and TrustedInstaller may change
 /// `path`, or rename, delete or re-permission a folder above it. A path that doesn't exist yet
 /// is judged by the nearest folder that does, since whoever may add to that folder can create
-/// it. `None` when the permissions of that path cannot be read. A folder whose permissions
-/// cannot be read counts as unchanged, so the answer never rests on a guess.
-pub fn changeable_by_others(path: &Path) -> Option<bool> {
+/// it. Links are judged both as they stand and by where they lead, and anything whose
+/// permissions can't be read counts as changeable: this check exists to warn, so it fails
+/// towards warning.
+pub fn changeable_by_others(path: &Path) -> bool {
     changeable_within(path, 8)
 }
 
 /// `hops` bounds how many links are followed, so a loop of links ends.
-fn changeable_within(path: &Path, hops: u8) -> Option<bool> {
+fn changeable_within(path: &Path, hops: u8) -> bool {
+    let Some(existing) = path
+        .ancestors()
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
+    else {
+        return true;
+    };
+    let rest = path.strip_prefix(existing).unwrap_or(Path::new(""));
+    if hops == 0 {
+        return true;
+    }
+    // Where every link along the way, the last one included, really leads.
+    let resolved = match std::fs::canonicalize(existing) {
+        Ok(resolved) => Some(resolved),
+        Err(_) if is_reparse_point(existing).unwrap_or(true) => {
+            match std::fs::read_link(existing) {
+                Ok(target) => Some(
+                    existing
+                        .parent()
+                        .map_or(target.clone(), |parent| parent.join(&target)),
+                ),
+                Err(_) => return true,
+            }
+        }
+        Err(_) => None,
+    };
+    if let Some(resolved) = resolved
+        && resolved != existing
+        && changeable_within(&resolved.join(rest), hops - 1)
+    {
+        return true;
+    }
+    stands_changeable(existing)
+}
+
+/// The object itself, or any folder above it, judged without following links.
+fn stands_changeable(existing: &Path) -> bool {
     let read = |path: &Path| {
         Pinned::open(path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL)
             .ok()?
             .security()
             .ok()
     };
-    let existing = path
+    if !read(existing).is_some_and(|security| security.protected()) {
+        return true;
+    }
+    existing
         .ancestors()
-        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())?;
-    // A link, even one whose target is missing, is also judged by where it leads: that is
-    // where the program would be created.
-    if is_reparse_point(existing).unwrap_or(false) {
-        if hops == 0 {
-            return Some(true);
-        }
-        let Ok(target) = std::fs::read_link(existing) else {
-            return Some(true);
-        };
-        let target = existing
-            .parent()
-            .map_or(target.clone(), |parent| parent.join(&target));
-        let rest = path.strip_prefix(existing).unwrap_or(Path::new(""));
-        if changeable_within(&target.join(rest), hops - 1) == Some(true) {
-            return Some(true);
-        }
-    }
-    if !read(existing)?.protected() {
-        return Some(true);
-    }
-    Some(
-        existing
-            .ancestors()
-            .skip(1)
-            .any(|folder| read(folder).is_some_and(|security| !security.keeps_children_in_place())),
-    )
+        .skip(1)
+        .any(|folder| !read(folder).is_some_and(|security| security.keeps_children_in_place()))
 }
 
 /// Opens a file to read it, without following a link, and only if it resolves to a path

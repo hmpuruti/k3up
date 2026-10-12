@@ -61,14 +61,15 @@ pub fn inspected(workload: &Workload, exists: impl Fn(&Path) -> bool) -> Vec<Exp
 }
 
 /// The paths of `workload` that an account other than SYSTEM, Administrators and
-/// TrustedInstaller may change, or move by changing a folder above them. A path whose
-/// permissions cannot be read is left out. Always empty outside Windows.
+/// TrustedInstaller may change, or move by changing a folder above them, judged through every
+/// link along the way. A path whose permissions cannot be read counts as exposed. Always empty
+/// outside Windows.
 pub fn exposed_paths(workload: &Workload) -> Vec<Exposure> {
     #[cfg(windows)]
     {
         inspected(workload, |path| path.exists())
             .into_iter()
-            .filter(|exposure| changeable(&exposure.path))
+            .filter(|exposure| crate::win32::changeable_by_others(&exposure.path))
             .collect()
     }
     #[cfg(not(windows))]
@@ -76,14 +77,6 @@ pub fn exposed_paths(workload: &Workload) -> Vec<Exposure> {
         let _ = workload;
         vec![]
     }
-}
-
-/// A link is judged both as it stands and by where it leads.
-#[cfg(windows)]
-fn changeable(path: &Path) -> bool {
-    let target = std::fs::canonicalize(path).ok();
-    crate::win32::changeable_by_others(path) == Some(true)
-        || target.is_some_and(|target| crate::win32::changeable_by_others(&target) == Some(true))
 }
 
 pub fn warning_line(name: &str, path: &Path) -> String {
