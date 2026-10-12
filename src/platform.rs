@@ -47,6 +47,39 @@ pub fn machine_data_dir() -> PathBuf {
         .join("K3 Up")
 }
 
+/// Whether two paths name the same directory, though either may not exist yet. On Windows,
+/// case, the kind of separator, a trailing separator and a `\\?\` prefix make no difference,
+/// and directories that both exist are compared as resolved.
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        if let (Ok(a), Ok(b)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            return windows_dir_key(&a) == windows_dir_key(&b);
+        }
+        windows_dir_key(a) == windows_dir_key(b)
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::absolute(a).ok() == std::path::absolute(b).ok()
+    }
+}
+
+#[cfg(windows)]
+fn windows_dir_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let plain = match text.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_string(),
+    };
+    let plain = Path::new(&plain);
+    std::path::absolute(plain)
+        .unwrap_or_else(|_| plain.to_path_buf())
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
 pub fn prepare_dir(path: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(path).context("Create data directory")?;
     #[cfg(unix)]
@@ -495,6 +528,60 @@ mod tests {
         assert_eq!(
             stop_leftover(&format!("{pid} 1"), std::time::Duration::ZERO),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod same_dir_tests {
+    use super::*;
+
+    #[test]
+    fn a_directory_matches_itself_with_or_without_a_trailing_separator() {
+        let missing = std::env::temp_dir().join("k3up-same-dir").join("Data");
+        let trailing = PathBuf::from(format!(
+            "{}{}",
+            missing.display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        assert!(same_dir(&missing, &missing));
+        assert!(same_dir(&missing, &trailing));
+        assert!(!same_dir(&missing, &missing.with_file_name("Other")));
+        assert!(!same_dir(&missing, missing.parent().unwrap()));
+        let existing = std::env::temp_dir();
+        assert!(same_dir(&existing, &existing));
+        if cfg!(not(windows)) {
+            let upper = PathBuf::from(missing.to_string_lossy().to_uppercase());
+            assert!(!same_dir(&missing, &upper));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directories_ignore_case_separators_and_the_verbatim_prefix() {
+        for base in [
+            std::env::temp_dir().join("k3up-same-dir").join("Data"),
+            std::env::temp_dir(),
+        ] {
+            let text = base.to_string_lossy().into_owned();
+            for spelling in [
+                text.to_uppercase(),
+                text.to_lowercase(),
+                text.replace('\\', "/"),
+                format!("{text}\\"),
+                format!("{text}/"),
+                format!(r"\\?\{text}"),
+                format!(r"\\?\{}\", text.to_uppercase()),
+            ] {
+                assert!(same_dir(&base, Path::new(&spelling)), "{spelling}");
+                assert!(same_dir(Path::new(&spelling), &base), "{spelling}");
+            }
+            assert!(!same_dir(&base, &base.join("inner")));
+        }
+        // Through the key alone, since resolving a share would reach for the network.
+        assert_eq!(
+            windows_dir_key(Path::new(r"\\?\UNC\SERVER\share\k3 up\")),
+            windows_dir_key(Path::new(r"\\server\share\K3 Up"))
         );
     }
 }

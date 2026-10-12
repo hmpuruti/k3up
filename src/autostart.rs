@@ -171,8 +171,21 @@ impl LoginAgent {
     pub fn registration(&self) -> Registration {
         match self.registered_entry() {
             None => Registration::None,
-            Some(entry) if entry.contains(&self.entry_marker()) => Registration::ThisDirectory,
+            Some(entry) if self.names_this_directory(&entry) => Registration::ThisDirectory,
             Some(_) => Registration::OtherDirectory,
+        }
+    }
+
+    fn names_this_directory(&self, entry: &str) -> bool {
+        #[cfg(windows)]
+        {
+            run_entry_data_dir(entry).is_some_and(|recorded| {
+                platform::same_dir(std::path::Path::new(recorded), &self.data)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            entry.contains(&self.entry_marker())
         }
     }
 
@@ -360,12 +373,6 @@ impl LoginAgent {
         crate::win32::registry_string(crate::win32::Hive::CurrentUser, RUN_KEY, RUN_VALUE)
     }
 
-    /// Matches `run_entry`, which records the data directory as given.
-    fn entry_marker(&self) -> String {
-        let data = self.data.to_string_lossy();
-        format!("--data-dir \"{}\"", data.trim_end_matches('\\'))
-    }
-
     fn install(&self) -> Result<()> {
         crate::win32::set_registry_string(
             crate::win32::Hive::CurrentUser,
@@ -384,6 +391,13 @@ impl LoginAgent {
     fn start_supervised(&self) -> Result<()> {
         anyhow::bail!("Windows has no per-user agent supervisor")
     }
+}
+
+/// The data directory in a login entry that `run_entry` wrote.
+#[cfg(any(windows, test))]
+fn run_entry_data_dir(entry: &str) -> Option<&str> {
+    let (_, rest) = entry.split_once("--data-dir \"")?;
+    rest.split_once('"').map(|(data, _)| data)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -521,6 +535,35 @@ mod tests {
         let marker = |data: &str| format!("--data-dir {}", crate::systemd::quoted(data));
         assert!(unit.contains(&marker("/srv/k3up")));
         assert!(!unit.contains(&marker("/srv/k3")));
+    }
+
+    #[test]
+    fn windows_login_entries_name_their_data_directory() {
+        let entry = r#""C:\Program Files\K3 Up\k3up-agent.exe" --data-dir "C:\Users\me\AppData\Local\K3 Up""#;
+        assert_eq!(
+            run_entry_data_dir(entry),
+            Some(r"C:\Users\me\AppData\Local\K3 Up")
+        );
+        assert_eq!(run_entry_data_dir(r#""k3up-agent.exe""#), None);
+        assert_eq!(
+            run_entry_data_dir(r#""k3up-agent.exe" --data-dir "C:\K3"#),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_login_entry_matches_its_directory_in_any_case() {
+        let data = std::env::temp_dir().join("K3 Up Login");
+        let login = LoginAgent::new(PathBuf::from(r"C:\k3up-agent.exe"), data.clone());
+        let entry = login.run_entry().unwrap();
+        let upper = LoginAgent::new(
+            PathBuf::new(),
+            PathBuf::from(data.to_string_lossy().to_uppercase()),
+        );
+        assert!(upper.names_this_directory(&entry));
+        let other = LoginAgent::new(PathBuf::new(), data.with_file_name("K3 Up Other"));
+        assert!(!other.names_this_directory(&entry));
     }
 
     #[test]

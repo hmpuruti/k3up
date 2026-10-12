@@ -211,24 +211,12 @@ pub fn refuse_central_agent(services_mode: bool, workload_services: bool) -> Res
 /// Refuses services mode for `requested` while it is on for another directory.
 pub fn check_registration(registered: Option<&Path>, requested: &Path) -> Result<()> {
     match registered {
-        Some(registered) if !same_path(registered, requested) => anyhow::bail!(
+        Some(registered) if !crate::platform::same_dir(registered, requested) => anyhow::bail!(
             "Services mode already uses {}. Run `k3up services disable` there first.",
             registered.display()
         ),
         _ => Ok(()),
     }
-}
-
-/// Windows paths ignore case and a trailing separator.
-fn same_path(a: &Path, b: &Path) -> bool {
-    let plain = |path: &Path| {
-        std::path::absolute(path)
-            .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_lowercase()
-    };
-    plain(a) == plain(b)
 }
 
 /// The two records that turn services mode on for a directory: the machine-wide registry
@@ -421,12 +409,14 @@ mod tests {
         let first = base.join("K3 Up");
         check_registration(None, &first).unwrap();
         check_registration(Some(&first), &first).unwrap();
-        let same = PathBuf::from(format!(
-            "{}{}",
-            first.to_string_lossy().to_uppercase(),
-            std::path::MAIN_SEPARATOR
-        ));
-        check_registration(Some(&first), &same).unwrap();
+        let trailing = PathBuf::from(format!("{}{}", first.display(), std::path::MAIN_SEPARATOR));
+        check_registration(Some(&first), &trailing).unwrap();
+        #[cfg(windows)]
+        check_registration(
+            Some(&first),
+            Path::new(&format!(r"\\?\{}", first.to_string_lossy().to_uppercase())),
+        )
+        .unwrap();
         let error = check_registration(Some(&first), &base.join("Other"))
             .unwrap_err()
             .to_string();

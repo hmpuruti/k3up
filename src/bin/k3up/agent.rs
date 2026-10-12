@@ -15,12 +15,7 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Whether the client's data directory is the one the login item manages.
 fn managed(client: &Client) -> bool {
-    same_dir(&client.data_dir, &platform::login_data_dir())
-}
-
-/// Compares paths as given, since either may not exist yet.
-fn same_dir(a: &Path, b: &Path) -> bool {
-    std::path::absolute(a).ok() == std::path::absolute(b).ok()
+    platform::same_dir(&client.data_dir, &platform::login_data_dir())
 }
 
 fn login(client: &Client) -> Result<LoginAgent> {
@@ -336,8 +331,6 @@ mod tests {
     fn the_login_item_stays_with_the_users_own_directory_in_services_mode() {
         let own = std::env::temp_dir().join("k3up-own");
         let machine = std::env::temp_dir().join("k3up-machine");
-        assert!(same_dir(&own, &own));
-        assert!(!same_dir(&machine, &own));
 
         check_install(true, false, &own).unwrap();
         let other = check_install(false, false, &machine).unwrap_err();
@@ -348,6 +341,24 @@ mod tests {
         );
         let beside = check_install(true, true, &own).unwrap_err();
         assert!(beside.to_string().starts_with("Services mode is on"));
+    }
+
+    #[test]
+    fn the_default_directory_is_managed_however_it_is_spelled() {
+        let default = platform::login_data_dir();
+        let text = default.to_string_lossy().into_owned();
+        let trailing = format!("{text}{}", std::path::MAIN_SEPARATOR);
+        assert!(managed(&Client::new(&default)));
+        assert!(managed(&Client::new(&trailing)));
+        assert!(!managed(&Client::new(default.join("other"))));
+        let upper = text.to_uppercase();
+        assert_ne!(upper, text);
+        assert_eq!(managed(&Client::new(&upper)), cfg!(windows));
+        #[cfg(windows)]
+        assert!(managed(&Client::new(format!(
+            r"\\?\{}",
+            text.to_lowercase()
+        ))));
     }
 
     fn backed_out(

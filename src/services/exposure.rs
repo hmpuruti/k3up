@@ -1,7 +1,7 @@
 //! Services mode runs every workload as LocalSystem, so a program, script or working folder
 //! that other users can change lets them run their own code as SYSTEM at the next start.
 use crate::model::Workload;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Use {
@@ -16,20 +16,52 @@ pub struct Exposure {
     pub what: Use,
 }
 
-/// Arguments that name an existing file or folder by absolute path, either whole or as the
-/// value of an option such as `--config=C:\app\config.ps1`.
-pub fn path_arguments(args: &[String], exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+/// Arguments that name an existing file or folder, either whole or as the value of an option
+/// such as `--config=C:\app\config.ps1`. A relative path is resolved against `folder`, as
+/// Windows resolves it for the process. One that resolves to `folder` or a folder above it is
+/// left out, since those are inspected anyway.
+pub fn path_arguments(
+    args: &[String],
+    folder: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
     args.iter()
         .filter_map(|arg| {
             let value = arg.split_once('=').map(|(_, value)| value);
             [Some(arg.as_str()), value]
                 .into_iter()
                 .flatten()
-                .map(Path::new)
-                .find(|path| path.is_absolute() && exists(path))
-                .map(Path::to_path_buf)
+                .filter_map(|text| resolved(Path::new(text), folder))
+                .find(|path| exists(path))
         })
         .collect()
+}
+
+fn resolved(path: &Path, folder: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    if !folder.is_absolute() {
+        return None;
+    }
+    let joined = normalised(&folder.join(path));
+    (joined.is_absolute() && !normalised(folder).starts_with(&joined)).then_some(joined)
+}
+
+/// Removes `.` and resolves `..` without touching the disk, as Windows does with a path
+/// before it opens it.
+fn normalised(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other),
+        }
+    }
+    result
 }
 
 /// Every path the workload's process runs or may load code from, once each.
@@ -38,12 +70,16 @@ pub fn inspected(workload: &Workload, exists: impl Fn(&Path) -> bool) -> Vec<Exp
         path: workload.executable.clone().into(),
         what: Use::Program,
     };
-    let arguments = path_arguments(&workload.args, exists)
-        .into_iter()
-        .map(|path| Exposure {
-            path,
-            what: Use::Argument,
-        });
+    let arguments = path_arguments(
+        &workload.args,
+        Path::new(&workload.working_directory),
+        exists,
+    )
+    .into_iter()
+    .map(|path| Exposure {
+        path,
+        what: Use::Argument,
+    });
     let folder = Exposure {
         path: workload.working_directory.clone().into(),
         what: Use::Folder,
@@ -124,7 +160,44 @@ mod tests {
             "https://example.com/hook".into(),
             "--url=https://example.com/hook".into(),
         ];
-        assert_eq!(path_arguments(&args, exists), [script, config, folder]);
+        assert_eq!(
+            path_arguments(&args, &absolute("work"), exists),
+            [script, config, folder]
+        );
+    }
+
+    #[test]
+    fn relative_arguments_are_resolved_against_the_working_folder() {
+        let root = absolute("k3up-exposure");
+        let folder = root.join("work");
+        let above = root.join("x").join("job.cmd");
+        let bare = folder.join("job.ps1");
+        let option = folder.join("sub").join("a.txt");
+        let existing = [
+            above.clone(),
+            bare.clone(),
+            option.clone(),
+            folder.clone(),
+            root.clone(),
+        ];
+        let exists = |path: &Path| existing.iter().any(|known| known == path);
+        let separator = std::path::MAIN_SEPARATOR;
+        let args = [
+            format!("..{separator}x{separator}job.cmd"),
+            "job.ps1".into(),
+            format!("--file=sub{separator}a.txt"),
+            "missing.ps1".into(),
+            format!("--log=logs{separator}missing.log"),
+            ".".into(),
+            "..".into(),
+            format!(".{separator}"),
+            "--dir=..".into(),
+        ];
+        assert_eq!(
+            path_arguments(&args, &folder, exists),
+            [above, bare, option]
+        );
+        assert!(path_arguments(&["job.ps1".into()], Path::new("work"), |_| true).is_empty());
     }
 
     #[test]

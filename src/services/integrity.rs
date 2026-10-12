@@ -47,15 +47,81 @@ pub fn from_hex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Creates the secret for `prefix` when it is missing, and protects its key either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPlan {
+    Keep,
+    Create,
+}
+
+/// A new key would make every existing signature fail, and the services that run those
+/// workloads would refuse them at their next start, so one is made only while nothing is
+/// signed.
+pub fn plan_key(prefix: &str, stored: Option<&[u8]>, signed: usize) -> anyhow::Result<KeyPlan> {
+    if stored.is_some_and(|key| key.len() == KEY_LENGTH) {
+        return Ok(KeyPlan::Keep);
+    }
+    if signed == 0 {
+        return Ok(KeyPlan::Create);
+    }
+    let definitions = if signed == 1 {
+        "1 workload definition is".to_string()
+    } else {
+        format!("{signed} workload definitions are")
+    };
+    anyhow::bail!(
+        r"The signing key in HKLM\{} is missing or damaged, but {definitions} signed with it. Restore the key from a backup, or remove those workloads with `k3up remove --stop NAME` and re-apply them from a trusted manifest after `k3up services enable`.",
+        key_path(prefix)
+    )
+}
+
+/// The `.sig` files in `workloads`, whatever the case of their extension.
+pub fn signed_definitions(workloads: &std::path::Path) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    let entries = match std::fs::read_dir(workloads) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        entries => entries.with_context(|| format!("Read {}", workloads.display()))?,
+    };
+    let mut signed = 0;
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("Read {}", workloads.display()))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sig"))
+        {
+            signed += 1;
+        }
+    }
+    Ok(signed)
+}
+
+/// Refuses, changing nothing, when the secret for `prefix` is missing or damaged while
+/// definitions in `workloads` are signed.
 #[cfg(windows)]
-pub fn ensure_key(prefix: &str) -> anyhow::Result<()> {
+pub fn check_key(prefix: &str, workloads: &std::path::Path) -> anyhow::Result<()> {
+    let stored = crate::win32::registry_binary(
+        crate::win32::Hive::LocalMachine,
+        &key_path(prefix),
+        KEY_VALUE,
+    );
+    plan_key(prefix, stored.as_deref(), signed_definitions(workloads)?).map(drop)
+}
+
+/// Creates the secret for `prefix` when it is missing and nothing in `workloads` is signed,
+/// and protects its key either way.
+#[cfg(windows)]
+pub fn ensure_key(prefix: &str, workloads: &std::path::Path) -> anyhow::Result<()> {
+    check_key(prefix, workloads)?;
     crate::win32::protected_registry_binary(
         &key_path(prefix),
         KEY_SDDL,
         KEY_VALUE,
         KEY_LENGTH,
-        || crate::win32::random_bytes(KEY_LENGTH),
+        || {
+            plan_key(prefix, None, signed_definitions(workloads)?)?;
+            crate::win32::random_bytes(KEY_LENGTH)
+        },
     )
     .map(|_| ())
 }
@@ -70,7 +136,7 @@ pub fn load_key(prefix: &str) -> anyhow::Result<Vec<u8>> {
     .filter(|key| key.len() == KEY_LENGTH)
     .ok_or_else(|| {
         anyhow::anyhow!(
-            r"The services mode signing key in HKLM\{} is missing or unreadable. Run `k3up services enable` from an elevated terminal",
+            r"The services mode signing key in HKLM\{} is missing, damaged or unreadable. Run k3up from an elevated terminal. If the key is lost, restore it from a backup, or remove the workloads with `k3up remove --stop NAME` and re-apply them from a trusted manifest after `k3up services enable`.",
             key_path(prefix)
         )
     })
@@ -119,6 +185,39 @@ mod tests {
         for broken in ["0", "zz", "0é", "+1"] {
             assert_eq!(from_hex(broken), None, "{broken}");
         }
+    }
+
+    #[test]
+    fn a_key_is_created_only_while_nothing_is_signed_with_the_old_one() {
+        let valid = [7u8; KEY_LENGTH];
+        let short = [7u8; KEY_LENGTH - 1];
+        assert_eq!(plan_key("K3Up_", None, 0).unwrap(), KeyPlan::Create);
+        assert_eq!(plan_key("K3Up_", Some(&short), 0).unwrap(), KeyPlan::Create);
+        assert_eq!(plan_key("K3Up_", Some(&valid), 0).unwrap(), KeyPlan::Keep);
+        assert_eq!(plan_key("K3Up_", Some(&valid), 3).unwrap(), KeyPlan::Keep);
+        for stored in [None, Some(&short[..]), Some(&[][..])] {
+            assert_eq!(
+                plan_key("K3Up_", stored, 2).unwrap_err().to_string(),
+                r"The signing key in HKLM\SOFTWARE\K3 Up\Integrity is missing or damaged, but 2 workload definitions are signed with it. Restore the key from a backup, or remove those workloads with `k3up remove --stop NAME` and re-apply them from a trusted manifest after `k3up services enable`."
+            );
+        }
+        let one = plan_key("K3Up_", None, 1).unwrap_err().to_string();
+        assert!(
+            one.contains(", but 1 workload definition is signed with it."),
+            "{one}"
+        );
+    }
+
+    #[test]
+    fn signatures_are_counted_whatever_the_case_of_their_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let workloads = dir.path().join("workloads");
+        assert_eq!(signed_definitions(&workloads).unwrap(), 0);
+        std::fs::create_dir(&workloads).unwrap();
+        for name in ["web.toml", "web.sig", "api.SIG", "notes.txt", "sig"] {
+            std::fs::write(workloads.join(name), "").unwrap();
+        }
+        assert_eq!(signed_definitions(&workloads).unwrap(), 2);
     }
 
     #[test]

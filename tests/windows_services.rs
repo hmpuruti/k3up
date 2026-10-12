@@ -87,7 +87,7 @@ impl Machine {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         );
-        integrity::ensure_key(&prefix).unwrap();
+        integrity::ensure_key(&prefix, &data.join("workloads")).unwrap();
         let backend = Backend::with(
             &data,
             Settings {
@@ -223,8 +223,8 @@ impl Machine {
         })
     }
 
-    fn cli(&self, arguments: &[&str]) -> (bool, String) {
-        let output = std::process::Command::new(CLI)
+    fn cli_output(&self, arguments: &[&str]) -> std::process::Output {
+        std::process::Command::new(CLI)
             .arg("--data-dir")
             .arg(&self.data)
             .arg("--json")
@@ -232,7 +232,11 @@ impl Machine {
             .env("K3UP_SERVICE_PREFIX", &self.prefix)
             .env("K3UP_HOST", HOST)
             .output()
-            .unwrap();
+            .unwrap()
+    }
+
+    fn cli(&self, arguments: &[&str]) -> (bool, String) {
+        let output = self.cli_output(arguments);
         (
             output.status.success(),
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -678,6 +682,50 @@ fn a_program_users_may_change_is_created_with_a_warning() {
 }
 
 #[test]
+fn a_start_that_fails_after_the_create_still_warns() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let program = open_folder(&machine).join("cmd.exe");
+    std::fs::copy(system_cmd(), &program).unwrap();
+    let data = machine.data.to_string_lossy().into_owned();
+    let output = machine.cli_output(&[
+        "create",
+        "failing",
+        "--exe",
+        &program.to_string_lossy(),
+        "--cwd",
+        &data,
+        "--never-restart",
+        "--start",
+        "--wait",
+        "--",
+        "/c",
+        "exit",
+        "1",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    let response: Response = serde_json::from_str(&stdout).unwrap();
+    assert!(!response.ok);
+    assert_eq!(
+        warnings(&response.message),
+        [exposure::warning_line("failing", &program)],
+        "{}",
+        response.message
+    );
+    assert!(
+        !response.message.starts_with("Warning: "),
+        "{}",
+        response.message
+    );
+    assert_eq!(
+        machine.get("failing").workload.executable,
+        program.to_string_lossy()
+    );
+}
+
+#[test]
 fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
     let Some(machine) = Machine::start() else {
         return;
@@ -779,6 +827,11 @@ fn only_scripts_users_may_change_are_warned_about() {
     assert!(warnings(&quiet).is_empty(), "{quiet}");
     let warned = create("warned", &open);
     assert_eq!(warnings(&warned), [exposure::warning_line("warned", &open)]);
+    let relative = create("relative", Path::new(r"..\open\job.cmd"));
+    assert_eq!(
+        warnings(&relative),
+        [exposure::warning_line("relative", &open)]
+    );
 
     let option = Workload {
         name: "option".into(),
@@ -864,6 +917,51 @@ fn the_host_runs_only_definitions_k3up_signed() {
     machine.ok(Command::Stop {
         name: "signed".into(),
     });
+}
+
+#[test]
+fn a_lost_key_is_not_replaced_while_definitions_are_signed_with_it() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    assert!(machine.put(machine.workload("kept", "pulse")).ok);
+    let workloads = machine.data.join("workloads");
+    let key = integrity::key_path(&machine.prefix);
+    let stored = || k3up::win32::registry_binary(k3up::win32::Hive::LocalMachine, &key, "Key");
+    let refused = format!(
+        r"The signing key in HKLM\{key} is missing or damaged, but 1 workload definition is signed with it. Restore the key from a backup, or remove those workloads with `k3up remove --stop NAME` and re-apply them from a trusted manifest after `k3up services enable`."
+    );
+
+    k3up::win32::delete_registry_value(k3up::win32::Hive::LocalMachine, &key, "Key").unwrap();
+    let error = integrity::ensure_key(&machine.prefix, &workloads).unwrap_err();
+    assert_eq!(format!("{error:#}"), refused);
+    assert_eq!(stored(), None);
+
+    let output = std::process::Command::new("reg.exe")
+        .args([
+            "add",
+            &format!(r"HKLM\{key}"),
+            "/v",
+            "Key",
+            "/t",
+            "REG_BINARY",
+        ])
+        .args(["/d", "0102", "/f"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let error = integrity::ensure_key(&machine.prefix, &workloads).unwrap_err();
+    assert_eq!(format!("{error:#}"), refused);
+    assert_eq!(stored(), Some(vec![1, 2]));
+
+    machine.ok(Command::Remove {
+        name: "kept".into(),
+    });
+    integrity::ensure_key(&machine.prefix, &workloads).unwrap();
+    assert_eq!(
+        integrity::load_key(&machine.prefix).unwrap().len(),
+        integrity::KEY_LENGTH
+    );
 }
 
 #[test]

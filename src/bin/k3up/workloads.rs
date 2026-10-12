@@ -43,30 +43,56 @@ pub fn create(client: &Client, request: Create) -> Result<Response> {
         workload: Box::new(workload.clone()),
         create_only: true,
     })?;
-    if !response.ok || !request.start {
-        return Ok(warn_exposed(client, &[workload], response));
+    if !response.ok {
+        return Ok(response);
     }
-    let started = start(client, &request.name, request.wait, request.timeout)?;
-    Ok(warn_exposed(client, &[workload], started))
+    let warnings = exposure_warnings(client, &[workload]);
+    let outcome = if request.start {
+        start(client, &request.name, request.wait, request.timeout)
+    } else {
+        Ok(response)
+    };
+    with_warnings(outcome, &warnings)
 }
 
-/// In services mode, adds a warning line for each path of `workloads` that users who aren't
+/// In services mode, a warning line for each path of `workloads` that users who aren't
 /// administrators may change, since the workloads run as SYSTEM.
-pub fn warn_exposed(client: &Client, workloads: &[Workload], response: Response) -> Response {
-    if !response.ok || !k3up::services::active(&client.data_dir) {
-        return response;
+pub fn exposure_warnings(client: &Client, workloads: &[Workload]) -> Vec<String> {
+    if !k3up::services::active(&client.data_dir) {
+        return vec![];
     }
-    let lines: Vec<String> = workloads
+    workloads
         .iter()
         .flat_map(|workload| exposure::warning_lines(workload, &exposure::exposed_paths(workload)))
-        .collect();
-    if lines.is_empty() {
+        .collect()
+}
+
+/// Adds the warnings for a saved definition to the outcome of what followed, so that a start
+/// that failed afterwards still reports them.
+fn with_warnings(outcome: Result<Response>, warnings: &[String]) -> Result<Response> {
+    if warnings.is_empty() {
+        return outcome;
+    }
+    let response = outcome.unwrap_or_else(|error| Response::error(format!("{error:#}")));
+    Ok(appended(response, warnings))
+}
+
+fn appended(response: Response, warnings: &[String]) -> Response {
+    if warnings.is_empty() {
         return response;
     }
     Response {
-        message: format!("{}\n{}", response.message, lines.join("\n")),
+        message: format!("{}\n{}", response.message, warnings.join("\n")),
         ..response
     }
+}
+
+/// Adds the warnings for `workloads` to a response that saved them.
+pub fn warn_exposed(client: &Client, workloads: &[Workload], response: Response) -> Response {
+    if !response.ok {
+        return response;
+    }
+    appended(response, &exposure_warnings(client, workloads))
 }
 
 pub struct Edit {
@@ -124,8 +150,7 @@ pub fn edit(client: &Client, request: Edit) -> Result<Response> {
         workload.args = request.args;
     }
     workload.validate()?;
-    let response = save_edit(client, &current, workload.clone(), request.restart_running)?;
-    Ok(warn_exposed(client, &[workload], response))
+    save_edit(client, &current, workload, request.restart_running)
 }
 
 fn save_edit(
@@ -137,12 +162,14 @@ fn save_edit(
     let name = current.workload.name.clone();
     let live = current.pid.is_some() || current.desired_running;
     if workload == current.workload {
-        return Ok(Response::success("No changes"));
+        let unchanged = Response::success("No changes");
+        return Ok(warn_exposed(client, &[workload], unchanged));
     }
     // Labels apply to a running workload at once, unless a restart was asked for anyway.
     let relabel = current.workload.only_labels_differ(&workload);
     if !live || (relabel && !restart_running) {
-        return put(client, workload);
+        let saved = put(client, workload.clone())?;
+        return Ok(warn_exposed(client, &[workload], saved));
     }
     if !restart_running {
         bail!(
@@ -151,17 +178,18 @@ fn save_edit(
         );
     }
     checked(client.send(Command::Stop { name: name.clone() })?)?;
-    let saved = put(client, workload);
+    let saved = put(client, workload.clone());
     let started = client.send(Command::Start { name: name.clone() });
     let saved = saved?;
     if !saved.ok {
         return Ok(saved);
     }
-    let started = checked(started?)?;
-    Ok(Response {
+    let warnings = exposure_warnings(client, &[workload]);
+    let restarted = started.and_then(checked).map(|started| Response {
         message: format!("{}\nStarted {name} again", saved.message),
         ..started
-    })
+    });
+    with_warnings(restarted, &warnings)
 }
 
 fn put(client: &Client, workload: Workload) -> Result<Response> {
@@ -432,5 +460,29 @@ pub fn logs(
         }
         after = Some(response.offset.unwrap_or_default());
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warnings_follow_the_outcome_whether_or_not_it_succeeded() {
+        let warnings = ["Warning: one".to_string(), "Warning: two".to_string()];
+        let started = with_warnings(Ok(Response::success("Started web")), &warnings).unwrap();
+        assert!(started.ok);
+        assert_eq!(started.message, "Started web\nWarning: one\nWarning: two");
+
+        let refused = with_warnings(Ok(Response::error("web stopped")), &warnings).unwrap();
+        assert!(!refused.ok);
+        assert_eq!(refused.message, "web stopped\nWarning: one\nWarning: two");
+
+        let failed = with_warnings(Err(anyhow::anyhow!("web failed")), &warnings).unwrap();
+        assert!(!failed.ok);
+        assert_eq!(failed.message, "web failed\nWarning: one\nWarning: two");
+
+        let quiet = with_warnings(Err(anyhow::anyhow!("web failed")), &[]).unwrap_err();
+        assert_eq!(quiet.to_string(), "web failed");
     }
 }

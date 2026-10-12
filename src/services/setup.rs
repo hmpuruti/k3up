@@ -132,7 +132,8 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
     refuse_central_agent_service()?;
     let registered = super::registered();
     super::check_registration(super::in_use().as_deref(), data)?;
-    super::integrity::ensure_key(&settings.prefix)?;
+    let workloads = Layout::new(data).workloads();
+    super::integrity::check_key(&settings.prefix, &workloads)?;
     let _lock = lock_if_prepared(data)?;
     let target = install_dir()?;
     if target.exists() {
@@ -142,6 +143,7 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
     let prefix = settings.prefix.as_str();
     let (jobs, running) = running_workloads(data, prefix)?;
     refuse_running_jobs(&jobs)?;
+    super::integrity::ensure_key(prefix, &workloads)?;
     install_then_repair(
         &mut Services { prefix },
         &running,
@@ -270,7 +272,7 @@ fn program_sources(target: &Path) -> Result<Option<Vec<(&'static str, File)>>> {
     if !source.join(PROGRAMS[0]).is_file() {
         bail!("Place k3up-host.exe beside k3up.exe");
     }
-    if same_dir(&source, target) {
+    if crate::platform::same_dir(&source, target) {
         return Ok(None);
     }
     open_sources(&source, target).map(Some)
@@ -383,13 +385,6 @@ fn copy_programs(sources: Vec<(&str, File)>, target: &Path) -> Result<Vec<String
         lines.push(format!("Copied {program} to {}", target.display()));
     }
     Ok(lines)
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
 }
 
 pub fn disable(data: &Path) -> Result<String> {

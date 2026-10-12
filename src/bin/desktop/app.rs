@@ -232,7 +232,7 @@ impl App {
     fn managed(&self) -> Option<&LoginAgent> {
         self.login
             .as_ref()
-            .filter(|login| login.data_dir() == self.client.data_dir)
+            .filter(|login| k3up::platform::same_dir(login.data_dir(), &self.client.data_dir))
     }
 
     fn link(&self) -> Link {
