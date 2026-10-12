@@ -682,8 +682,9 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
     let Some(machine) = Machine::start() else {
         return;
     };
+    let open = open_folder(&machine);
     let mut workload = machine.workload("later", "run");
-    let missing = open_folder(&machine).join("not-yet").join("tool.exe");
+    let missing = open.join("not-yet").join("tool.exe");
     workload.executable = missing.to_string_lossy().into();
     let exposed: Vec<PathBuf> = exposure::exposed_paths(&workload)
         .into_iter()
@@ -701,7 +702,7 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
 
     // A link in a protected folder that leads to a missing folder users can create.
     let link = machine.data.join("later-link");
-    std::os::windows::fs::symlink_dir(open_folder(&machine).join("gone"), &link).unwrap();
+    std::os::windows::fs::symlink_dir(open.join("gone"), &link).unwrap();
     let through_link = link.join("tool.exe");
     workload.executable = through_link.to_string_lossy().into();
     let exposed: Vec<PathBuf> = exposure::exposed_paths(&workload)
@@ -712,7 +713,7 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
     std::fs::remove_dir(&link).unwrap();
 
     // A link higher up leads into a folder users control, though the last folder is protected.
-    let real = open_folder(&machine).join("deep");
+    let real = open.join("deep");
     std::fs::create_dir_all(real.join("inner")).unwrap();
     k3up::win32::secure_dir(&real.join("inner"), k3up::win32::PRIVATE_DIR_SDDL).unwrap();
     let hop = machine.data.join("hop");
@@ -729,7 +730,7 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
     // A protected link leads through a second link that sits in a folder users control.
     let settled = machine.data.join("settled");
     std::fs::create_dir(&settled).unwrap();
-    let middle = open_folder(&machine).join("middle");
+    let middle = open.join("middle");
     std::os::windows::fs::symlink_dir(&settled, &middle).unwrap();
     let front = machine.data.join("front");
     std::os::windows::fs::symlink_dir(&middle, &front).unwrap();
