@@ -135,6 +135,10 @@ pub fn inspected(
     exists: impl Fn(&Path) -> bool,
     machine_path: Option<String>,
 ) -> Vec<Exposure> {
+    // A definition the caller may not read arrives with its paths left empty.
+    if workload.executable.is_empty() {
+        return vec![];
+    }
     let program = Exposure {
         path: workload.executable.clone().into(),
         what: Use::Program,
@@ -381,6 +385,14 @@ mod tests {
             ..Default::default()
         };
         assert!(inspected(&hidden, |_| true, None).is_empty());
+        assert!(
+            inspected(
+                &hidden,
+                |_| true,
+                Some(std::env::temp_dir().display().to_string())
+            )
+            .is_empty()
+        );
         assert!(exposed_paths(&hidden).is_empty());
     }
 }
