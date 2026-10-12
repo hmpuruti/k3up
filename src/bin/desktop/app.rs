@@ -268,6 +268,19 @@ impl App {
                     };
                     let started =
                         start.then(|| login.start().map_err(|error| format!("{error:#}")));
+                    // `services enable` may have published services mode meanwhile; the
+                    // agent's workloads must not run beside the services.
+                    if k3up::services::machine_mode_on() {
+                        let undone = k3up::autostart::back_out(&login, registered == Ok(true))
+                            .map_err(|error| format!("{error:#}"));
+                        let reason = undone.err().unwrap_or_else(|| {
+                            "Services mode was turned on, so the agent was stopped".into()
+                        });
+                        return AgentSetup {
+                            registered: Err(reason.clone()),
+                            started: start.then_some(Err(reason)),
+                        };
+                    }
                     AgentSetup {
                         registered,
                         started,

@@ -60,6 +60,12 @@ fn main() -> iced::Result {
             if let Err(error) = login.start() {
                 eprintln!("{error:#}");
             }
+            // `services enable` may have published services mode while the agent started.
+            if services::machine_mode_on()
+                && let Err(error) = k3up::autostart::back_out(&login, options.register_agent)
+            {
+                eprintln!("{error:#}");
+            }
         }
         return Ok(());
     }

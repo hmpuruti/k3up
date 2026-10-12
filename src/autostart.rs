@@ -55,6 +55,56 @@ pub fn desktop_agent(
     Some(LoginAgent::new(agent?, data.to_path_buf()))
 }
 
+/// Undoes an agent setup that raced `k3up services enable`: stops the agent first, then
+/// removes its login item if this setup registered it, and reports every step that failed.
+pub fn back_out(login: &LoginAgent, registered: bool) -> Result<()> {
+    back_out_with(
+        || stop_agent(login),
+        || {
+            if registered {
+                login.unregister()
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+fn back_out_with(
+    stop: impl FnOnce() -> Result<()>,
+    unregister: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let failures: Vec<String> = [stop(), unregister()]
+        .into_iter()
+        .filter_map(|step| step.err().map(|error| format!("{error:#}")))
+        .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Stopping the agent after services mode was turned on failed: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn stop_agent(login: &LoginAgent) -> Result<()> {
+    if !login.is_running() {
+        return Ok(());
+    }
+    // A reply may be lost when the agent exits first; only the exit itself counts.
+    let _ = crate::client::Client::new(login.data_dir()).send(crate::protocol::Command::Shutdown);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while login.is_running() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "The agent did not stop within 60 seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(())
+}
+
 /// Starts the agent for the current user at login and on demand.
 ///
 /// macOS uses a launchd LaunchAgent and Linux a systemd user service; both restart the agent
@@ -481,6 +531,30 @@ mod tests {
         assert_eq!(login.data_dir(), data);
         assert!(desktop_agent(Some(agent), data, true).is_none());
         assert!(desktop_agent(None, data, false).is_none());
+    }
+
+    #[test]
+    fn backing_out_tries_every_step_and_reports_each_failure() {
+        assert!(back_out_with(|| Ok(()), || Ok(())).is_ok());
+        let error = back_out_with(
+            || anyhow::bail!("stop failed"),
+            || anyhow::bail!("unregister failed"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("stop failed") && error.contains("unregister failed"),
+            "{error}"
+        );
+        let unregistered = std::cell::Cell::new(false);
+        let _ = back_out_with(
+            || anyhow::bail!("stop failed"),
+            || {
+                unregistered.set(true);
+                Ok(())
+            },
+        );
+        assert!(unregistered.get());
     }
 
     #[test]
