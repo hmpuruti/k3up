@@ -264,9 +264,26 @@ fn commands_found(
                     .iter()
                     .map(|name| folder.join(name))
                     .find(|path| exists(path))
+                    .map(|path| as_listed(&path))
             })
         })
         .collect()
+}
+
+/// `path` with its file name spelled as the folder lists it, since a PATHEXT extension such
+/// as `.CMD` matches `helper.cmd` on Windows but should be reported as the file is named.
+fn as_listed(path: &Path) -> PathBuf {
+    let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let wanted = name.to_string_lossy().to_lowercase();
+    std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().to_lowercase() == wanted)
+        .map(|entry| entry.path())
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// A file that runs or loads code, judged by its extension.
