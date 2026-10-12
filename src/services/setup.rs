@@ -1,6 +1,6 @@
 //! Turning services mode on and off for a data directory.
 use super::{
-    backend::{Backend, Settings},
+    backend::{Backend, DEFAULT_PREFIX, Settings},
     files::{self, Layout},
     host,
     pause::{Control, install_then_repair},
@@ -24,15 +24,22 @@ use std::{
 /// Copied to Program Files from the folder of the running k3up.exe. The host is required.
 const PROGRAMS: [&str; 3] = ["k3up-host.exe", "k3up.exe", "k3up-desktop.exe"];
 const CENTRAL_AGENT: &str = "K3Up";
+pub const SETUP_WAIT: Duration = Duration::from_secs(60);
+/// SYSTEM and Administrators only.
+const SETUP_LOCK_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
 pub fn install_dir() -> Result<PathBuf> {
     Ok(crate::win32::program_files()?.join("K3 Up"))
 }
 
 /// Creates or secures the data directory and its folders and what they already hold, then
-/// writes the marker. Safe to repeat, and repeating it replaces a marker written with older
-/// permissions.
+/// writes the marker. Safe to repeat.
 pub fn prepare(data: &Path) -> Result<()> {
+    prepare_folders(data)?;
+    mark(data)
+}
+
+fn prepare_folders(data: &Path) -> Result<()> {
     let layout = Layout::new(data);
     refuse_tampered(&layout)?;
     secure_dir(data, ROOT_DIR_SDDL)?;
@@ -45,9 +52,27 @@ pub fn prepare(data: &Path) -> Result<()> {
         secure_dir(&folder, sddl)?;
         reset_contents(&folder)?;
     }
-    files::write_atomic(&layout.marker(), b"", |path| {
+    Ok(())
+}
+
+/// Replaces a marker written with older permissions, too.
+fn mark(data: &Path) -> Result<()> {
+    files::write_atomic(&Layout::new(data).marker(), b"", |path| {
         set_security(path, MARKER_SDDL)
     })
+}
+
+/// Held across the whole machine while `services enable` or `services disable` runs, since
+/// the registry record and service names are the machine's. Tests use their own service name
+/// prefix, and with it their own lock.
+pub fn setup_lock(prefix: &str, wait: Duration) -> Result<crate::win32::HeldMutex> {
+    let name = if prefix == DEFAULT_PREFIX {
+        r"Global\K3UpServicesSetup".to_string()
+    } else {
+        format!(r"Global\K3UpServicesSetup_{prefix}")
+    };
+    crate::win32::lock_mutex(&name, SETUP_LOCK_SDDL, wait)?
+        .context("Another k3up command is enabling or disabling services mode; try again")
 }
 
 /// Refuses definitions that users who aren't administrators could have edited, or that sit
@@ -97,7 +122,9 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
             data.display()
         );
     }
-    super::check_registration(super::registered().as_deref(), data)?;
+    let _setup = setup_lock(&settings.prefix, SETUP_WAIT)?;
+    let registered = super::registered();
+    super::check_registration(registered.as_deref(), data)?;
     let _lock = lock_if_prepared(data)?;
     let target = install_dir()?;
     if target.exists() {
@@ -121,26 +148,47 @@ pub fn enable(data: &Path) -> Result<Vec<String>> {
             )]),
         },
         || {
-            prepare(data)?;
-            register(data)?;
+            prepare_folders(data)?;
+            super::record(&mut Records(data), registered.is_some())?;
             Ok(vec![format!("Services mode is on for {}", data.display())])
         },
     )
     .context("Turning services mode on did not finish")
 }
 
-/// Records `data` for the whole machine as the one services mode directory. Only `enable`
-/// and `disable` touch this record; the tests, which use their own service name prefix and
-/// data directories, call `prepare` instead and leave it alone.
-fn register(data: &Path) -> Result<()> {
-    let data = std::path::absolute(data)?;
-    crate::win32::set_registry_string(
+/// The machine-wide record and the marker for `data`. Only `enable` and `disable` touch the
+/// record; the tests, which use their own service name prefix and data directories, call
+/// `prepare` instead and leave it alone.
+struct Records<'a>(&'a Path);
+
+impl super::Records for Records<'_> {
+    fn register(&mut self) -> Result<()> {
+        let data = std::path::absolute(self.0)?;
+        crate::win32::set_registry_string(
+            crate::win32::Hive::LocalMachine,
+            super::REGISTRY_KEY,
+            super::REGISTRY_VALUE,
+            &data.to_string_lossy(),
+        )
+        .context("Record the services mode data directory in the registry")
+    }
+
+    fn unregister(&mut self) -> Result<()> {
+        unregister()
+    }
+
+    fn mark(&mut self) -> Result<()> {
+        mark(self.0)
+    }
+}
+
+fn unregister() -> Result<()> {
+    crate::win32::delete_registry_value(
         crate::win32::Hive::LocalMachine,
         super::REGISTRY_KEY,
         super::REGISTRY_VALUE,
-        &data.to_string_lossy(),
     )
-    .context("Record the services mode data directory in the registry")
+    .context("Remove the services mode record from the registry")
 }
 
 /// The lock that commands changing services hold, once a protected folder exists to hold it.
@@ -287,6 +335,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 pub fn disable(data: &Path) -> Result<String> {
     let settings = Settings::from_env()?;
+    let _setup = setup_lock(&settings.prefix, SETUP_WAIT)?;
     if let Some(registered) = super::registered() {
         super::check_registration(Some(data), &registered).map_err(|_| {
             anyhow!(
@@ -315,12 +364,7 @@ pub fn disable(data: &Path) -> Result<String> {
         }
         _ => {}
     }
-    crate::win32::delete_registry_value(
-        crate::win32::Hive::LocalMachine,
-        super::REGISTRY_KEY,
-        super::REGISTRY_VALUE,
-    )
-    .context("Remove the services mode record from the registry")?;
+    unregister()?;
     Ok(format!(
         "Services mode is off. Definitions, logs and history are kept in {}",
         data.display()

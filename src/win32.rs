@@ -10,9 +10,13 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     sync::OnceLock,
+    time::Duration,
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE, LocalFree},
+    Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE, LocalFree,
+        WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
         Authorization::{
@@ -37,7 +41,9 @@ use windows_sys::Win32::{
             HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW,
             RegGetValueW, RegSetKeyValueW,
         },
-        Threading::{GetCurrentProcess, OpenProcessToken},
+        Threading::{
+            CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
+        },
     },
     UI::Shell::{FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath},
 };
@@ -716,12 +722,32 @@ unsafe fn system_or_administrators(sid: PSID) -> bool {
 /// Refuses a pipe owned by anyone other than this user, SYSTEM or Administrators. Otherwise
 /// another local account could create the pipe while the agent is down and pose as it.
 pub fn verify_pipe_owner(pipe: &std::fs::File) -> Result<()> {
+    let trusted = with_owner(pipe.as_raw_handle() as HANDLE, |owner| {
+        // SAFETY: with_owner passes a valid SID.
+        unsafe {
+            if system_or_administrators(owner) {
+                Ok(true)
+            } else {
+                current_user_is(owner)
+            }
+        }
+    })
+    .context("Read agent pipe owner")?;
+    if !trusted? {
+        bail!("The agent pipe belongs to another account; refusing to connect");
+    }
+    Ok(())
+}
+
+/// Calls `check` with the owner of the kernel object that `handle`, opened with READ_CONTROL,
+/// refers to.
+fn with_owner<T>(handle: HANDLE, check: impl FnOnce(PSID) -> T) -> Result<T> {
     let mut owner: PSID = ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: the handle is open for the duration of the call; out-pointers are valid.
     let status = unsafe {
         GetSecurityInfo(
-            pipe.as_raw_handle() as HANDLE,
+            handle,
             SE_KERNEL_OBJECT,
             OWNER_SECURITY_INFORMATION,
             &mut owner,
@@ -732,25 +758,77 @@ pub fn verify_pipe_owner(pipe: &std::fs::File) -> Result<()> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(status as i32))
-            .context("Read agent pipe owner");
+        return Err(std::io::Error::from_raw_os_error(status as i32).into());
     }
-    // SAFETY: owner points into descriptor, which stays allocated until LocalFree below.
-    let trusted = unsafe {
-        if system_or_administrators(owner) {
-            Ok(true)
-        } else {
-            current_user_is(owner)
-        }
-    };
-    // SAFETY: allocated by GetSecurityInfo.
+    let result = check(owner);
+    // SAFETY: allocated by GetSecurityInfo; `owner` points into it and is no longer used.
     unsafe {
         LocalFree(descriptor);
     }
-    if !trusted? {
-        bail!("The agent pipe belongs to another account; refusing to connect");
+    Ok(result)
+}
+
+/// A named mutex this thread owns until it is dropped.
+pub struct HeldMutex(HANDLE);
+
+impl Drop for HeldMutex {
+    fn drop(&mut self) {
+        // SAFETY: this thread owns the mutex, and the handle is closed only here.
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
     }
-    Ok(())
+}
+
+/// Waits up to `wait` to own the mutex `name`, creating it with the access in `sddl` when it
+/// does not exist yet. `None` when another holder kept it the whole time. A holder that ended
+/// without releasing it leaves it to the next. An existing mutex that an account other than
+/// SYSTEM or Administrators created is refused: that account could hold it for ever.
+pub fn lock_mutex(name: &str, sddl: &str, wait: Duration) -> Result<Option<HeldMutex>> {
+    let mut attributes = SecurityAttributes::from_sddl(sddl)?;
+    let text = wide(OsStr::new(name));
+    // SAFETY: the attributes and the NUL-terminated name outlive the call.
+    let handle = unsafe { CreateMutexW(attributes.as_mut_ptr(), 0, text.as_ptr()) };
+    let opened = std::io::Error::last_os_error();
+    if handle.is_null() {
+        return Err(opened).with_context(|| format!("Open {name}"));
+    }
+    let close = |error: anyhow::Error| {
+        // SAFETY: the handle came from CreateMutexW and is not used again.
+        unsafe {
+            CloseHandle(handle);
+        }
+        error
+    };
+    if opened.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
+        // SAFETY: with_owner passes a valid SID.
+        let trusted = with_owner(handle, |owner| unsafe { system_or_administrators(owner) })
+            .with_context(|| format!("Read the owner of {name}"))
+            .map_err(close)?;
+        if !trusted {
+            return Err(close(anyhow::anyhow!(
+                "{name} belongs to an account other than SYSTEM or Administrators. Restart Windows and try again"
+            )));
+        }
+    }
+    // INFINITE is u32::MAX, so a longer wait stops just short of it.
+    let millis = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX - 1);
+    // SAFETY: the handle is open.
+    match unsafe { WaitForSingleObject(handle, millis) } {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(HeldMutex(handle))),
+        WAIT_TIMEOUT => {
+            // SAFETY: the handle came from CreateMutexW and is not used again.
+            unsafe {
+                CloseHandle(handle);
+            }
+            Ok(None)
+        }
+        _ => Err(close(
+            anyhow::Error::from(std::io::Error::last_os_error())
+                .context(format!("Wait for {name}")),
+        )),
+    }
 }
 
 /// # Safety

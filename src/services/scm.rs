@@ -1,5 +1,8 @@
 //! The Windows service manager calls that services mode needs.
-use super::status::{Scm, Service, description, display_name, instance_of, starts_at_boot};
+use super::status::{
+    Recovery, Scm, Service, ServiceSettings, description, display_name, instance_of,
+    split_command_line, starts_at_boot,
+};
 use crate::model::Workload;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -35,6 +38,7 @@ use windows_sys::Win32::{
 
 pub const START_TIMEOUT: Duration = Duration::from_secs(30);
 const DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+const ACCOUNT: &str = "LocalSystem";
 
 /// How the service manager starts a workload's host.
 pub struct Registration<'a> {
@@ -284,12 +288,10 @@ fn info(workload: &Workload, at: &Registration) -> ServiceInfo {
     }
 }
 
-fn configure(handle: &windows_service::service::Service, workload: &Workload) -> Result<()> {
-    handle.set_description(description(workload))?;
-    handle.set_delayed_auto_start(starts_at_boot(workload))?;
-    // These only act when the host itself crashes. A workload that gave up for good reports
-    // a clean stop with an error code, which must not bring it back.
-    handle.update_failure_actions(ServiceFailureActions {
+/// These only act when the host itself crashes. A workload that gave up for good reports a
+/// clean stop with an error code, which must not bring it back.
+fn failure_actions() -> ServiceFailureActions {
+    ServiceFailureActions {
         reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
         reboot_msg: None,
         command: None,
@@ -302,9 +304,87 @@ fn configure(handle: &windows_service::service::Service, workload: &Workload) ->
                 })
                 .collect(),
         ),
-    })?;
+    }
+}
+
+fn configure(handle: &windows_service::service::Service, workload: &Workload) -> Result<()> {
+    handle.set_description(description(workload))?;
+    handle.set_delayed_auto_start(starts_at_boot(workload))?;
+    handle.update_failure_actions(failure_actions())?;
     handle.set_failure_actions_on_non_crash_failures(false)?;
     Ok(())
+}
+
+fn recovery(actions: &ServiceFailureActions, on_non_crash_failures: bool) -> Recovery {
+    Recovery {
+        reset: match actions.reset_period {
+            ServiceFailureResetPeriod::Never => None,
+            ServiceFailureResetPeriod::After(period) => Some(period),
+        },
+        actions: actions
+            .actions
+            .iter()
+            .flatten()
+            .map(|action| (action.action_type.to_raw(), action.delay))
+            .collect(),
+        on_non_crash_failures,
+    }
+}
+
+/// The settings `create` and `reconfigure` give the service.
+pub fn wanted(workload: &Workload, at: &Registration) -> ServiceSettings {
+    let info = info(workload, at);
+    ServiceSettings {
+        command: std::iter::once(info.executable_path.into_os_string())
+            .chain(info.launch_arguments)
+            .map(|word| word.to_string_lossy().into_owned())
+            .collect(),
+        start_type: info.start_type.to_raw(),
+        delayed: starts_at_boot(workload),
+        account: ACCOUNT.into(),
+        display_name: info.display_name.to_string_lossy().into_owned(),
+        description: description(workload).into(),
+        recovery: recovery(&failure_actions(), false),
+    }
+}
+
+/// The settings the service manager holds for `service`.
+pub fn settings(service: &str) -> Result<ServiceSettings> {
+    let handle = require(service, ServiceAccess::QUERY_CONFIG)?;
+    let read = || -> Result<ServiceSettings> {
+        let config = handle.query_config()?;
+        Ok(ServiceSettings {
+            command: split_command_line(&config.executable_path.to_string_lossy()),
+            start_type: config.start_type.to_raw(),
+            delayed: delayed(&handle)?,
+            account: config
+                .account_name
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            display_name: config.display_name.to_string_lossy().into_owned(),
+            description: service_description(&handle)?,
+            recovery: recovery(
+                &handle.get_failure_actions()?,
+                handle.get_failure_actions_on_non_crash_failures()?,
+            ),
+        })
+    };
+    read().with_context(|| format!("Read service {service}"))
+}
+
+fn service_description(handle: &windows_service::service::Service) -> Result<String> {
+    query_config2(handle, SERVICE_CONFIG_DESCRIPTION, |buffer| {
+        // SAFETY: for this level the buffer starts with a SERVICE_DESCRIPTIONW whose string is
+        // null or points into the same buffer.
+        unsafe { wide_string((*buffer.cast::<SERVICE_DESCRIPTIONW>()).lpDescription) }
+    })
+}
+
+fn delayed(handle: &windows_service::service::Service) -> Result<bool> {
+    query_config2(handle, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, |buffer| {
+        // SAFETY: for this level the buffer starts with a SERVICE_DELAYED_AUTO_START_INFO.
+        unsafe { (*buffer.cast::<SERVICE_DELAYED_AUTO_START_INFO>()).fDelayedAutostart != 0 }
+    })
 }
 
 fn change_access() -> ServiceAccess {
@@ -328,11 +408,17 @@ pub fn create(workload: &Workload, at: &Registration) -> Result<()> {
 }
 
 /// Applies the whole definition. Also used for a running service whose labels changed: the
-/// service manager accepts a new configuration while the service runs.
+/// service manager accepts a new configuration while the service runs. The account is named,
+/// since leaving it out keeps one someone else set.
 pub fn reconfigure(workload: &Workload, at: &Registration) -> Result<()> {
     let handle = require(at.service, change_access())?;
+    let info = ServiceInfo {
+        account_name: Some(ACCOUNT.into()),
+        account_password: Some(OsString::new()),
+        ..info(workload, at)
+    };
     handle
-        .change_config(&info(workload, at))
+        .change_config(&info)
         .with_context(|| format!("Change service {}", at.service))?;
     configure(&handle, workload).with_context(|| format!("Configure service {}", at.service))
 }
@@ -343,13 +429,15 @@ pub fn check_create_access() -> Result<()> {
 }
 
 /// What `create` and `reconfigure` set on a service, as the service manager holds it, so a
-/// failed change can be undone. Failure actions are left out: K3 Up always sets the same ones.
+/// failed change can be undone. The account is left out: its password cannot be read back.
 pub struct Snapshot {
     start_type: u32,
     command_line: Vec<u16>,
     display_name: Vec<u16>,
     description: String,
     delayed: bool,
+    failure_actions: ServiceFailureActions,
+    on_non_crash_failures: bool,
 }
 
 /// Opens the service with the rights a change needs, so a caller without them fails here,
@@ -358,21 +446,14 @@ pub fn snapshot(service: &str) -> Result<Snapshot> {
     let handle = require(service, change_access())?;
     let read = || -> Result<Snapshot> {
         let config = handle.query_config()?;
-        let description = query_config2(&handle, SERVICE_CONFIG_DESCRIPTION, |buffer| {
-            // SAFETY: for this level the buffer starts with a SERVICE_DESCRIPTIONW whose
-            // string is null or points into the same buffer.
-            unsafe { wide_string((*buffer.cast::<SERVICE_DESCRIPTIONW>()).lpDescription) }
-        })?;
-        let delayed = query_config2(&handle, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, |buffer| {
-            // SAFETY: for this level the buffer starts with a SERVICE_DELAYED_AUTO_START_INFO.
-            unsafe { (*buffer.cast::<SERVICE_DELAYED_AUTO_START_INFO>()).fDelayedAutostart != 0 }
-        })?;
         Ok(Snapshot {
             start_type: config.start_type.to_raw(),
             command_line: crate::win32::wide(config.executable_path.as_os_str()),
             display_name: crate::win32::wide(&config.display_name),
-            description,
-            delayed,
+            description: service_description(&handle)?,
+            delayed: delayed(&handle)?,
+            failure_actions: handle.get_failure_actions()?,
+            on_non_crash_failures: handle.get_failure_actions_on_non_crash_failures()?,
         })
     };
     read().with_context(|| format!("Read service {service}"))
@@ -429,10 +510,22 @@ pub fn restore(service: &str, snapshot: &Snapshot) -> Result<()> {
             snapshot.display_name.as_ptr(),
         )
     } != 0;
+    // Without actions, the reset period is ignored and the actions are kept; an empty list
+    // removes them.
+    let failure_actions = ServiceFailureActions {
+        actions: Some(snapshot.failure_actions.actions.clone().unwrap_or_default()),
+        reboot_msg: None,
+        command: None,
+        ..snapshot.failure_actions.clone()
+    };
     let restored = if changed {
         handle
             .set_description(&snapshot.description)
             .and_then(|()| handle.set_delayed_auto_start(snapshot.delayed))
+            .and_then(|()| handle.update_failure_actions(failure_actions))
+            .and_then(|()| {
+                handle.set_failure_actions_on_non_crash_failures(snapshot.on_non_crash_failures)
+            })
             .map_err(Into::into)
     } else {
         Err(anyhow::Error::from(std::io::Error::last_os_error()))

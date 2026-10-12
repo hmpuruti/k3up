@@ -182,6 +182,29 @@ impl Machine {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    fn sc_config(&self, name: &str, settings: &[&str]) {
+        let output = std::process::Command::new("sc.exe")
+            .args(["config", &self.service(name)])
+            .args(settings)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    fn apply(&self, workloads: &[Workload], dry_run: bool) -> Response {
+        self.send(Command::Apply {
+            manifest: Manifest {
+                version: 1,
+                workloads: workloads.to_vec(),
+            },
+            dry_run,
+        })
+    }
+
     fn cli(&self, arguments: &[&str]) -> (bool, String) {
         let output = std::process::Command::new(CLI)
             .arg("--data-dir")
@@ -1494,4 +1517,209 @@ fn definitions_users_could_edit_are_not_repaired_into_trust() {
         "{error}"
     );
     assert!(k3up::win32::writable_by_others(&edited).unwrap());
+}
+
+#[test]
+fn enabling_and_disabling_take_turns_across_the_machine() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let prefix = machine.prefix.clone();
+    let short = Duration::from_millis(300);
+    let other_thread = |prefix: &str| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| setup::setup_lock(prefix, short).map(drop))
+                .join()
+                .unwrap()
+        })
+    };
+    let held = setup::setup_lock(&prefix, short).unwrap();
+    let error = other_thread(&prefix).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Another k3up command is enabling or disabling services mode; try again"
+    );
+    let denied = as_standard_user(|| setup::setup_lock(&prefix, short).map(drop)).unwrap_err();
+    assert!(format!("{denied:#}").contains("os error 5"), "{denied:#}");
+    drop(held);
+    other_thread(&prefix).unwrap();
+
+    // A holder that ends without releasing the lock leaves it to the next.
+    std::thread::scope(|scope| {
+        scope.spawn(|| std::mem::forget(setup::setup_lock(&prefix, short).unwrap()));
+    });
+    drop(setup::setup_lock(&prefix, short).unwrap());
+}
+
+#[test]
+fn a_setup_lock_another_account_created_is_refused() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let output = std::process::Command::new("whoami.exe")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let user = text.trim().rsplit(',').next().unwrap().trim_matches('"');
+    assert!(user.starts_with("S-1-5-21-"), "{text}");
+    let name = format!(r"Global\K3UpTestSquat_{}", machine.prefix);
+    let squatted = k3up::win32::lock_mutex(
+        &name,
+        &format!("O:{user}D:(A;;GA;;;WD)"),
+        Duration::from_secs(1),
+    )
+    .unwrap()
+    .unwrap();
+    let error = std::thread::scope(|scope| {
+        scope
+            .spawn(|| k3up::win32::lock_mutex(&name, "D:P(A;;GA;;;SY)(A;;GA;;;BA)", WAIT).map(drop))
+            .join()
+            .unwrap()
+    })
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "{name} belongs to an account other than SYSTEM or Administrators. Restart Windows and try again"
+        )
+    );
+    drop(squatted);
+}
+
+#[test]
+fn names_that_differ_only_in_case_change_nothing() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let workloads = machine.data.join("workloads");
+    let both = machine.apply(
+        &[
+            machine.workload("Web", "pulse"),
+            machine.workload("web", "pulse"),
+        ],
+        false,
+    );
+    assert!(!both.ok);
+    assert_eq!(
+        both.message,
+        "The manifest names both 'Web' and 'web'; Windows treats names that differ only in case as the same"
+    );
+    assert!(!scm::exists(&machine.service("web")).unwrap());
+    assert!(files::names(&workloads, "toml").unwrap().is_empty());
+
+    assert!(machine.put(machine.workload("web", "pulse")).ok);
+    let config = machine.sc("qc", "web");
+    let saved = std::fs::read(workloads.join("web.toml")).unwrap();
+    let mut renamed = machine.workload("Web", "pulse");
+    renamed.description = "Renamed".into();
+    let expected = "A workload named 'web' already exists; Windows treats names that differ only in case as the same";
+    for dry_run in [true, false] {
+        let refused = machine.apply(std::slice::from_ref(&renamed), dry_run);
+        assert!(!refused.ok);
+        assert_eq!(refused.message, expected);
+    }
+    let created = machine.send(Command::Put {
+        workload: Box::new(renamed),
+        create_only: true,
+    });
+    assert_eq!(created.message, expected);
+    assert_eq!(machine.sc("qc", "web"), config);
+    assert_eq!(std::fs::read(workloads.join("web.toml")).unwrap(), saved);
+    assert_eq!(files::names(&workloads, "toml").unwrap(), ["web"]);
+
+    let mut web = machine.workload("web", "pulse");
+    web.description = "Front".into();
+    let updated = machine.put(web);
+    assert_eq!(updated.message, "Update web");
+}
+
+#[test]
+fn a_start_type_changed_outside_k3up_is_restored_while_running() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let web = machine.workload("drift", "pulse");
+    assert!(machine.put(web.clone()).ok);
+    let config = machine.sc("qc", "drift");
+    assert!(config.contains("DEMAND_START"), "{config}");
+    machine.ok(Command::Start {
+        name: "drift".into(),
+    });
+    let before = machine.until("drift", |status| status.state == State::Running);
+    machine.sc_config("drift", &["start=", "auto"]);
+    assert!(machine.sc("qc", "drift").contains("AUTO_START"));
+
+    let preview = machine.apply(std::slice::from_ref(&web), true);
+    assert_eq!(
+        preview.message,
+        "Preview only\nUpdate drift: service settings differ (start type)"
+    );
+    assert!(machine.sc("qc", "drift").contains("AUTO_START"));
+    let applied = machine.apply(std::slice::from_ref(&web), false);
+    assert_eq!(
+        applied.message,
+        "Update drift: service settings differ (start type)"
+    );
+    assert_eq!(machine.sc("qc", "drift"), config);
+    let after = machine.get("drift");
+    assert_eq!(after.state, State::Running);
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(
+        machine.apply(std::slice::from_ref(&web), false).message,
+        "No changes"
+    );
+}
+
+#[test]
+fn a_command_line_or_account_changed_outside_k3up_is_restored() {
+    let Some(machine) = Machine::start() else {
+        return;
+    };
+    let web = machine.workload("binpath", "pulse");
+    assert!(machine.put(web.clone()).ok);
+    let config = machine.sc("qc", "binpath");
+    let other = r"C:\Windows\System32\cmd.exe /c exit 0";
+    machine.sc_config("binpath", &["binPath=", other]);
+    assert!(machine.sc("qc", "binpath").contains(other));
+    let applied = machine.apply(std::slice::from_ref(&web), false);
+    assert_eq!(
+        applied.message,
+        "Update binpath: service settings differ (command line)"
+    );
+    assert_eq!(machine.sc("qc", "binpath"), config);
+
+    machine.sc_config(
+        "binpath",
+        &["obj=", r"NT AUTHORITY\LocalService", "password=", ""],
+    );
+    let applied = machine.apply(std::slice::from_ref(&web), false);
+    assert_eq!(
+        applied.message,
+        "Update binpath: service settings differ (account)"
+    );
+    assert_eq!(machine.sc("qc", "binpath"), config);
+
+    machine.ok(Command::Start {
+        name: "binpath".into(),
+    });
+    machine.until("binpath", |status| status.state == State::Running);
+    machine.sc_config("binpath", &["binPath=", other]);
+    let refused = machine.apply(std::slice::from_ref(&web), false);
+    assert!(!refused.ok);
+    assert_eq!(
+        refused.message,
+        "Stop 'binpath' before changing its definition: its service settings differ (command line)"
+    );
+    assert!(machine.sc("qc", "binpath").contains(other));
+    machine.ok(Command::Stop {
+        name: "binpath".into(),
+    });
+    assert!(machine.apply(std::slice::from_ref(&web), false).ok);
+    assert_eq!(machine.sc("qc", "binpath"), config);
+    machine.ok(Command::Start {
+        name: "binpath".into(),
+    });
+    machine.until("binpath", |status| status.state == State::Running);
 }

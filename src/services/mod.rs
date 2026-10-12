@@ -200,6 +200,35 @@ fn same_path(a: &Path, b: &Path) -> bool {
     plain(a) == plain(b)
 }
 
+/// The two records that turn services mode on for a directory: the machine-wide registry
+/// value, through which ordinary commands find it, and the marker inside it.
+pub trait Records {
+    fn register(&mut self) -> Result<()>;
+    fn unregister(&mut self) -> Result<()>;
+    fn mark(&mut self) -> Result<()>;
+}
+
+/// Writes the registry value before the marker, so that a marked directory is always one
+/// ordinary commands find. When the marker fails, the value this call added is taken back. A
+/// directory that was already registered keeps its value.
+pub fn record(records: &mut impl Records, registered: bool) -> Result<()> {
+    if !registered {
+        records.register()?;
+    }
+    let Err(error) = records.mark() else {
+        return Ok(());
+    };
+    if registered {
+        return Err(error);
+    }
+    match records.unregister() {
+        Ok(()) => Err(error),
+        Err(undo) => Err(anyhow::anyhow!(
+            "{error:#}\nRemoving the services mode record from the registry failed too: {undo:#}"
+        )),
+    }
+}
+
 /// Whether `data` is in services mode and protected.
 pub fn active(data: &Path) -> bool {
     matches!(check(data), Ok(true))
@@ -385,6 +414,80 @@ mod tests {
                 message.contains("k3up export --output workloads.toml\n  k3up agent uninstall")
             );
         }
+    }
+
+    #[derive(Default)]
+    struct FakeRecords {
+        fail: Vec<&'static str>,
+        calls: Vec<&'static str>,
+    }
+
+    impl FakeRecords {
+        fn call(&mut self, name: &'static str) -> Result<()> {
+            self.calls.push(name);
+            if self.fail.contains(&name) {
+                anyhow::bail!("{name} failed");
+            }
+            Ok(())
+        }
+    }
+
+    impl Records for FakeRecords {
+        fn register(&mut self) -> Result<()> {
+            self.call("register")
+        }
+
+        fn unregister(&mut self) -> Result<()> {
+            self.call("unregister")
+        }
+
+        fn mark(&mut self) -> Result<()> {
+            self.call("mark")
+        }
+    }
+
+    fn recorded(fail: &[&'static str], registered: bool) -> (Vec<&'static str>, Option<String>) {
+        let mut fake = FakeRecords {
+            fail: fail.to_vec(),
+            ..Default::default()
+        };
+        let result = record(&mut fake, registered);
+        (fake.calls, result.err().map(|error| error.to_string()))
+    }
+
+    #[test]
+    fn the_marker_is_written_only_after_the_registry_value() {
+        assert_eq!(recorded(&[], false), (vec!["register", "mark"], None));
+        assert_eq!(
+            recorded(&["register"], false),
+            (vec!["register"], Some("register failed".into()))
+        );
+        assert_eq!(
+            recorded(&["mark"], false),
+            (
+                vec!["register", "mark", "unregister"],
+                Some("mark failed".into())
+            )
+        );
+        assert_eq!(
+            recorded(&["mark", "unregister"], false),
+            (
+                vec!["register", "mark", "unregister"],
+                Some(
+                    "mark failed\nRemoving the services mode record from the registry failed too: unregister failed"
+                        .into()
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn a_registered_directory_keeps_its_registry_value() {
+        assert_eq!(recorded(&[], true), (vec!["mark"], None));
+        assert_eq!(
+            recorded(&["mark"], true),
+            (vec!["mark"], Some("mark failed".into()))
+        );
     }
 
     #[test]

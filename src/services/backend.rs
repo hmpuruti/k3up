@@ -3,7 +3,7 @@
 use super::{
     files::{self, Layout},
     host, scm,
-    status::{self, Definition, Scm, Service},
+    status::{self, Definition, Drift, Scm, Service},
 };
 use crate::{
     model::{Manifest, State, Status, Workload},
@@ -101,6 +101,14 @@ impl Backend {
                 create_only,
             } => {
                 let _lock = self.lock()?;
+                if create_only {
+                    let existing = self.definitions()?;
+                    let services = self.services()?;
+                    status::refuse_case_clashes(
+                        &[workload.name.as_str()],
+                        &known_names(&existing, &services),
+                    )?;
+                }
                 if create_only && self.known(&workload.name)? {
                     bail!(
                         "Workload '{}' already exists; use apply to update it",
@@ -309,6 +317,12 @@ impl Backend {
             status::ensure_supported(spec)
                 .with_context(|| format!("Invalid workload '{}'", spec.name))?;
         }
+        let names: Vec<&str> = manifest
+            .workloads
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        status::refuse_case_clashes(&names, &known_names(&existing, &services))?;
         let mut merged = existing.clone();
         for spec in &manifest.workloads {
             merged.insert(spec.name.clone(), spec.clone());
@@ -323,27 +337,37 @@ impl Backend {
         for spec in manifest.workloads {
             let current = existing.get(&spec.name);
             let service = services.get(&spec.name);
-            if current == Some(&spec) && service.is_some() {
+            let drift = match (current, service) {
+                (Some(current), Some(_)) => self.drift(current)?,
+                _ => Drift::default(),
+            };
+            let unchanged = current == Some(&spec);
+            if unchanged && service.is_some() && drift.is_empty() {
                 continue;
             }
             let relabel = current.is_some_and(|current| current.only_labels_differ(&spec));
             let running = service.is_some_and(|service| service.scm != Scm::Stopped);
-            if running && !relabel && current != Some(&spec) {
+            if running && !relabel && !unchanged {
                 bail!("Stop '{}' before changing its definition", spec.name);
             }
-            changes.push(format!(
-                "{} {}",
-                if current.is_some() {
-                    "Update"
-                } else {
-                    "Create"
-                },
-                spec.name
-            ));
+            if running && drift.needs_stop() {
+                bail!(
+                    "Stop '{}' before changing its definition: its service settings differ ({drift})",
+                    spec.name
+                );
+            }
+            changes.push(match (current, drift.is_empty()) {
+                (None, _) => format!("Create {}", spec.name),
+                (Some(_), true) => format!("Update {}", spec.name),
+                (Some(_), false) => {
+                    format!("Update {}: service settings differ ({drift})", spec.name)
+                }
+            });
             plan.push(Change {
                 previous: current.cloned(),
                 registered: service.is_some(),
                 relabel,
+                restored: unchanged,
                 workload: spec,
             });
         }
@@ -361,7 +385,9 @@ impl Backend {
         for step in &steps {
             self.event(
                 &step.change.workload.name,
-                if step.change.relabel {
+                if step.change.restored {
+                    "Windows service settings restored from the definition"
+                } else if step.change.relabel {
                     "Definition saved; group or description changed"
                 } else {
                     "Definition saved"
@@ -375,6 +401,17 @@ impl Backend {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ))
+    }
+
+    /// How the service of an existing workload differs from what its definition asks for, for
+    /// example after a change in the Services console.
+    fn drift(&self, workload: &Workload) -> Result<Drift> {
+        let instance =
+            files::read_definition_and_instance(&self.layout.definition(&workload.name))?
+                .and_then(|(_, instance)| instance);
+        let service = self.service_name(&workload.name);
+        let wanted = scm::wanted(workload, &self.registration(&service, instance.as_deref()));
+        Ok(status::drift(&wanted, &scm::settings(&service)?))
     }
 
     /// Checks what can be checked before the first change, and records what each change
@@ -659,6 +696,8 @@ struct Change {
     previous: Option<Workload>,
     registered: bool,
     relabel: bool,
+    /// The definition is unchanged; only its service's settings are put back.
+    restored: bool,
 }
 
 /// A change with what it replaces: the definition file's bytes, and the service's settings
@@ -692,6 +731,17 @@ fn refuse_unprotected(folder: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn known_names<'a>(
+    definitions: &'a BTreeMap<String, Workload>,
+    services: &'a BTreeMap<String, Service>,
+) -> Vec<&'a str> {
+    definitions
+        .keys()
+        .chain(services.keys())
+        .map(String::as_str)
+        .collect()
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {

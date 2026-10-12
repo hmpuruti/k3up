@@ -3,8 +3,10 @@
 use super::files::HostState;
 use crate::model::{Kind, State, Status, Workload};
 use anyhow::{Result, bail};
+use std::time::Duration;
 
 const DISPLAY_PREFIX: &str = "K3 Up: ";
+const SAME_NAME: &str = "Windows treats names that differ only in case as the same";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scm {
@@ -34,7 +36,7 @@ pub fn instance_of(command_line: &str) -> Option<String> {
 
 /// Splits a command line the way Windows programs read their arguments, so a quoted data
 /// directory that contains ` --instance ` is not mistaken for the option.
-fn split_command_line(line: &str) -> Vec<String> {
+pub fn split_command_line(line: &str) -> Vec<String> {
     let mut chars = line.trim_start().chars().peekable();
     let mut words = vec![];
     // The program path ends at the closing quote or at whitespace, without escapes.
@@ -141,6 +143,101 @@ pub fn starts_at_boot(workload: &Workload) -> bool {
 /// definition from a missing one.
 pub fn known(definition: &Definition, service_exists: bool) -> bool {
     service_exists || matches!(definition, Definition::Present(_))
+}
+
+/// Refuses a name in `manifest` that differs only in case from another in it, or from one in
+/// `existing`: Windows service and file names ignore case, so both would share one service
+/// and one definition. The same name in the same case is an update.
+pub fn refuse_case_clashes(manifest: &[&str], existing: &[&str]) -> Result<()> {
+    let clash = |names: &[&str], name: &str| {
+        names
+            .iter()
+            .find(|other| other.eq_ignore_ascii_case(name) && **other != name)
+            .map(|other| other.to_string())
+    };
+    for (index, name) in manifest.iter().enumerate() {
+        if let Some(other) = clash(&manifest[..index], name) {
+            bail!("The manifest names both '{other}' and '{name}'; {SAME_NAME}");
+        }
+        if let Some(other) = clash(existing, name) {
+            bail!("A workload named '{other}' already exists; {SAME_NAME}");
+        }
+    }
+    Ok(())
+}
+
+/// What a workload's Windows service is set to: what K3 Up asks for, or what the service
+/// manager holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceSettings {
+    /// The program and each argument, as Windows splits the command line.
+    pub command: Vec<String>,
+    pub start_type: u32,
+    pub delayed: bool,
+    pub account: String,
+    pub display_name: String,
+    pub description: String,
+    pub recovery: Recovery,
+}
+
+/// What the service manager does when the host crashes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Recovery {
+    /// `None` when the failure count is never reset.
+    pub reset: Option<Duration>,
+    /// Each action's type, as Windows numbers them, and delay.
+    pub actions: Vec<(i32, Duration)>,
+    pub on_non_crash_failures: bool,
+}
+
+/// The settings of a service that differ from what K3 Up asks for, by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Drift(pub Vec<&'static str>);
+
+impl Drift {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// A running host keeps its command line and account until it stops.
+    pub fn needs_stop(&self) -> bool {
+        self.0
+            .iter()
+            .any(|setting| matches!(*setting, "command line" | "account"))
+    }
+}
+
+impl std::fmt::Display for Drift {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0.join(", "))
+    }
+}
+
+pub fn drift(wanted: &ServiceSettings, found: &ServiceSettings) -> Drift {
+    let account = |name: &str| {
+        let name = name.strip_prefix(".\\").unwrap_or(name);
+        name.to_ascii_lowercase()
+    };
+    Drift(
+        [
+            ("command line", wanted.command == found.command),
+            (
+                "start type",
+                (wanted.start_type, wanted.delayed) == (found.start_type, found.delayed),
+            ),
+            (
+                "account",
+                account(&wanted.account) == account(&found.account),
+            ),
+            ("display name", wanted.display_name == found.display_name),
+            ("description", wanted.description == found.description),
+            ("recovery actions", wanted.recovery == found.recovery),
+        ]
+        .into_iter()
+        .filter(|(_, same)| !same)
+        .map(|(setting, _)| setting)
+        .collect(),
+    )
 }
 
 /// The one place that lists what services mode cannot run yet.
@@ -500,6 +597,86 @@ mod tests {
         assert_eq!(hidden.workload.group, "shop/front");
         assert!(hidden.workload.executable.is_empty());
         assert_eq!(hidden.state, State::Running);
+    }
+
+    #[test]
+    fn names_that_differ_only_in_case_are_refused() {
+        refuse_case_clashes(&["web", "api"], &["web", "db"]).unwrap();
+        assert_eq!(
+            refuse_case_clashes(&["Web"], &["web", "db"])
+                .unwrap_err()
+                .to_string(),
+            "A workload named 'web' already exists; Windows treats names that differ only in case as the same"
+        );
+        assert_eq!(
+            refuse_case_clashes(&["api", "Web", "web"], &[])
+                .unwrap_err()
+                .to_string(),
+            "The manifest names both 'Web' and 'web'; Windows treats names that differ only in case as the same"
+        );
+        refuse_case_clashes(&["web-1", "WEB_1"], &["web_2"]).unwrap();
+    }
+
+    fn settings() -> ServiceSettings {
+        ServiceSettings {
+            command: [r"C:\k3up-host.exe", "--workload", "web"]
+                .map(String::from)
+                .to_vec(),
+            start_type: 3,
+            delayed: false,
+            account: "LocalSystem".into(),
+            display_name: "K3 Up: web".into(),
+            description: "K3 Up workload".into(),
+            recovery: Recovery {
+                reset: Some(Duration::from_secs(86_400)),
+                actions: vec![(1, Duration::from_secs(5))],
+                on_non_crash_failures: false,
+            },
+        }
+    }
+
+    type Change = fn(&mut ServiceSettings);
+
+    #[test]
+    fn every_service_setting_counts_as_drift() {
+        let wanted = settings();
+        assert!(drift(&wanted, &wanted).is_empty());
+        let mut found = settings();
+        found.account = r".\localsystem".into();
+        assert!(drift(&wanted, &found).is_empty());
+
+        let changes: [(&str, Change); 8] = [
+            ("command line", |found| {
+                found.command[0] = r"C:\other.exe".into()
+            }),
+            ("command line", |found| found.command.push("--extra".into())),
+            ("start type", |found| found.start_type = 2),
+            ("start type", |found| found.delayed = true),
+            ("account", |found| found.account = r".\someone".into()),
+            ("display name", |found| found.display_name = "Other".into()),
+            ("description", |found| found.description.clear()),
+            ("recovery actions", |found| {
+                found.recovery.on_non_crash_failures = true
+            }),
+        ];
+        for (setting, change) in changes {
+            let mut found = settings();
+            change(&mut found);
+            let drift = drift(&wanted, &found);
+            assert_eq!(drift.0, [setting]);
+            assert_eq!(
+                drift.needs_stop(),
+                matches!(setting, "command line" | "account"),
+                "{setting}"
+            );
+        }
+        let mut found = settings();
+        found.recovery.actions.clear();
+        found.display_name.clear();
+        assert_eq!(
+            drift(&wanted, &found).to_string(),
+            "display name, recovery actions"
+        );
     }
 
     #[test]
