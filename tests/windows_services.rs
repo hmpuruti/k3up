@@ -725,6 +725,23 @@ fn a_missing_program_is_judged_by_the_folder_that_would_hold_it() {
         .collect();
     assert_eq!(exposed, [nested]);
     std::fs::remove_dir(&hop).unwrap();
+
+    // A protected link leads through a second link that sits in a folder users control.
+    let settled = machine.data.join("settled");
+    std::fs::create_dir(&settled).unwrap();
+    let middle = open_folder(&machine).join("middle");
+    std::os::windows::fs::symlink_dir(&settled, &middle).unwrap();
+    let front = machine.data.join("front");
+    std::os::windows::fs::symlink_dir(&middle, &front).unwrap();
+    let chained = front.join("tool.exe");
+    workload.executable = chained.to_string_lossy().into();
+    let exposed: Vec<PathBuf> = exposure::exposed_paths(&workload)
+        .into_iter()
+        .map(|exposure| exposure.path)
+        .collect();
+    assert_eq!(exposed, [chained]);
+    std::fs::remove_dir(&front).unwrap();
+    std::fs::remove_dir(&middle).unwrap();
 }
 
 #[test]

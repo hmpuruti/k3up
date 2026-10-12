@@ -431,47 +431,47 @@ pub fn writable_by_others(path: &Path) -> Result<bool> {
 /// Whether an account other than SYSTEM, Administrators and TrustedInstaller may change
 /// `path`, or rename, delete or re-permission a folder above it. A path that doesn't exist yet
 /// is judged by the nearest folder that does, since whoever may add to that folder can create
-/// it. Links are judged both as they stand and by where they lead, and anything whose
-/// permissions can't be read counts as changeable: this check exists to warn, so it fails
+/// it. Every link along the way is judged both as it stands and by where it leads, and anything
+/// whose permissions can't be read counts as changeable: this check exists to warn, so it fails
 /// towards warning.
 pub fn changeable_by_others(path: &Path) -> bool {
     changeable_within(path, 8)
 }
 
-/// `hops` bounds how many links are followed, so a loop of links ends.
+/// Walks `path` one component at a time. Each link met on the way is judged as it stands,
+/// since whoever may change it or its folder can point it elsewhere before the host follows it,
+/// and then followed. `hops` bounds how many links are followed, so a loop of links ends.
 fn changeable_within(path: &Path, hops: u8) -> bool {
-    let Some(existing) = path
-        .ancestors()
-        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
-    else {
-        return true;
-    };
-    let rest = path.strip_prefix(existing).unwrap_or(Path::new(""));
-    if hops == 0 {
-        return true;
-    }
-    // Where every link along the way, the last one included, really leads.
-    let resolved = match std::fs::canonicalize(existing) {
-        Ok(resolved) => Some(resolved),
-        Err(_) if is_reparse_point(existing).unwrap_or(true) => {
-            match std::fs::read_link(existing) {
-                Ok(target) => Some(
-                    existing
-                        .parent()
-                        .map_or(target.clone(), |parent| parent.join(&target)),
-                ),
-                Err(_) => return true,
+    let components: Vec<_> = path.components().collect();
+    let mut walked = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        walked.push(component);
+        if !matches!(component, std::path::Component::Normal(_)) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&walked) {
+            // Whoever may add to the last folder that exists can create the rest.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return walked.parent().is_none_or(stands_changeable);
+            }
+            Err(_) => return true,
+            Ok(_) if !is_reparse_point(&walked).unwrap_or(true) => {}
+            Ok(_) => {
+                if hops == 0 || stands_changeable(&walked) {
+                    return true;
+                }
+                let Ok(target) = std::fs::read_link(&walked) else {
+                    return true;
+                };
+                let target = walked
+                    .parent()
+                    .map_or(target.clone(), |parent| parent.join(&target));
+                let rest: PathBuf = components[index + 1..].iter().collect();
+                return changeable_within(&target.join(rest), hops - 1);
             }
         }
-        Err(_) => None,
-    };
-    if let Some(resolved) = resolved
-        && resolved != existing
-        && changeable_within(&resolved.join(rest), hops - 1)
-    {
-        return true;
     }
-    stands_changeable(existing)
+    stands_changeable(path)
 }
 
 /// The object itself, or any folder above it, judged without following links.
