@@ -356,6 +356,7 @@ mod tests {
         let separator = std::path::MAIN_SEPARATOR;
         let mut workload = Workload {
             name: "web".into(),
+            executable: text(&absolute("tool.exe")),
             working_directory: text(&folder),
             ..Default::default()
         };
